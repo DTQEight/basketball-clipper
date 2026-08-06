@@ -37,6 +37,7 @@ from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model
 from demo_chonyy import ChonyyGoalDetector, draw_frame
 from tracker import GoalDetector
+from cutter.ffmpeg_cutter import cut_clips
 
 
 def draw_frame_diff(frame, blob, hoop, detector, frame_idx, fps):
@@ -83,6 +84,8 @@ _calib = {
     "baseline_frame": None,  # 标定时的帧（作为基准帧差法的无球基准）
     "baseline_idx": -1,
 }
+# 保存最近一次检测的进球时间戳，供「生成集锦」使用
+_last_goals = []
 
 
 def on_load_video(video_path):
@@ -337,6 +340,9 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
             pass
 
         progress(1.0, desc="完成")
+        # 保存进球时间戳供「生成集锦」使用
+        _last_goals.clear()
+        _last_goals.extend(detector.goals)
         goals_str = "\n".join([f"  [{i+1}] {ts:.1f}s (帧 {int(ts*fps)})"
                                for i, ts in enumerate(detector.goals)])
         if not goals_str:
@@ -373,6 +379,35 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
     except Exception as e:
         import traceback
         return None, f"❌ 检测失败: {e}\n\n{traceback.format_exc()}"
+
+
+def on_generate_highlights(pre_roll, post_roll, min_gap, progress=gr.Progress()):
+    """根据检测到的进球时间戳生成集锦视频。"""
+    if _video_state["path"] is None:
+        return None, "❌ 请先加载视频并检测进球"
+    if not _last_goals:
+        return None, "❌ 没有检测到进球，无法生成集锦（请先点「开始检测」）"
+
+    progress(0.05, desc=f"开始剪辑（{len(_last_goals)} 个进球）...")
+    try:
+        out_path = cut_clips(
+            _video_state["path"], list(_last_goals),
+            pre_roll=int(pre_roll), post_roll=int(post_roll),
+            min_gap=int(min_gap),
+        )
+        if out_path and os.path.exists(out_path):
+            progress(1.0, desc="集锦生成完成")
+            n = len(_last_goals)
+            dur = sum(int(post_roll) + int(pre_roll) for _ in _last_goals)
+            return out_path, (f"✅ 集锦已生成（{n} 个进球片段）\n"
+                              f"前保留 {int(pre_roll)}s | 后保留 {int(post_roll)}s | "
+                              f"最小合并间隔 {int(min_gap)}s\n"
+                              f"输出: {out_path}")
+        else:
+            return None, "❌ 集锦生成失败（cut_clips 返回空）"
+    except Exception as e:
+        import traceback
+        return None, f"❌ 剪辑失败: {e}\n\n{traceback.format_exc()}"
 
 
 # ============ Gradio 界面 ============
@@ -420,6 +455,16 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
             result_video = gr.Video(label="检测结果视频")
             result_status = gr.Textbox(label="检测统计", interactive=False, lines=12)
 
+            gr.Markdown("---\n### ✂️ 自动剪辑集锦")
+            gr.Markdown("基于上方检测到的进球时间戳，自动裁剪片段并拼接成集锦 mp4")
+            with gr.Row():
+                pre_roll = gr.Number(label="进球前保留(秒)", value=5, precision=0)
+                post_roll = gr.Number(label="进球后保留(秒)", value=5, precision=0)
+                cut_min_gap = gr.Number(label="最小合并间隔(秒)", value=8, precision=0)
+            cut_btn = gr.Button("✂️ 生成集锦", variant="primary")
+            highlights_video = gr.Video(label="集锦视频")
+            highlights_status = gr.Textbox(label="剪辑状态", interactive=False, lines=4)
+
     # 事件绑定
     load_btn.click(on_load_video, inputs=[video_path_input],
                    outputs=[preview_image, frame_slider, info_text])
@@ -431,6 +476,9 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
     run_btn.click(on_run_detect,
                   inputs=[start_frame, end_frame, ball_conf, min_gap, method],
                   outputs=[result_video, result_status])
+    cut_btn.click(on_generate_highlights,
+                  inputs=[pre_roll, post_roll, cut_min_gap],
+                  outputs=[highlights_video, highlights_status])
 
 
 if __name__ == "__main__":
