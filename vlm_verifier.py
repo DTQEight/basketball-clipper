@@ -33,7 +33,8 @@ except Exception:
 
 _SBOX = 0x08000000 if os.name == "nt" else 0  # Windows 沙箱规避
 
-MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
+# Token Plan 专用 base_url（tp- 开头密钥必须用此地址，普通 sk- 密钥用 https://api.xiaomimimo.com/v1）
+MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 MIMO_MODEL = "mimo-v2.5"
 
 # 缓存目录
