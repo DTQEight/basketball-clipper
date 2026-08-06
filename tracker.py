@@ -1,0 +1,341 @@
+"""进球检测器：基准帧差法 + 连通域分析 + 音频峰值融合（固定机位专用）。
+
+算法参考论文：Camera-based Basketball Scoring Detection Using CNN
+实践方案参考：CSDN 神投手（lyandgh）+ basketball-highlights 多信号融合
+
+工作原理：
+  1. 标定时取一帧无球的画面作为基准帧
+  2. 每帧与基准帧做灰度差分 → 二值化 → 连通域分析
+  3. 在篮筐周边区域找最大连通域 = 运动的篮球
+  4. 跟踪斑块：斑块先经过篮筐上沿 → 后经过篮筐下沿 = 视觉进球
+  5. 融合阶段：视觉进球 ± 时间窗口 内有音频峰值 = 高置信度进球
+
+优势（针对固定机位）：
+  - 基准帧稳定，差分信号强（不依赖微小晃动）
+  - 检测运动物体本身，不依赖 YOLO（不怕漏检）
+  - 规则明确：上沿→下沿 = 进球，不靠猜
+  - 多信号融合：视觉+音频互证，减少误报漏报
+"""
+
+import cv2
+import numpy as np
+
+
+class GoalDetector:
+    """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测 + 音频融合。"""
+
+    def __init__(self, hoop_box, baseline_frame=None,
+                 hoop_above_margin=30, hoop_x_margin=25,
+                 approach_dist=100, disappear_frames=3, confirm_below=True,
+                 min_gap_sec=3.0,
+                 diff_threshold=25, min_blob_area=50, max_blob_area=5000,
+                 search_margin=60,
+                 audio_peaks=None, fusion_window=2.0,
+                 fusion_mode="or"):
+        """
+        hoop_box: (x1, y1, x2, y2) 篮筐框
+        baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
+        diff_threshold: 帧差二值化阈值（25 较保守，可降到 15 提灵敏度）
+        min_blob_area: 最小连通域面积（过滤噪声）
+        max_blob_area: 最大连通域面积（过滤大物体如人）
+        search_margin: 篮筐周边搜索范围（像素）
+        audio_peaks: 音频峰值时间戳列表（秒），None 表示不用音频
+        fusion_window: 音频视觉融合时间窗口（秒，±窗口）
+        fusion_mode: 融合模式
+            "or"  - 视觉或音频触发都算进球（默认，高召回）
+            "and" - 视觉和音频都必须触发（高精度）
+            "fused_only" - 仅输出双信号确认的进球
+            "visual_only" - 仅用视觉信号（兼容旧行为）
+        """
+        self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
+        self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
+        self.hoop_cy = (self.hoop_y1 + self.hoop_y2) / 2
+        self.hoop_w = self.hoop_x2 - self.hoop_x1
+        self.hoop_h = self.hoop_y2 - self.hoop_y1
+        self.hoop_top = self.hoop_y1
+        self.hoop_bot = self.hoop_y2
+
+        self.min_gap_sec = min_gap_sec
+        self.diff_threshold = diff_threshold
+        self.min_blob_area = min_blob_area
+        self.max_blob_area = max_blob_area
+        self.search_margin = search_margin
+
+        # 音频融合参数
+        self.audio_peaks = sorted([float(p) for p in audio_peaks]) if audio_peaks else []
+        self.fusion_window = float(fusion_window)
+        self.fusion_mode = fusion_mode
+
+        # 基准帧（灰度）
+        self.baseline_gray = None
+        if baseline_frame is not None:
+            self.set_baseline(baseline_frame)
+
+        # 搜索区域（篮筐周边扩展 margin）
+        self.search_x1 = max(0, self.hoop_x1 - search_margin)
+        self.search_y1 = max(0, self.hoop_y1 - search_margin)
+        self.search_x2 = self.hoop_x2 + search_margin
+        self.search_y2 = self.hoop_y2 + search_margin
+
+        # 进球状态机：跟踪斑块穿越篮筐
+        self.blob_above_hoop = False   # 斑块是否在篮筐上方
+        self.blob_history = []         # 斑块 y 坐标历史
+        self.last_blob_box = None      # 上一帧斑块位置
+
+        self.goals = []                # 视觉进球时间戳（兼容旧接口）
+        self.visual_goals = []         # 视觉进球时间戳
+        self.fused_goals = []          # 融合后最终进球时间戳
+        self.last_goal_frame = -1
+        self.fps = 30.0
+        self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
+        self._audio_used = set()       # 已被匹配的音频峰值索引
+
+    def set_baseline(self, frame):
+        """设置基准帧。"""
+        if frame is None:
+            return
+        if len(frame.shape) == 3:
+            self.baseline_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            self.baseline_gray = frame.copy()
+        # 高斯模糊降噪
+        self.baseline_gray = cv2.GaussianBlur(self.baseline_gray, (5, 5), 0)
+
+    def _find_moving_blob(self, frame_gray):
+        """在篮筐周边搜索区域找最大运动连通域。
+
+        返回: (cx, cy, x1, y1, x2, y2, area) 或 None
+        """
+        if self.baseline_gray is None:
+            return None
+
+        h, w = frame_gray.shape[:2]
+        # 限制搜索区域不超过画面
+        sx2 = min(self.search_x2, w)
+        sy2 = min(self.search_y2, h)
+
+        # 提取搜索区域 ROI
+        curr_roi = frame_gray[self.search_y1:sy2, self.search_x1:sx2]
+        base_roi = self.baseline_gray[self.search_y1:sy2, self.search_x1:sx2]
+
+        if curr_roi.size == 0 or base_roi.size == 0:
+            return None
+        if curr_roi.shape != base_roi.shape:
+            return None
+
+        # 帧差
+        diff = cv2.absdiff(curr_roi, base_roi)
+        _, diff_bin = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+
+        # 形态学操作去噪 + 连接相邻区域
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN, kernel)
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, kernel)
+
+        # 连通域分析
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(diff_bin, connectivity=8)
+
+        # 调试用：差分比例
+        self.last_diff_ratio = float(np.sum(diff_bin > 0)) / diff_bin.size * 255
+
+        # 找最大的有效连通域（面积在范围内）
+        best_blob = None
+        best_area = 0
+        for k in range(1, num):
+            area = stats[k, cv2.CC_STAT_AREA]
+            if not (self.min_blob_area <= area <= self.max_blob_area):
+                continue
+            bx = stats[k, cv2.CC_STAT_LEFT] + self.search_x1
+            by = stats[k, cv2.CC_STAT_TOP] + self.search_y1
+            bw = stats[k, cv2.CC_STAT_WIDTH]
+            bh = stats[k, cv2.CC_STAT_HEIGHT]
+            bcx = centroids[k][0] + self.search_x1
+            bcy = centroids[k][1] + self.search_y1
+
+            # 斑块宽度不能超过篮筐宽度太多（是球不是大物体）
+            if bw > self.hoop_w * 1.5:
+                continue
+
+            if area > best_area:
+                best_area = area
+                best_blob = (float(bcx), float(bcy),
+                             int(bx), int(by), int(bx + bw), int(by + bh),
+                             int(area))
+
+        return best_blob
+
+    def feed(self, ball_pos, frame_idx, fps, frame=None):
+        """喂入一帧数据。
+
+        ball_pos: 忽略（兼容接口，基准帧差法不用 YOLO）
+        frame_idx: 当前帧号
+        fps: 帧率
+        frame: 当前帧 BGR 图像（必须提供）
+        返回: 进球时间戳（秒）或 None
+        """
+        self.fps = fps
+
+        if frame is None:
+            return None
+
+        # 首帧自动设为基准（如果未设置）
+        if self.baseline_gray is None:
+            self.set_baseline(frame)
+            return None
+
+        # 转灰度 + 模糊
+        if len(frame.shape) == 3:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            frame_gray = frame
+        frame_gray = cv2.GaussianBlur(frame_gray, (5, 5), 0)
+
+        # 冷却期检查
+        if self.last_goal_frame >= 0:
+            gap_sec = (frame_idx - self.last_goal_frame) / fps
+            if gap_sec < self.min_gap_sec:
+                self.last_blob_box = None
+                return None
+
+        # 在篮筐周边找运动斑块
+        blob = self._find_moving_blob(frame_gray)
+
+        if blob is None:
+            # 没检测到运动物体，保持状态但衰减历史
+            if len(self.blob_history) > 5:
+                self.blob_history.pop(0)
+            self.last_blob_box = None
+            return None
+
+        cx, cy, bx1, by1, bx2, by2, area = blob
+        self.last_blob_box = (bx1, by1, bx2, by2)
+
+        # 记录斑块 y 历史
+        self.blob_history.append((frame_idx, cy))
+        if len(self.blob_history) > 30:
+            self.blob_history.pop(0)
+
+        # ====== 进球判断：斑块从篮筐上沿穿越到下沿 ======
+        # 斑块中心在篮筐上方
+        if cy < self.hoop_top:
+            self.blob_above_hoop = True
+
+        # 斑块从上方移动到篮筐下沿以下
+        elif self.blob_above_hoop and cy >= self.hoop_bot:
+            # 验证：斑块 x 在篮筐范围内（含容差）
+            in_x = (self.hoop_x1 - int(self.hoop_w * 0.3) <= cx
+                    <= self.hoop_x2 + int(self.hoop_w * 0.3))
+            # 验证：斑块宽度 <= 篮筐宽度（是球不是大物体）
+            blob_w = bx2 - bx1
+            size_ok = blob_w <= self.hoop_w * 1.2
+
+            if in_x and size_ok:
+                # 验证轨迹连续性：最近几帧 y 是否整体下降
+                trend_ok = self._check_downward_trend()
+
+                if trend_ok:
+                    ts = frame_idx / fps
+                    self.visual_goals.append(ts)
+                    self.blob_above_hoop = False
+                    self.blob_history = []
+
+                    # 多信号融合：检查附近是否有音频峰值
+                    has_audio_match = self._match_audio_peak(ts)
+
+                    if self.fusion_mode in ("or", "visual_only"):
+                        # 视觉触发就算进球（兼容旧行为）
+                        self.goals.append(ts)
+                        self.last_goal_frame = frame_idx
+                        if has_audio_match:
+                            self.fused_goals.append(ts)
+                        return ts
+                    elif self.fusion_mode in ("and", "fused_only"):
+                        # 必须视觉+音频都触发
+                        if has_audio_match:
+                            self.goals.append(ts)
+                            self.fused_goals.append(ts)
+                            self.last_goal_frame = frame_idx
+                            return ts
+                        else:
+                            # 视觉触发但无音频确认，仍记录冷却（避免短时间重复）
+                            self.last_goal_frame = frame_idx
+                            return None
+                    else:
+                        self.goals.append(ts)
+                        self.last_goal_frame = frame_idx
+                        return ts
+
+            # 不满足条件，重置
+            self.blob_above_hoop = False
+
+        return None
+
+    def _match_audio_peak(self, ts):
+        """检查时间戳 ts 附近 ±fusion_window 内是否有未使用的音频峰值。
+
+        匹配后标记该音频峰值为已使用（避免重复匹配）。
+        返回: True/False
+        """
+        if not self.audio_peaks:
+            return False
+        best_j = -1
+        best_dist = self.fusion_window
+        for j, a in enumerate(self.audio_peaks):
+            if j in self._audio_used:
+                continue
+            d = abs(a - ts)
+            if d < best_dist:
+                best_dist = d
+                best_j = j
+        if best_j >= 0:
+            self._audio_used.add(best_j)
+            return True
+        return False
+
+    def finalize(self):
+        """视频处理完毕后调用，处理仅音频触发的候选（fusion_mode="or" 时）。
+
+        返回: 仅音频触发的进球时间戳列表
+        """
+        audio_only = []
+        if not self.audio_peaks or self.fusion_mode != "or":
+            return audio_only
+        for j, a in enumerate(self.audio_peaks):
+            if j in self._audio_used:
+                continue
+            # 检查是否与已有进球冲突（避免重复）
+            conflict = False
+            for g in self.goals:
+                if abs(g - a) < self.min_gap_sec:
+                    conflict = True
+                    break
+            if not conflict:
+                self.goals.append(float(a))
+                self.goals.sort()
+                audio_only.append(float(a))
+        return audio_only
+
+    def _check_downward_trend(self, n=4):
+        """检查最近 n 帧斑块是否整体向下运动。"""
+        if len(self.blob_history) < n:
+            n = len(self.blob_history)
+            if n < 2:
+                return True
+        recent = self.blob_history[-n:]
+        ys = [r[1] for r in recent]
+        # y 整体增加（向下）且至少下降 10 像素
+        return (ys[-1] - ys[0]) > 10
+
+    def get_debug_info(self):
+        """获取调试信息。"""
+        return {
+            "diff_ratio": self.last_diff_ratio,
+            "blob_above": self.blob_above_hoop,
+            "blob_box": self.last_blob_box,
+            "search_area": (self.search_x1, self.search_y1, self.search_x2, self.search_y2),
+            "visual_goals": len(self.visual_goals),
+            "fused_goals": len(self.fused_goals),
+            "audio_peaks": len(self.audio_peaks),
+            "audio_used": len(self._audio_used),
+            "fusion_mode": self.fusion_mode,
+        }

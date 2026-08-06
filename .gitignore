@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# 训练数据（太大，不上传）
+train_data/
+train_data_manual/
+runs/
+demo_output/
+
+# 视频文件（太大）
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.ts
+*.flv
+
+# 权重文件（太大，用 release 上传）
+weights/*.pt
+*.pt
+
+# 缓存
+.cache/
+*.cache
+E:\bball_cache\
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log

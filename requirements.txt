@@ -1,0 +1,23 @@
+# 篮球录像进球检测与自动剪辑 - 依赖列表
+
+# YOLO 目标检测
+ultralytics>=8.0.0
+
+# 视频读取（PyAV，兼容 HEVC/moov 后置 mp4）
+av>=12.0.0
+
+# 图像处理
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 视频转码（自带含 libx264 + nvenc 的 ffmpeg）
+imageio-ffmpeg>=0.4.9
+
+# 命令行 ffmpeg 封装
+ffmpeg-python>=0.2.0
+
+# 配置文件
+pyyaml>=6.0
+
+# 可视化界面
+gradio>=4.0.0
