@@ -38,6 +38,16 @@ from app import get_ball_model
 from demo_chonyy import ChonyyGoalDetector, draw_frame
 from tracker import GoalDetector
 from cutter.ffmpeg_cutter import cut_clips
+from vlm_verifier import verify_goals_batch, filter_confirmed_goals
+
+# 加载 .env 文件中的 API Key
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 
 def draw_frame_diff(frame, blob, hoop, detector, frame_idx, fps):
@@ -410,6 +420,68 @@ def on_generate_highlights(pre_roll, post_roll, min_gap, progress=gr.Progress())
         return None, f"❌ 剪辑失败: {e}\n\n{traceback.format_exc()}"
 
 
+def on_vlm_verify(api_key, min_confidence, progress=gr.Progress()):
+    """用 VLM 对 CV 检测到的候选进球做二次验证。"""
+    if _video_state["path"] is None:
+        return "❌ 请先加载视频并检测进球", ""
+    if not _last_goals:
+        return "❌ 没有候选进球（请先点「开始检测」）", ""
+    if not api_key or not api_key.strip():
+        return "❌ 请输入 Mimo API Key", ""
+
+    api_key = api_key.strip()
+    n = len(_last_goals)
+    progress(0.02, desc=f"开始 VLM 验证（{n} 个候选）...")
+
+    log_lines = [f"VLM 二次验证开始（{n} 个候选进球）"]
+    log_lines.append(f"API: Mimo v2.5 | 窗口: ±3秒 | 最低置信度: {min_confidence}")
+    log_lines.append("")
+
+    confirmed = []
+
+    def on_progress(current, total, result):
+        pct = current / total
+        ts = result["timestamp"]
+        status = "✅进球" if result["is_goal"] else "❌否决"
+        conf = result["confidence"]
+        reason = result.get("reason", "")[:50]
+        err = result.get("error", "")
+        line = f"[{current}/{total}] {ts:.1f}s → {status} (conf={conf:.2f})"
+        if err:
+            line += f" ⚠️{err[:30]}"
+        elif reason:
+            line += f" {reason}"
+        log_lines.append(line)
+        if result["is_goal"] and conf >= min_confidence:
+            confirmed.append(ts)
+        progress(pct, desc=f"VLM 验证中 {current}/{total}")
+
+    results = verify_goals_batch(
+        _video_state["path"], list(_last_goals), api_key,
+        progress_callback=on_progress,
+    )
+
+    confirmed = filter_confirmed_goals(results, min_confidence=min_confidence)
+
+    log_lines.append("")
+    log_lines.append(f"━━━ VLM 验证结果 ━━━")
+    log_lines.append(f"候选: {n} 个 | 确认进球: {len(confirmed)} 个 | "
+                     f"否决: {n - len(confirmed)} 个")
+    if confirmed:
+        log_lines.append("确认的进球时间: " +
+                         ", ".join([f"{t:.1f}s" for t in confirmed]))
+
+    # 更新全局进球列表为 VLM 确认的结果（供「生成集锦」使用）
+    _last_goals.clear()
+    _last_goals.extend(confirmed)
+
+    progress(1.0, desc="VLM 验证完成")
+    status = (f"✅ VLM 验证完成\n"
+              f"候选 {n} 个 → 确认 {len(confirmed)} 个 → 否决 {n - len(confirmed)} 个\n"
+              f"已更新进球列表，可点「生成集锦」剪辑确认的进球")
+    return status, "\n".join(log_lines)
+
+
 # ============ Gradio 界面 ============
 # 预填已知视频路径
 _DEFAULT_VIDEO = r"D:\Downloads\highlights.mp4"
@@ -465,6 +537,21 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
             highlights_video = gr.Video(label="集锦视频")
             highlights_status = gr.Textbox(label="剪辑状态", interactive=False, lines=4)
 
+            gr.Markdown("---\n### 🤖 VLM 大模型二次验证（推荐）")
+            gr.Markdown("CV 检测的候选进球 → VLM 逐个确认 → 过滤误报。"
+                        "解决 CV 漏检/误报问题，提高准确率")
+            vlm_api_key = gr.Textbox(
+                label="Mimo API Key",
+                value=os.environ.get("MIMO_API_KEY", ""),
+                type="password",
+                placeholder="tp-xxxxx",
+                info="从 https://platform.xiaomimimo.com 获取")
+            vlm_conf = gr.Slider(0.0, 1.0, value=0.5, step=0.1,
+                                 label="最低确认置信度")
+            vlm_btn = gr.Button("🤖 VLM 验证候选进球", variant="primary")
+            vlm_status = gr.Textbox(label="验证状态", interactive=False, lines=3)
+            vlm_log = gr.Textbox(label="验证日志", interactive=False, lines=12)
+
     # 事件绑定
     load_btn.click(on_load_video, inputs=[video_path_input],
                    outputs=[preview_image, frame_slider, info_text])
@@ -479,6 +566,9 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
     cut_btn.click(on_generate_highlights,
                   inputs=[pre_roll, post_roll, cut_min_gap],
                   outputs=[highlights_video, highlights_status])
+    vlm_btn.click(on_vlm_verify,
+                  inputs=[vlm_api_key, vlm_conf],
+                  outputs=[vlm_status, vlm_log])
 
 
 if __name__ == "__main__":

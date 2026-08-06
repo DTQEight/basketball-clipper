@@ -8,6 +8,10 @@ venv/
 env/
 ENV/
 
+# 密钥（不要上传）
+.env
+*.key
+
 # 训练数据（太大，不上传）
 train_data/
 train_data_manual/
