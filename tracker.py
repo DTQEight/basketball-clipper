@@ -79,8 +79,13 @@ class GoalDetector:
 
         # 进球状态机：跟踪斑块穿越篮筐
         self.blob_above_hoop = False   # 斑块是否在篮筐上方
+        self.blob_in_hoop = False      # 斑块是否在篮筐框内
+        self.blob_in_hoop_frames = 0   # 斑块在框内的连续帧数
         self.blob_history = []         # 斑块 y 坐标历史
         self.last_blob_box = None      # 上一帧斑块位置
+        self.last_above_frame = -999   # 上次斑块在篮筐上方的帧号
+        self.last_in_hoop_frame = -999 # 上次斑块在篮筐框内的帧号
+        self.above_timeout_frames = 45 # 上方状态保持时长（约 1.5 秒 @30fps）
 
         self.goals = []                # 视觉进球时间戳（兼容旧接口）
         self.visual_goals = []         # 视觉进球时间戳
@@ -89,6 +94,21 @@ class GoalDetector:
         self.fps = 30.0
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
         self._audio_used = set()       # 已被匹配的音频峰值索引
+
+        # 诊断计数器
+        self.diag = {
+            "cross_above": 0,      # 斑块到达篮筐上方次数
+            "cross_below": 0,      # 斑块到达篮筐下方次数
+            "in_hoop": 0,          # 斑块在篮筐框内次数
+            "reject_cooldown": 0,  # 冷却期跳过
+            "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
+            "reject_in_x": 0,      # x 不在篮筐范围
+            "reject_size": 0,      # 斑块太宽
+            "reject_trend": 0,     # 趋势检查失败
+            "reject_no_blob": 0,   # 没检测到运动斑块
+            "side_goal": 0,        # 侧向进筐判定成功
+            "timeout_goal": 0,     # 超时匹配成功
+        }
 
     def set_baseline(self, frame):
         """设置基准帧。"""
@@ -194,6 +214,7 @@ class GoalDetector:
         if self.last_goal_frame >= 0:
             gap_sec = (frame_idx - self.last_goal_frame) / fps
             if gap_sec < self.min_gap_sec:
+                self.diag["reject_cooldown"] += 1
                 self.last_blob_box = None
                 return None
 
@@ -202,8 +223,10 @@ class GoalDetector:
 
         if blob is None:
             # 没检测到运动物体，保持状态但衰减历史
+            self.diag["reject_no_blob"] += 1
             if len(self.blob_history) > 5:
                 self.blob_history.pop(0)
+            self.blob_in_hoop_frames = 0
             self.last_blob_box = None
             return None
 
@@ -215,58 +238,116 @@ class GoalDetector:
         if len(self.blob_history) > 30:
             self.blob_history.pop(0)
 
+        # 判断斑块相对篮筐的位置
+        in_x = (self.hoop_x1 - int(self.hoop_w * 0.3) <= cx
+                <= self.hoop_x2 + int(self.hoop_w * 0.3))
+        blob_w = bx2 - bx1
+        size_ok = blob_w <= self.hoop_w * 1.2
+
         # ====== 进球判断：斑块从篮筐上沿穿越到下沿 ======
         # 斑块中心在篮筐上方
         if cy < self.hoop_top:
             self.blob_above_hoop = True
+            self.last_above_frame = frame_idx
+            self.diag["cross_above"] += 1
+            self.blob_in_hoop_frames = 0
 
-        # 斑块从上方移动到篮筐下沿以下
-        elif self.blob_above_hoop and cy >= self.hoop_bot:
-            # 验证：斑块 x 在篮筐范围内（含容差）
-            in_x = (self.hoop_x1 - int(self.hoop_w * 0.3) <= cx
-                    <= self.hoop_x2 + int(self.hoop_w * 0.3))
-            # 验证：斑块宽度 <= 篮筐宽度（是球不是大物体）
-            blob_w = bx2 - bx1
-            size_ok = blob_w <= self.hoop_w * 1.2
+        # 斑块在篮筐框内
+        elif self.hoop_top <= cy <= self.hoop_bot:
+            self.diag["in_hoop"] += 1
+            if in_x:
+                self.blob_in_hoop_frames += 1
+                self.last_in_hoop_frame = frame_idx
 
-            if in_x and size_ok:
-                # 验证轨迹连续性：最近几帧 y 是否整体下降
-                trend_ok = self._check_downward_trend()
+        # 斑块在篮筐下方
+        elif cy >= self.hoop_bot:
+            self.diag["cross_below"] += 1
 
-                if trend_ok:
+            # 检查上方状态是否在超时窗口内（允许中间几帧漏检）
+            above_in_time = (frame_idx - self.last_above_frame) <= self.above_timeout_frames
+            hoop_in_time = (frame_idx - self.last_in_hoop_frame) <= self.above_timeout_frames
+
+            # 路径1：从上方穿越到下方（标准进球路径，含超时匹配）
+            if self.blob_above_hoop or above_in_time:
+                if not in_x:
+                    self.diag["reject_in_x"] += 1
+                elif not size_ok:
+                    self.diag["reject_size"] += 1
+                else:
+                    trend_ok = self._check_downward_trend()
+                    if not trend_ok:
+                        self.diag["reject_trend"] += 1
+                    else:
+                        if above_in_time and not self.blob_above_hoop:
+                            self.diag["timeout_goal"] += 1
+                        ts = frame_idx / fps
+                        self.visual_goals.append(ts)
+                        self.blob_above_hoop = False
+                        self.last_above_frame = -999
+                        self.blob_in_hoop_frames = 0
+                        self.blob_history = []
+                        has_audio_match = self._match_audio_peak(ts)
+                        if self.fusion_mode in ("or", "visual_only"):
+                            self.goals.append(ts)
+                            self.last_goal_frame = frame_idx
+                            if has_audio_match:
+                                self.fused_goals.append(ts)
+                            return ts
+                        elif self.fusion_mode in ("and", "fused_only"):
+                            if has_audio_match:
+                                self.goals.append(ts)
+                                self.fused_goals.append(ts)
+                                self.last_goal_frame = frame_idx
+                                return ts
+                            else:
+                                self.last_goal_frame = frame_idx
+                                return None
+                        else:
+                            self.goals.append(ts)
+                            self.last_goal_frame = frame_idx
+                            return ts
+                self.blob_above_hoop = False
+
+            # 路径2：侧向进筐（斑块在框内出现过 >=1 帧后到下方，不要求先到上方）
+            elif self.blob_in_hoop_frames >= 1 or hoop_in_time:
+                if not in_x:
+                    self.diag["reject_in_x"] += 1
+                elif not size_ok:
+                    self.diag["reject_size"] += 1
+                else:
+                    if hoop_in_time and self.blob_in_hoop_frames < 1:
+                        self.diag["timeout_goal"] += 1
+                    else:
+                        self.diag["side_goal"] += 1
                     ts = frame_idx / fps
                     self.visual_goals.append(ts)
-                    self.blob_above_hoop = False
+                    self.blob_in_hoop_frames = 0
+                    self.last_in_hoop_frame = -999
                     self.blob_history = []
-
-                    # 多信号融合：检查附近是否有音频峰值
                     has_audio_match = self._match_audio_peak(ts)
-
                     if self.fusion_mode in ("or", "visual_only"):
-                        # 视觉触发就算进球（兼容旧行为）
                         self.goals.append(ts)
                         self.last_goal_frame = frame_idx
                         if has_audio_match:
                             self.fused_goals.append(ts)
                         return ts
                     elif self.fusion_mode in ("and", "fused_only"):
-                        # 必须视觉+音频都触发
                         if has_audio_match:
                             self.goals.append(ts)
                             self.fused_goals.append(ts)
                             self.last_goal_frame = frame_idx
                             return ts
                         else:
-                            # 视觉触发但无音频确认，仍记录冷却（避免短时间重复）
                             self.last_goal_frame = frame_idx
                             return None
                     else:
                         self.goals.append(ts)
                         self.last_goal_frame = frame_idx
                         return ts
+            else:
+                self.diag["reject_no_above"] += 1
 
-            # 不满足条件，重置
-            self.blob_above_hoop = False
+            self.blob_in_hoop_frames = 0
 
         return None
 
@@ -323,8 +404,8 @@ class GoalDetector:
                 return True
         recent = self.blob_history[-n:]
         ys = [r[1] for r in recent]
-        # y 整体增加（向下）且至少下降 10 像素
-        return (ys[-1] - ys[0]) > 10
+        # y 整体增加（向下）且至少下降 5 像素（放宽，适配斜向运动）
+        return (ys[-1] - ys[0]) > 5
 
     def get_debug_info(self):
         """获取调试信息。"""

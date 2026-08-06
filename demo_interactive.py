@@ -186,9 +186,7 @@ def on_reset_hoop():
     return "已重置，请重新点击 2 个点标定篮筐（基准帧也会重新采集）"
 
 
-def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method,
-                  diff_threshold, min_blob_area, max_blob_area, search_margin,
-                  progress=gr.Progress()):
+def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progress=gr.Progress()):
     """运行进球检测并生成可视化视频。
 
     method: "chonyy" 状态机（依赖球 y 轨迹顺序）
@@ -218,28 +216,20 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method,
         if use_diff:
             detector = GoalDetector(hoop, baseline_frame=_calib["baseline_frame"],
                                     min_gap_sec=float(min_gap_sec),
-                                    diff_threshold=int(diff_threshold),
-                                    min_blob_area=int(min_blob_area),
-                                    max_blob_area=int(max_blob_area),
-                                    search_margin=int(search_margin),
                                     fusion_mode="visual_only")
             method_name = "基准帧差法 (diff)"
         else:
             detector = ChonyyGoalDetector(hoop, min_gap_sec=float(min_gap_sec))
             method_name = "chonyy 状态机"
 
-        # 加载 YOLO：仅 chonyy 需要；diff 纯帧差不用模型，省去加载和推理时间
-        model = None
-        if not use_diff:
-            progress(0, desc="加载 YOLO 模型...")
-            model, weights_path = get_ball_model()
+        # 加载 YOLO（chonyy 需要，diff 不需要但加载以备可视化）
+        progress(0, desc="加载 YOLO 模型...")
+        model, weights_path = get_ball_model()
 
-        # 输出目录直接用 GRADIO_TEMP_DIR，避免 Gradio 二次复制文件到 hash 子目录
-        out_dir = Path(_gradio_tmp)
+        # 输出目录改到 E 盘（避免 C 盘中文路径导致 URL 编码问题）
+        out_dir = Path(_CACHE_ROOT) / "demo_output"
         out_dir.mkdir(parents=True, exist_ok=True)
-        # 每次用唯一文件名，避免并发覆盖
-        run_id = int(time.time() * 1000) % 1000000
-        out_path = str(out_dir / f"demo_result_{run_id}.mp4")
+        out_path = str(out_dir / "demo_result.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         info = get_video_info(_video_state["path"])
         out_writer = cv2.VideoWriter(out_path, fourcc, fps,
@@ -261,33 +251,32 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method,
         reader = VideoReader(_video_state["path"])
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
-                # YOLO 检测球：仅 chonyy 算法需要；diff 算法不用 YOLO（纯帧差）
+                # YOLO 检测球（chonyy 用，diff 仅作诊断对比）
                 ball_pos = None
-                if not use_diff:
-                    try:
-                        res = model.predict(frame, conf=float(ball_conf), imgsz=1280,
-                                            device="cuda:0", verbose=False)[0]
-                        if res.boxes is not None and len(res.boxes) > 0:
-                            names = res.names
-                            clses = res.boxes.cls.cpu().numpy().astype(int)
-                            xyxy = res.boxes.xyxy.cpu().numpy()
-                            confs = res.boxes.conf.cpu().numpy()
-                            best = None
-                            for j, c in enumerate(clses):
-                                n = names.get(c, "").lower()
-                                if "ball" in n or "basketball" in n:
-                                    if best is None or confs[j] > confs[best]:
-                                        best = j
-                            if best is not None:
-                                x1, y1, x2, y2 = xyxy[best]
-                                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                                ball_pos = (float(cx), float(cy), float(x1), float(y1),
-                                            float(x2), float(y2), float(confs[best]))
-                    except Exception:
-                        pass
+                try:
+                    res = model.predict(frame, conf=float(ball_conf), imgsz=1280,
+                                        device="cuda:0", verbose=False)[0]
+                    if res.boxes is not None and len(res.boxes) > 0:
+                        names = res.names
+                        clses = res.boxes.cls.cpu().numpy().astype(int)
+                        xyxy = res.boxes.xyxy.cpu().numpy()
+                        confs = res.boxes.conf.cpu().numpy()
+                        best = None
+                        for j, c in enumerate(clses):
+                            n = names.get(c, "").lower()
+                            if "ball" in n or "basketball" in n:
+                                if best is None or confs[j] > confs[best]:
+                                    best = j
+                        if best is not None:
+                            x1, y1, x2, y2 = xyxy[best]
+                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                            ball_pos = (float(cx), float(cy), float(x1), float(y1),
+                                        float(x2), float(y2), float(confs[best]))
+                except Exception:
+                    pass
 
-                # 诊断统计（球位置，仅 chonyy 模式）
-                if not use_diff and ball_pos is not None:
+                # 诊断统计（球位置）
+                if ball_pos is not None:
                     diag["ball_detected"] += 1
                     cx, cy = ball_pos[0], ball_pos[1]
                     diag["ball_x_min"] = min(diag["ball_x_min"], cx)
@@ -337,7 +326,7 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method,
             import imageio_ffmpeg
             import subprocess
             ff = imageio_ffmpeg.get_ffmpeg_exe()
-            h264_path = str(out_dir / f"demo_h264_{run_id}.mp4")
+            h264_path = str(out_dir / "demo_h264.mp4")
             subprocess.run([ff, "-y", "-i", out_path, "-c:v", "libx264",
                             "-crf", "23", "-movflags", "+faststart", h264_path],
                            creationflags=0x08000000, capture_output=True, timeout=600)
@@ -357,28 +346,22 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method,
         by = f"[{diag['ball_y_min']:.0f}, {diag['ball_y_max']:.0f}]" if diag["ball_detected"] else "N/A"
         extra = ""
         if use_diff:
-            hoop_w = hoop[2] - hoop[0]
-            hoop_h = hoop[3] - hoop[1]
-            search_x1 = max(0, hoop[0] - int(search_margin))
-            search_y1 = max(0, hoop[1] - int(search_margin))
-            search_x2 = hoop[2] + int(search_margin)
-            search_y2 = hoop[3] + int(search_margin)
-            extra = (f"━━━ diff 参数 ━━━\n"
-                     f"帧差阈值: {int(diff_threshold)} | 斑块面积: [{int(min_blob_area)}, {int(max_blob_area)}]\n"
-                     f"搜索范围: {int(search_margin)}px → x[{search_x1},{search_x2}] y[{search_y1},{search_y2}]\n"
-                     f"篮筐尺寸: {hoop_w}x{hoop_h} | 斑块宽度上限: {hoop_w*1.5:.0f}px\n"
-                     f"━━━ diff 检测 ━━━\n"
-                     f"运动斑块检测: {diag['blob_detected']}/{processed} 帧 "
+            d = detector.diag
+            extra = (f"运动斑块检测: {diag['blob_detected']}/{processed} 帧 "
                      f"({diag['blob_detected']/max(processed,1)*100:.0f}%)\n"
-                     f"斑块检测率低 → 降低阈值/减小最小面积/扩大搜索范围\n"
-                     f"斑块检测率正常但无进球 → 检查篮筐标定/穿越方向\n")
+                     f"━━━ diff 拒绝原因 ━━━\n"
+                     f"  到达上方: {d['cross_above']} | 在框内: {d['in_hoop']} | 到达下方: {d['cross_below']}\n"
+                     f"  冷却跳过: {d['reject_cooldown']} | 无斑块: {d['reject_no_blob']}\n"
+                     f"  无上方直接到下方: {d['reject_no_above']} | x不在范围: {d['reject_in_x']}\n"
+                     f"  斑块太宽: {d['reject_size']} | 趋势失败: {d['reject_trend']}\n"
+                     f"  侧向进筐成功: {d['side_goal']} | 超时匹配成功: {d['timeout_goal']}\n")
         status = (f"✅ 检测完成 [{method_name}]\n"
                   f"处理: {processed} 帧 | 耗时: {elapsed:.0f}s | "
                   f"{processed/max(elapsed,0.1):.1f} fps\n"
                   f"篮筐框: x[{hoop[0]},{hoop[2]}] y[{hoop[1]},{hoop[3]}]\n"
                   f"检测到进球: {len(detector.goals)} 个\n{goals_str}\n"
+                  f"━━━ 诊断 ━━━\n"
                   f"{extra}"
-                  f"━━━ YOLO 诊断 ━━━\n"
                   f"YOLO 检测到球: {diag['ball_detected']}/{processed} 帧 "
                   f"({diag['ball_detected']/max(processed,1)*100:.0f}%)\n"
                   f"球 x 范围: {bx} | 篮筐 x: [{hoop[0]},{hoop[2]}]\n"
@@ -431,19 +414,6 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
                 label="检测算法",
                 info="chonyy=状态机(需球从上方穿越) | diff=基准帧差法(适合底角视角)")
 
-            with gr.Accordion("diff 高级参数（漏检时调节）", open=False):
-                diff_threshold = gr.Slider(5, 50, value=25, step=1,
-                                           label="帧差阈值（低=灵敏/高=严格）",
-                                           info="漏检多→降低(如15) | 误报多→提高(如35)")
-                with gr.Row():
-                    min_blob_area = gr.Slider(10, 500, value=50, step=5,
-                                              label="最小斑块面积")
-                    max_blob_area = gr.Slider(1000, 20000, value=5000, step=500,
-                                              label="最大斑块面积")
-                search_margin = gr.Slider(20, 200, value=60, step=10,
-                                          label="搜索范围(像素)",
-                                          info="篮筐周边搜索运动物体的范围，漏检→扩大")
-
             run_btn = gr.Button("🚀 开始检测", variant="primary")
 
         with gr.Column(scale=1):
@@ -459,8 +429,7 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
                          outputs=[preview_image, click_status])
     reset_btn.click(on_reset_hoop, outputs=[click_status])
     run_btn.click(on_run_detect,
-                  inputs=[start_frame, end_frame, ball_conf, min_gap, method,
-                          diff_threshold, min_blob_area, max_blob_area, search_margin],
+                  inputs=[start_frame, end_frame, ball_conf, min_gap, method],
                   outputs=[result_video, result_status])
 
 
@@ -472,4 +441,4 @@ if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7870,
                 show_error=True, prevent_thread_lock=False,
                 max_file_size=5000*1024*1024,  # 5GB 上限
-                allowed_paths=[_out_dir, _gradio_dir])  # 允许提供结果视频
+                allowed_paths=[_CACHE_ROOT])  # 允许整个 bball_cache（含 gradio 会话子目录）
