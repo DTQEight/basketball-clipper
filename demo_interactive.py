@@ -35,10 +35,8 @@ import gradio as gr
 
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model
-from demo_chonyy import ChonyyGoalDetector, draw_frame
 from tracker import GoalDetector
 from cutter.ffmpeg_cutter import cut_clips
-from vlm_verifier import verify_goals_batch, filter_confirmed_goals
 
 # 加载 .env 文件中的 API Key
 _env_file = Path(__file__).parent / ".env"
@@ -50,42 +48,6 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 
-def draw_frame_diff(frame, blob, hoop, detector, frame_idx, fps):
-    """基准帧差法的可视化绘制。"""
-    out = frame.copy()
-    x1, y1, x2, y2 = hoop
-    # 篮筐框（绿）+ 上沿/下沿线
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.line(out, (x1 - 30, y1), (x2 + 30, y1), (0, 255, 255), 1)  # 上沿 黄
-    cv2.line(out, (x1 - 30, y2), (x2 + 30, y2), (255, 0, 255), 1)  # 下沿 紫
-    cv2.putText(out, "HOOP", (x1, max(y1 - 8, 15)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    # 搜索区域（蓝虚线框）
-    cv2.rectangle(out, (detector.search_x1, detector.search_y1),
-                  (detector.search_x2, detector.search_y2), (255, 200, 0), 1)
-    # 运动斑块（红）
-    if blob is not None:
-        bx1, by1, bx2, by2 = blob
-        cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-        cv2.putText(out, "MOVING", (bx1, max(by1 - 5, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-    # 状态信息
-    ts = frame_idx / fps
-    above = "Y" if detector.blob_above_hoop else "N"
-    info_lines = [
-        f"Frame: {frame_idx} ({ts:.1f}s)",
-        f"Method: DIFF (baseline)",
-        f"Above: {above} | Goals: {len(detector.goals)}",
-        f"diff_ratio: {detector.last_diff_ratio:.1f}",
-    ]
-    for i, line in enumerate(info_lines):
-        cv2.putText(out, line, (10, 25 + i * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    # 进球时刻闪烁红色边框
-    if detector.goals and abs(ts - detector.goals[-1]) < 1.0:
-        cv2.rectangle(out, (0, 0), (out.shape[1] - 1, out.shape[0] - 1), (0, 0, 255), 8)
-    return out
-
 # ============ 全局状态 ============
 _video_state = {"path": None, "total": 0, "fps": 30.0, "codec": "unknown"}
 _calib = {
@@ -96,6 +58,11 @@ _calib = {
 }
 # 保存最近一次检测的进球时间戳，供「生成集锦」使用
 _last_goals = []
+# 保存每个进球的独立片段路径，供 UI 逐个预览/保留/删除
+# 格式: [{"ts": 5.1, "path": "E:/bball_cache/demo_output/goal_0_5s.mp4"}, ...]
+_last_goal_clips = []
+# 用户选择保留的进球索引（基于 _last_goal_clips）
+_kept_goal_indices = set()
 
 
 def on_load_video(video_path):
@@ -199,12 +166,9 @@ def on_reset_hoop():
     return "已重置，请重新点击 2 个点标定篮筐（基准帧也会重新采集）"
 
 
-def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progress=gr.Progress()):
-    """运行进球检测并生成可视化视频。
-
-    method: "chonyy" 状态机（依赖球 y 轨迹顺序）
-            "diff"   基准帧差法（检测运动物体穿越篮筐，适合底角视角）
-    """
+def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, progress=gr.Progress()):
+    """运行进球检测并生成可视化视频（diff + YOLO 双确认）。"""
+    global _kept_goal_indices, _last_goal_clips, _last_goals
     if _video_state["path"] is None:
         return None, "❌ 请先加载视频"
     if _calib["hoop"] is None:
@@ -220,33 +184,28 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
     if end <= start:
         return None, "❌ 结束帧必须大于起始帧"
 
-    use_diff = (method == "diff")
-    if use_diff and _calib["baseline_frame"] is None:
+    if _calib["baseline_frame"] is None:
         return None, "❌ 基准帧差法需要基准帧，请重新点击 2 个点标定篮筐"
 
     try:
-        # 初始化检测器
-        if use_diff:
-            detector = GoalDetector(hoop, baseline_frame=_calib["baseline_frame"],
-                                    min_gap_sec=float(min_gap_sec),
-                                    fusion_mode="visual_only")
-            method_name = "基准帧差法 (diff)"
-        else:
-            detector = ChonyyGoalDetector(hoop, min_gap_sec=float(min_gap_sec))
-            method_name = "chonyy 状态机"
+        # 初始化检测器：diff 宽松模式 + YOLO 双确认
+        detector = GoalDetector(hoop, baseline_frame=_calib["baseline_frame"],
+                                min_gap_sec=float(min_gap_sec),
+                                fusion_mode="visual_only",
+                                loose_mode=True,
+                                yolo_confirm=True)
+        method_name = "diff+YOLO双确认"
 
-        # 加载 YOLO（chonyy 需要，diff 不需要但加载以备可视化）
+        # 加载 YOLO 模型（双确认 + 可视化都需要）
         progress(0, desc="加载 YOLO 模型...")
         model, weights_path = get_ball_model()
 
         # 输出目录改到 E 盘（避免 C 盘中文路径导致 URL 编码问题）
         out_dir = Path(_CACHE_ROOT) / "demo_output"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = str(out_dir / "demo_result.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        info = get_video_info(_video_state["path"])
-        out_writer = cv2.VideoWriter(out_path, fourcc, fps,
-                                     (info["width"], info["height"]))
+        # 用时间戳命名避免并发/重复运行时文件占用
+        import time as _t
+        _stamp = int(_t.time())
 
         progress(0.01, desc=f"开始检测 [{method_name}]...")
         t0 = time.time()
@@ -260,7 +219,11 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
                 "ball_y_min": 99999, "ball_y_max": 0,
                 "blob_detected": 0}
 
-        # 用 VideoReader 顺序读取（一次打开，避免每帧重新 open/seek，提速几十倍）
+        # 第一阶段：纯检测（不写视频），记录进球时刻附近的帧索引
+        # 长视频写完整可视化 mp4 会很大且转码超时，改为只写进球前后片段
+        goal_clip_frames = set()  # 需要写入的帧索引
+        clip_half = int(fps * 3)  # 进球前后各 3 秒
+
         reader = VideoReader(_video_state["path"])
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
@@ -307,47 +270,69 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
                         else:
                             diag["in_hoop"] += 1
 
-                # 喂入检测器 + 可视化
-                if use_diff:
-                    detector.feed(None, fidx, fps, frame=frame)
-                    blob = detector.last_blob_box
-                    if blob is not None:
-                        diag["blob_detected"] += 1
-                    annotated = draw_frame_diff(frame, blob, hoop, detector, fidx, fps)
-                else:
-                    detector.feed(ball_pos, fidx, fps)
-                    annotated = draw_frame(frame, ball_pos, hoop, detector, fidx, fps)
-                out_writer.write(annotated)
+                # 喂入检测器（diff + YOLO 双确认，需传 ball_pos）
+                detector.feed(ball_pos, fidx, fps, frame=frame)
+                blob = detector.last_blob_box
+                if blob is not None:
+                    diag["blob_detected"] += 1
 
                 processed += 1
                 if processed % 30 == 0:
-                    progress(processed / n_frames,
+                    progress(processed / n_frames * 0.7,
                              desc=f"检测中 {processed}/{n_frames} | 进球: {len(detector.goals)}")
         finally:
             reader.close()
-            out_writer.release()
 
         # 基准帧差法结束后调用 finalize（处理仅音频候选，这里无音频所以无影响）
-        if use_diff:
-            detector.finalize()
+        detector.finalize()
 
         elapsed = time.time() - t0
 
-        # 转码为 H.264 以便浏览器播放（用 subprocess 替代 os.system，更可靠）
-        progress(0.99, desc="转码为 H.264...")
-        try:
-            import imageio_ffmpeg
-            import subprocess
-            ff = imageio_ffmpeg.get_ffmpeg_exe()
-            h264_path = str(out_dir / "demo_h264.mp4")
-            subprocess.run([ff, "-y", "-i", out_path, "-c:v", "libx264",
-                            "-crf", "23", "-movflags", "+faststart", h264_path],
-                           creationflags=0x08000000, capture_output=True, timeout=600)
-            if os.path.exists(h264_path) and os.path.getsize(h264_path) > 0:
-                os.remove(out_path)
-                out_path = h264_path
-        except Exception as e:
-            pass
+        # 第二阶段：为每个进球生成独立预览片段
+        # 每个进球前后各 clip_half 秒，单独一个 mp4，方便用户逐个保留/删除
+        goals = sorted(detector.goals)
+        print(f"[DEBUG] 第二阶段开始: 检测到 {len(goals)} 个进球, goals={goals}", flush=True)
+        _last_goal_clips.clear()
+        _kept_goal_indices.clear()  # 重置保留标记，待用户重新选择
+
+        import imageio_ffmpeg
+        import subprocess as _sp
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+
+        for gi, gts in enumerate(goals):
+            progress(0.7 + 0.25 * gi / max(len(goals), 1),
+                     desc=f"生成片段 {gi+1}/{len(goals)} ({gts:.1f}s)...")
+            gframe = int(gts * fps)
+            seg_start = max(start, gframe - clip_half)
+            seg_end = min(end, gframe + clip_half)
+            if seg_end <= seg_start:
+                continue
+
+            # ffmpeg 直接切片 + 转码 H.264（单次完成，跳过逐帧读取和中间文件）
+            # 预览片段降到 480p 加速生成（仅供人工确认用，集锦保持原画质）
+            clip_path = str(out_dir / f"goal_{gi}_{int(gts)}s_{_stamp}.mp4")
+            seg_start_sec = seg_start / fps
+            seg_dur_sec = (seg_end - seg_start) / fps
+            try:
+                _sp.run([ff, "-y", "-loglevel", "error",
+                         "-ss", f"{seg_start_sec:.3f}", "-i", _video_state["path"],
+                         "-t", f"{seg_dur_sec:.3f}",
+                         "-vf", "scale=-2:480",  # 480p，保持宽高比
+                         "-c:v", "libx264", "-preset", "fast", "-crf", "26",
+                         "-movflags", "+faststart", clip_path],
+                        creationflags=0x08000000, capture_output=True, timeout=60)
+                if not (os.path.exists(clip_path) and os.path.getsize(clip_path) > 0):
+                    clip_path = None
+            except Exception:
+                clip_path = None
+
+            if clip_path:
+                _last_goal_clips.append({"ts": gts, "path": clip_path, "idx": gi})
+                print(f"[DEBUG] 片段 {gi+1}/{len(goals)} 生成完成: {clip_path}", flush=True)
+
+        # 默认全部保留（用户可后续取消）
+        _kept_goal_indices = set(range(len(_last_goal_clips)))
+        print(f"[DEBUG] 第二阶段完成: 共生成 {len(_last_goal_clips)} 个片段", flush=True)
 
         progress(1.0, desc="完成")
         # 保存进球时间戳供「生成集锦」使用
@@ -360,17 +345,21 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
         # 诊断信息
         bx = f"[{diag['ball_x_min']:.0f}, {diag['ball_x_max']:.0f}]" if diag["ball_detected"] else "N/A"
         by = f"[{diag['ball_y_min']:.0f}, {diag['ball_y_max']:.0f}]" if diag["ball_detected"] else "N/A"
-        extra = ""
-        if use_diff:
-            d = detector.diag
-            extra = (f"运动斑块检测: {diag['blob_detected']}/{processed} 帧 "
-                     f"({diag['blob_detected']/max(processed,1)*100:.0f}%)\n"
-                     f"━━━ diff 拒绝原因 ━━━\n"
-                     f"  到达上方: {d['cross_above']} | 在框内: {d['in_hoop']} | 到达下方: {d['cross_below']}\n"
-                     f"  冷却跳过: {d['reject_cooldown']} | 无斑块: {d['reject_no_blob']}\n"
-                     f"  无上方直接到下方: {d['reject_no_above']} | x不在范围: {d['reject_in_x']}\n"
-                     f"  斑块太宽: {d['reject_size']} | 趋势失败: {d['reject_trend']}\n"
-                     f"  侧向进筐成功: {d['side_goal']} | 超时匹配成功: {d['timeout_goal']}\n")
+        d = detector.diag
+        total_yolo_triggers = d['yolo_confirmed'] + d['yolo_rejected']
+        confirm_rate = d['yolo_confirmed'] / max(total_yolo_triggers, 1) * 100
+        extra = (f"运动斑块检测: {diag['blob_detected']}/{processed} 帧 "
+                 f"({diag['blob_detected']/max(processed,1)*100:.0f}%)\n"
+                 f"━━━ diff 拒绝原因 ━━━\n"
+                 f"  到达上方: {d['cross_above']} | 在框内: {d['in_hoop']} | 到达下方: {d['cross_below']}\n"
+                 f"  冷却跳过: {d['reject_cooldown']} | 无斑块: {d['reject_no_blob']}\n"
+                 f"  无上方直接到下方: {d['reject_no_above']} | x不在范围: {d['reject_in_x']}\n"
+                 f"  斑块太宽: {d['reject_size']} | 趋势失败: {d['reject_trend']}\n"
+                 f"  侧向进筐成功: {d['side_goal']} | 超时匹配成功: {d['timeout_goal']}\n"
+                 f"━━━ YOLO 双确认 ━━━\n"
+                 f"  diff触发次数: {total_yolo_triggers} | "
+                 f"YOLO确认: {d['yolo_confirmed']} | YOLO否决: {d['yolo_rejected']}\n"
+                 f"  确认率: {confirm_rate:.0f}%\n")
         status = (f"✅ 检测完成 [{method_name}]\n"
                   f"处理: {processed} 帧 | 耗时: {elapsed:.0f}s | "
                   f"{processed/max(elapsed,0.1):.1f} fps\n"
@@ -385,10 +374,90 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, method, progre
                   f"球在篮筐 x 范围内: {diag['in_x_range']} 帧\n"
                   f"  其中 ABOVE(上方): {diag['above']} | IN_HOOP(框内): {diag['in_hoop']} | "
                   f"BELOW(下方): {diag['below']}")
-        return out_path, status
+        # 返回：第一个片段路径（供预览）+ 保留列表更新 + Dropdown更新 + 状态文本
+        first_clip = _last_goal_clips[0]["path"] if _last_goal_clips else None
+        # 进球选项：["1) 5.1s", "2) 14.6s", ...]
+        goal_choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
+        # 默认全选（全部保留）
+        default_kept = goal_choices[:]
+        # Dropdown 默认选第一个
+        default_preview = goal_choices[0] if goal_choices else None
+        return (first_clip,
+                gr.update(choices=goal_choices, value=default_kept),  # CheckboxGroup
+                gr.update(choices=goal_choices, value=default_preview),  # Dropdown
+                status)
     except Exception as e:
         import traceback
-        return None, f"❌ 检测失败: {e}\n\n{traceback.format_exc()}"
+        return (None,
+                gr.update(choices=[], value=[]),
+                gr.update(choices=[], value=None),
+                f"❌ 检测失败: {e}\n\n{traceback.format_exc()}")
+
+
+def on_select_goal_preview(selected):
+    """用户在 CheckboxGroup 选择某个进球时，预览该片段。
+    取第一个被选中的片段作为预览（Gradio CheckboxGroup 不支持单选）。
+    这里用单独的 Dropdown 选择预览更合适，但为简化用第一个选中项。
+    实际预览通过下方的 on_preview_goal_by_idx 实现。
+    """
+    if not selected or not _last_goal_clips:
+        return None
+    # 解析第一个选中项的索引
+    try:
+        idx = int(selected[0].split(")")[0]) - 1
+        return _last_goal_clips[idx]["path"]
+    except (IndexError, ValueError):
+        return None
+
+
+def on_preview_goal_by_idx(idx_str):
+    """通过下拉框选择预览某个进球片段。"""
+    if not _last_goal_clips or not idx_str:
+        return None
+    try:
+        idx = int(idx_str.split(")")[0]) - 1
+        if 0 <= idx < len(_last_goal_clips):
+            return _last_goal_clips[idx]["path"]
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def on_update_kept_goals(kept_choices):
+    """更新用户保留的进球列表，并删除未保留的片段文件。"""
+    global _kept_goal_indices, _last_goals
+    if not _last_goal_clips:
+        return "没有可保留的进球片段"
+
+    # 解析保留的索引
+    kept_indices = set()
+    for c in kept_choices:
+        try:
+            kept_indices.add(int(c.split(")")[0]) - 1)
+        except ValueError:
+            continue
+
+    # 删除未保留的片段文件
+    deleted = 0
+    for i, clip in enumerate(_last_goal_clips):
+        if i not in kept_indices:
+            try:
+                os.remove(clip["path"])
+                deleted += 1
+            except Exception:
+                pass
+
+    # 更新全局状态
+    _kept_goal_indices = kept_indices
+    # 更新 _last_goals 供集锦使用
+    kept_goals = [_last_goal_clips[i]["ts"] for i in sorted(kept_indices)
+                  if i < len(_last_goal_clips)]
+    _last_goals.clear()
+    _last_goals.extend(kept_goals)
+
+    total = len(_last_goal_clips)
+    kept = len(kept_indices)
+    return f"✅ 保留 {kept}/{total} 个进球 | 已删除 {deleted} 个片段 | 保留的进球时间: {', '.join([f'{t:.1f}s' for t in kept_goals])}"
 
 
 def on_generate_highlights(pre_roll, post_roll, min_gap, progress=gr.Progress()):
@@ -420,68 +489,6 @@ def on_generate_highlights(pre_roll, post_roll, min_gap, progress=gr.Progress())
         return None, f"❌ 剪辑失败: {e}\n\n{traceback.format_exc()}"
 
 
-def on_vlm_verify(api_key, min_confidence, progress=gr.Progress()):
-    """用 VLM 对 CV 检测到的候选进球做二次验证。"""
-    if _video_state["path"] is None:
-        return "❌ 请先加载视频并检测进球", ""
-    if not _last_goals:
-        return "❌ 没有候选进球（请先点「开始检测」）", ""
-    if not api_key or not api_key.strip():
-        return "❌ 请输入 Mimo API Key", ""
-
-    api_key = api_key.strip()
-    n = len(_last_goals)
-    progress(0.02, desc=f"开始 VLM 验证（{n} 个候选）...")
-
-    log_lines = [f"VLM 二次验证开始（{n} 个候选进球）"]
-    log_lines.append(f"API: Mimo v2.5 | 窗口: ±3秒 | 最低置信度: {min_confidence}")
-    log_lines.append("")
-
-    confirmed = []
-
-    def on_progress(current, total, result):
-        pct = current / total
-        ts = result["timestamp"]
-        status = "✅进球" if result["is_goal"] else "❌否决"
-        conf = result["confidence"]
-        reason = result.get("reason", "")[:50]
-        err = result.get("error", "")
-        line = f"[{current}/{total}] {ts:.1f}s → {status} (conf={conf:.2f})"
-        if err:
-            line += f" ⚠️{err[:30]}"
-        elif reason:
-            line += f" {reason}"
-        log_lines.append(line)
-        if result["is_goal"] and conf >= min_confidence:
-            confirmed.append(ts)
-        progress(pct, desc=f"VLM 验证中 {current}/{total}")
-
-    results = verify_goals_batch(
-        _video_state["path"], list(_last_goals), api_key,
-        progress_callback=on_progress,
-    )
-
-    confirmed = filter_confirmed_goals(results, min_confidence=min_confidence)
-
-    log_lines.append("")
-    log_lines.append(f"━━━ VLM 验证结果 ━━━")
-    log_lines.append(f"候选: {n} 个 | 确认进球: {len(confirmed)} 个 | "
-                     f"否决: {n - len(confirmed)} 个")
-    if confirmed:
-        log_lines.append("确认的进球时间: " +
-                         ", ".join([f"{t:.1f}s" for t in confirmed]))
-
-    # 更新全局进球列表为 VLM 确认的结果（供「生成集锦」使用）
-    _last_goals.clear()
-    _last_goals.extend(confirmed)
-
-    progress(1.0, desc="VLM 验证完成")
-    status = (f"✅ VLM 验证完成\n"
-              f"候选 {n} 个 → 确认 {len(confirmed)} 个 → 否决 {n - len(confirmed)} 个\n"
-              f"已更新进球列表，可点「生成集锦」剪辑确认的进球")
-    return status, "\n".join(log_lines)
-
-
 # ============ Gradio 界面 ============
 # 预填已知视频路径
 _DEFAULT_VIDEO = r"D:\Downloads\highlights.mp4"
@@ -509,22 +516,37 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
 
             with gr.Row():
                 start_frame = gr.Number(label="起始帧", value=0, precision=0)
-                end_frame = gr.Number(label="结束帧 (0=到末尾)", value=600, precision=0)
+                end_frame = gr.Number(label="结束帧 (0=到末尾)", value=0, precision=0)
             with gr.Row():
                 ball_conf = gr.Slider(0.1, 0.9, value=0.3, step=0.05,
                                       label="球检测置信度")
                 min_gap = gr.Slider(1.0, 10.0, value=3.0, step=0.5,
                                     label="最小进球间隔(秒)")
-            method = gr.Radio(
-                choices=["chonyy", "diff"],
-                value="diff",
-                label="检测算法",
-                info="chonyy=状态机(需球从上方穿越) | diff=基准帧差法(适合底角视角)")
 
             run_btn = gr.Button("🚀 开始检测", variant="primary")
 
         with gr.Column(scale=1):
-            result_video = gr.Video(label="检测结果视频")
+            gr.Markdown("### 🎬 进球片段预览")
+            with gr.Row():
+                goal_selector = gr.Dropdown(
+                    label="选择进球片段预览",
+                    choices=[],
+                    value=None,
+                    interactive=True,
+                    info="检测完成后下拉选择某个进球查看片段")
+                refresh_preview_btn = gr.Button("▶️ 预览", size="sm")
+            result_video = gr.Video(label="片段预览（每个进球单独一段）")
+            gr.Markdown("**勾选要保留的进球，取消勾选要删除的进球，然后点「确认保留」**")
+            kept_goals = gr.CheckboxGroup(
+                label="保留/删除进球（勾选=保留）",
+                choices=[],
+                value=[],
+                interactive=True)
+            with gr.Row():
+                confirm_kept_btn = gr.Button("✅ 确认保留（删除未勾选的片段）", variant="primary")
+                keep_all_btn = gr.Button("全选", size="sm")
+                clear_all_btn = gr.Button("全不选", size="sm")
+            kept_status = gr.Textbox(label="保留状态", interactive=False, lines=3)
             result_status = gr.Textbox(label="检测统计", interactive=False, lines=12)
 
             gr.Markdown("---\n### ✂️ 自动剪辑集锦")
@@ -537,21 +559,6 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
             highlights_video = gr.Video(label="集锦视频")
             highlights_status = gr.Textbox(label="剪辑状态", interactive=False, lines=4)
 
-            gr.Markdown("---\n### 🤖 VLM 大模型二次验证（推荐）")
-            gr.Markdown("CV 检测的候选进球 → VLM 逐个确认 → 过滤误报。"
-                        "解决 CV 漏检/误报问题，提高准确率")
-            vlm_api_key = gr.Textbox(
-                label="Mimo API Key",
-                value=os.environ.get("MIMO_API_KEY", ""),
-                type="password",
-                placeholder="tp-xxxxx",
-                info="从 https://platform.xiaomimimo.com 获取")
-            vlm_conf = gr.Slider(0.0, 1.0, value=0.5, step=0.1,
-                                 label="最低确认置信度")
-            vlm_btn = gr.Button("🤖 VLM 验证候选进球", variant="primary")
-            vlm_status = gr.Textbox(label="验证状态", interactive=False, lines=3)
-            vlm_log = gr.Textbox(label="验证日志", interactive=False, lines=12)
-
     # 事件绑定
     load_btn.click(on_load_video, inputs=[video_path_input],
                    outputs=[preview_image, frame_slider, info_text])
@@ -560,15 +567,25 @@ with gr.Blocks(title="篮球进球检测交互式 Demo") as demo:
     preview_image.select(on_image_click, inputs=[frame_slider],
                          outputs=[preview_image, click_status])
     reset_btn.click(on_reset_hoop, outputs=[click_status])
+    # 检测完成 → 返回首个片段预览 + 保留列表 + Dropdown选项 + 状态
     run_btn.click(on_run_detect,
-                  inputs=[start_frame, end_frame, ball_conf, min_gap, method],
-                  outputs=[result_video, result_status])
+                  inputs=[start_frame, end_frame, ball_conf, min_gap],
+                  outputs=[result_video, kept_goals, goal_selector, result_status])
+    # 下拉选择预览某个进球片段
+    goal_selector.change(on_preview_goal_by_idx, inputs=[goal_selector],
+                         outputs=[result_video])
+    refresh_preview_btn.click(on_preview_goal_by_idx, inputs=[goal_selector],
+                              outputs=[result_video])
+    # 全选/全不选
+    keep_all_btn.click(lambda: gr.update(value=[c for c in kept_goals.choices]),
+                       outputs=[kept_goals])
+    clear_all_btn.click(lambda: gr.update(value=[]), outputs=[kept_goals])
+    # 确认保留：删除未勾选的片段文件，更新 _last_goals
+    confirm_kept_btn.click(on_update_kept_goals, inputs=[kept_goals],
+                           outputs=[kept_status])
     cut_btn.click(on_generate_highlights,
                   inputs=[pre_roll, post_roll, cut_min_gap],
                   outputs=[highlights_video, highlights_status])
-    vlm_btn.click(on_vlm_verify,
-                  inputs=[vlm_api_key, vlm_conf],
-                  outputs=[vlm_status, vlm_log])
 
 
 if __name__ == "__main__":
@@ -576,7 +593,8 @@ if __name__ == "__main__":
     _gradio_dir = str(Path(_CACHE_ROOT) / "gradio")
     os.makedirs(_out_dir, exist_ok=True)
     os.makedirs(_gradio_dir, exist_ok=True)
-    demo.launch(server_name="127.0.0.1", server_port=7870,
+    demo.queue(default_concurrency_limit=1)  # Gradio 6.x 需显式启用队列，SSE 才能正常工作
+    demo.launch(server_name="127.0.0.1", server_port=7871,
                 show_error=True, prevent_thread_lock=False,
                 max_file_size=5000*1024*1024,  # 5GB 上限
                 allowed_paths=[_CACHE_ROOT])  # 允许整个 bball_cache（含 gradio 会话子目录）

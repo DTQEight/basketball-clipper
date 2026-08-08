@@ -31,7 +31,9 @@ class GoalDetector:
                  diff_threshold=25, min_blob_area=50, max_blob_area=5000,
                  search_margin=60,
                  audio_peaks=None, fusion_window=2.0,
-                 fusion_mode="or"):
+                 fusion_mode="or",
+                 loose_mode=False,
+                 yolo_confirm=False):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
@@ -46,6 +48,14 @@ class GoalDetector:
             "and" - 视觉和音频都必须触发（高精度）
             "fused_only" - 仅输出双信号确认的进球
             "visual_only" - 仅用视觉信号（兼容旧行为）
+        loose_mode: 宽松模式（高召回，配合 VLM 二次验证使用）
+            True  - 运动斑块进入篮筐框内就标记为候选进球（不需穿越上下沿）
+                    用于 CV 扫候选 + VLM 验证精度 的工作流
+            False - 默认严格模式（斑块需从上沿穿越到下沿）
+        yolo_confirm: YOLO 双确认（需配合 loose_mode=True 使用）
+            True  - loose 触发时，检查同一帧 YOLO 球位置是否在篮筐框内
+                    两者都满足才算进球（高精度，减少球员手/头误报）
+            False - 不做 YOLO 确认（纯 diff loose）
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -65,6 +75,8 @@ class GoalDetector:
         self.audio_peaks = sorted([float(p) for p in audio_peaks]) if audio_peaks else []
         self.fusion_window = float(fusion_window)
         self.fusion_mode = fusion_mode
+        self.loose_mode = loose_mode  # 宽松模式：斑块进框即候选，配合 VLM 验证
+        self.yolo_confirm = yolo_confirm  # YOLO 双确认：loose 触发时检查 YOLO 球位置
 
         # 基准帧（灰度）
         self.baseline_gray = None
@@ -95,6 +107,11 @@ class GoalDetector:
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
         self._audio_used = set()       # 已被匹配的音频峰值索引
 
+        # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
+        # 格式: [(frame_idx, cx, cy), ...]，保留最近 yolo_window_frames 帧
+        self.ball_pos_history = []
+        self.yolo_window_frames = 10   # 时间窗口大小（±10帧 ≈ 0.33秒 @30fps）
+
         # 诊断计数器
         self.diag = {
             "cross_above": 0,      # 斑块到达篮筐上方次数
@@ -108,6 +125,8 @@ class GoalDetector:
             "reject_no_blob": 0,   # 没检测到运动斑块
             "side_goal": 0,        # 侧向进筐判定成功
             "timeout_goal": 0,     # 超时匹配成功
+            "yolo_confirmed": 0,   # YOLO 双确认成功
+            "yolo_rejected": 0,    # YOLO 双确认失败（diff 触发但 YOLO 没球）
         }
 
     def set_baseline(self, frame):
@@ -187,7 +206,9 @@ class GoalDetector:
     def feed(self, ball_pos, frame_idx, fps, frame=None):
         """喂入一帧数据。
 
-        ball_pos: 忽略（兼容接口，基准帧差法不用 YOLO）
+        ball_pos: YOLO 球位置 (cx, cy, x1, y1, x2, y2, conf) 或 None
+                  - diff/diff_loose 模式忽略此参数
+                  - diff_yolo 模式需要传入，用于双确认
         frame_idx: 当前帧号
         fps: 帧率
         frame: 当前帧 BGR 图像（必须提供）
@@ -217,6 +238,15 @@ class GoalDetector:
                 self.diag["reject_cooldown"] += 1
                 self.last_blob_box = None
                 return None
+
+        # 缓存 YOLO 球位置到历史（用于双确认的时间窗口检查）
+        # 进球是一个过程（~0.3秒），即使触发瞬间 YOLO 漏检，前后帧检测到也能确认
+        if ball_pos is not None:
+            self.ball_pos_history.append((frame_idx, ball_pos[0], ball_pos[1]))
+        # 保留最近 yolo_window_frames 帧
+        cutoff = frame_idx - self.yolo_window_frames
+        while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
+            self.ball_pos_history.pop(0)
 
         # 在篮筐周边找运动斑块
         blob = self._find_moving_blob(frame_gray)
@@ -258,6 +288,35 @@ class GoalDetector:
             if in_x:
                 self.blob_in_hoop_frames += 1
                 self.last_in_hoop_frame = frame_idx
+
+                # 宽松模式：斑块进框即标记候选（配合 VLM 二次验证）
+                # 不要求穿越上下沿、不检查趋势，最大化召回率
+                if self.loose_mode and self.blob_in_hoop_frames >= 1:
+                    # YOLO 软确认：检查时间窗口内 YOLO 是否检测到球在篮筐附近
+                    # YOLO 有球在篮筐附近 → 确认进球（yolo_confirmed）
+                    # YOLO 没球或球不在附近 → 不否决，仍注册候选（yolo_no_evidence）
+                    #   理由：底角视角下 YOLO 常跟错物体或漏检，
+                    #         硬否决会导致真实进球被漏掉，交给 VLM 二次验证更可靠
+                    if self.yolo_confirm:
+                        margin_x = self.hoop_w * 1.0
+                        margin_y = self.hoop_h * 1.0
+                        x_lo = self.hoop_x1 - margin_x
+                        x_hi = self.hoop_x2 + margin_x
+                        y_lo = self.hoop_y1 - margin_y
+                        y_hi = self.hoop_y2 + margin_y
+                        yolo_near_hoop = any(
+                            x_lo <= bx <= x_hi and y_lo <= by <= y_hi
+                            for (_, bx, by) in self.ball_pos_history
+                        )
+                        if yolo_near_hoop:
+                            self.diag["yolo_confirmed"] += 1
+                        else:
+                            self.diag["yolo_rejected"] += 1
+                            # 软确认：不 return，继续注册候选
+                    ts = frame_idx / fps
+                    if self._register_goal(ts, frame_idx, fps, "loose"):
+                        self.blob_in_hoop_frames = 0
+                        return ts
 
         # 斑块在篮筐下方
         elif cy >= self.hoop_bot:
@@ -350,6 +409,26 @@ class GoalDetector:
             self.blob_in_hoop_frames = 0
 
         return None
+
+    def _register_goal(self, ts, frame_idx, fps, source=""):
+        """注册一个进球时间戳（供宽松模式复用，避免重复代码）。
+
+        返回: True 表示已注册（受冷却期控制），False 表示被冷却期拒绝
+        """
+        # 冷却期检查
+        if self.last_goal_frame >= 0:
+            gap_sec = (frame_idx - self.last_goal_frame) / fps
+            if gap_sec < self.min_gap_sec:
+                self.diag["reject_cooldown"] += 1
+                return False
+
+        self.visual_goals.append(ts)
+        self.goals.append(ts)
+        self.last_goal_frame = frame_idx
+        self.blob_history = []
+        if source == "loose":
+            self.diag["side_goal"] += 1  # 复用 side_goal 计数器
+        return True
 
     def _match_audio_peak(self, ts):
         """检查时间戳 ts 附近 ±fusion_window 内是否有未使用的音频峰值。

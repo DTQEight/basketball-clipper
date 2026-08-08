@@ -62,6 +62,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         output_path = os.path.join(out_dir, "highlights.mp4")
 
     # 切片：用 -ss 在输入前做快速 seek，-t 控制时长
+    # 集锦保持原画质：crf=18（接近无损），不缩放
     for i, (start, end) in enumerate(segments):
         clip_path = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
         duration = end - start
@@ -69,7 +70,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
             ffmpeg, "-y", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-i", video_path,
             "-t", f"{duration:.3f}",
-            "-c:v", codec, "-preset", "fast", "-crf", "23",
+            "-c:v", codec, "-preset", "fast", "-crf", "18",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             clip_path,
@@ -86,11 +87,11 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
             f.write(f"file '{p_norm}'\n")
 
     # 拼接：用 re-encode（-c:v libx264 -c:a aac）确保各片段编码一致
-    # 之前用 -c copy 对重新编码的片段可能失败（时间戳/SPS 不一致）
+    # 集锦保持原画质：crf=18，不缩放
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
         "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c:v", codec, "-preset", "fast", "-crf", "23",
+        "-c:v", codec, "-preset", "fast", "-crf", "18",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         output_path,
