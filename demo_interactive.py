@@ -218,12 +218,15 @@ def on_load_history(idx_choice, pre_roll, post_roll, cut_min_gap, progress=gr.Pr
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
 
-    goal_choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
-    default_preview = goal_choices[0] if goal_choices else None
+    checkbox_choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
+    # Radio 选项带保留标记（✅=保留 ❌=未保留），点击即预览
+    radio_choices = [f"{i+1}) {c['ts']:.1f}s {'✅' if i in _kept_goal_indices else '❌'}"
+                     for i, c in enumerate(_last_goal_clips)]
+    default_radio = radio_choices[0] if radio_choices else None
     first_clip = _last_goal_clips[0]["path"] if _last_goal_clips else None
     # CheckboxGroup 默认勾选保留的进球
-    kept_choices = [goal_choices[i] for i in sorted(_kept_goal_indices)
-                    if i < len(goal_choices)]
+    kept_choices = [checkbox_choices[i] for i in sorted(_kept_goal_indices)
+                    if i < len(checkbox_choices)]
 
     status = (f"✅ 已加载历史记录\n"
               f"视频: {r.get('video_name', '')}\n"
@@ -240,8 +243,8 @@ def on_load_history(idx_choice, pre_roll, post_roll, cut_min_gap, progress=gr.Pr
             status,
             first_clip,
             "",
-            gr.update(choices=goal_choices, value=default_preview),
-            gr.update(choices=goal_choices, value=kept_choices))
+            gr.update(choices=radio_choices, value=default_radio),
+            gr.update(choices=checkbox_choices, value=kept_choices))
 
 
 # 加载 .env 文件中的 API Key
@@ -662,20 +665,20 @@ def on_run_detect(start_frame, end_frame, ball_conf, min_gap_sec, progress=gr.Pr
                   f"球在篮筐 x 范围内: {diag['in_x_range']} 帧\n"
                   f"  其中 ABOVE(上方): {diag['above']} | IN_HOOP(框内): {diag['in_hoop']} | "
                   f"BELOW(下方): {diag['below']}")
-        # 返回：第一个片段路径（供预览）+ 保留列表更新 + Dropdown更新 + 状态文本
+        # 返回：第一个片段路径（供预览，检测完成自动播放第一个）+ 保留列表更新 + Radio更新 + 状态文本
         first_clip = _last_goal_clips[0]["path"] if _last_goal_clips else None
-        # 进球选项：["1) 5.1s", "2) 14.6s", ...]
-        goal_choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
-        # 默认全选（全部保留）
-        default_kept = goal_choices[:]
-        # Dropdown 默认选第一个
-        default_preview = goal_choices[0] if goal_choices else None
+        # CheckboxGroup 选项不带标记
+        checkbox_choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
+        # Radio 选项带保留标记（检测完成默认全保留 → 全 ✅，点击即预览）
+        radio_choices = [f"{i+1}) {c['ts']:.1f}s ✅" for i, c in enumerate(_last_goal_clips)]
+        default_kept = checkbox_choices[:]  # 默认全选
+        default_radio = radio_choices[0] if radio_choices else None
         # 保存到历史记录（初始全部进球作为 goals，kept_goals 暂为全部）
         _add_history(_video_state["path"], hoop,
                      detector.goals, detector.goals)
         return (first_clip,
-                gr.update(choices=goal_choices, value=default_kept),  # CheckboxGroup
-                gr.update(choices=goal_choices, value=default_preview),  # Dropdown
+                gr.update(choices=checkbox_choices, value=default_kept),  # CheckboxGroup
+                gr.update(choices=radio_choices, value=default_radio),  # Radio
                 status)
     except Exception as e:
         import traceback
@@ -702,7 +705,7 @@ def on_select_goal_preview(selected):
 
 
 def on_preview_goal_by_idx(idx_str):
-    """通过下拉框选择预览某个进球片段。"""
+    """Radio 选择预览某个进球片段（点击即预览，选项带 ✅/❌ 标记不影响索引解析）。"""
     if not _last_goal_clips or not idx_str:
         return None
     try:
@@ -714,13 +717,15 @@ def on_preview_goal_by_idx(idx_str):
     return None
 
 
-def on_update_kept_goals(kept_choices):
-    """更新用户保留的进球列表，并删除未保留的片段文件。"""
+def on_kept_goals_change(kept_choices, current_radio_value):
+    """CheckboxGroup 勾选变化时实时更新保留状态（不删文件，集锦直接用 _last_goals 时间戳从原视频切）。
+    同时刷新 Radio 选项的 ✅/❌ 标记，保持当前预览项不变。
+    """
     global _kept_goal_indices, _last_goals
     if not _last_goal_clips:
-        return "没有可保留的进球片段"
+        return "", gr.update()
 
-    # 解析保留的索引
+    # 解析保留索引
     kept_indices = set()
     for c in kept_choices:
         try:
@@ -728,31 +733,51 @@ def on_update_kept_goals(kept_choices):
         except ValueError:
             continue
 
-    # 删除未保留的片段文件
-    deleted = 0
-    for i, clip in enumerate(_last_goal_clips):
-        if i not in kept_indices:
-            try:
-                os.remove(clip["path"])
-                deleted += 1
-            except Exception:
-                pass
-
-    # 更新全局状态
+    # 更新全局状态（集锦生成直接读 _last_goals）
     _kept_goal_indices = kept_indices
-    # 更新 _last_goals 供集锦使用
-    kept_goals = [_last_goal_clips[i]["ts"] for i in sorted(kept_indices)
-                  if i < len(_last_goal_clips)]
+    kept_ts = [_last_goal_clips[i]["ts"] for i in sorted(kept_indices)
+               if i < len(_last_goal_clips)]
     _last_goals.clear()
-    _last_goals.extend(kept_goals)
+    _last_goals.extend(kept_ts)
+
+    # 实时写历史记录
+    if _video_state["path"]:
+        _add_history(_video_state["path"], _calib["hoop"],
+                     [c["ts"] for c in _last_goal_clips], kept_ts)
+
+    # 重建带标记的 Radio 选项，根据原 value 索引映射到新 value（避免选项文字变 ✅/❌ 后 value 失配）
+    radio_choices = [f"{i+1}) {c['ts']:.1f}s {'✅' if i in _kept_goal_indices else '❌'}"
+                     for i, c in enumerate(_last_goal_clips)]
+    new_value = None
+    if current_radio_value:
+        try:
+            idx = int(current_radio_value.split(")")[0]) - 1
+            if 0 <= idx < len(radio_choices):
+                new_value = radio_choices[idx]
+        except ValueError:
+            pass
 
     total = len(_last_goal_clips)
     kept = len(kept_indices)
-    # 更新历史记录中的 kept_goals
-    if _video_state["path"]:
-        _add_history(_video_state["path"], _calib["hoop"],
-                     [c["ts"] for c in _last_goal_clips], kept_goals)
-    return f"✅ 保留 {kept}/{total} 个进球 | 已删除 {deleted} 个片段 | 保留的进球时间: {', '.join([f'{t:.1f}s' for t in kept_goals])}"
+    status = (f"保留 {kept}/{total} 个 | " +
+              (", ".join([f"{t:.1f}s" for t in kept_ts]) if kept_ts else "无保留"))
+    return status, gr.update(choices=radio_choices, value=new_value)
+
+
+def on_keep_all():
+    """全选：勾选所有进球片段（触发 kept_goals.change 自动更新状态与 Radio 标记）。"""
+    if not _last_goal_clips:
+        return gr.update()
+    choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
+    return gr.update(choices=choices, value=choices[:])
+
+
+def on_clear_all():
+    """全不选：取消所有勾选（触发 kept_goals.change 自动更新状态与 Radio 标记）。"""
+    if not _last_goal_clips:
+        return gr.update()
+    choices = [f"{i+1}) {c['ts']:.1f}s" for i, c in enumerate(_last_goal_clips)]
+    return gr.update(choices=choices, value=[])
 
 
 def on_generate_highlights(pre_roll, post_roll, min_gap, progress=gr.Progress()):
@@ -1072,123 +1097,110 @@ _custom_theme = gr.themes.Soft(
 _custom_css = """
 .gradio-container { max-width: 1400px !important; padding: 16px !important; }
 h1 { text-align: center; margin-bottom: 4px !important; }
-.step-badge {
-    display: inline-block; background: #f97316; color: white;
-    width: 26px; height: 26px; line-height: 26px; border-radius: 50%;
-    text-align: center; font-weight: bold; margin-right: 6px; font-size: 14px;
-}
-.section-card { padding: 4px 0; }
 .status-box textarea { font-family: 'Consolas', 'SF Mono', monospace !important; font-size: 12px !important; }
+.compact-row { gap: 4px !important; }
 """
 
 with gr.Blocks(title="篮球进球检测") as demo:
     gr.Markdown("# 🏀 篮球进球检测与自动剪辑")
-    gr.Markdown("<p style='text-align:center;color:#64748b;'>输入视频文件或文件夹路径 → 滑动到篮筐画面 → 点击 2 点标定 → 开始检测</p>")
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1, min_width=480):
-            with gr.Group():
-                gr.Markdown("### 📥 加载视频")
-                video_path_input = gr.Textbox(
-                    label="视频文件或文件夹路径",
-                    value=_DEFAULT_VIDEO,
-                    placeholder=r"文件: D:\xxx.mp4 | 文件夹: D:\Videos\basketball",
-                    lines=1)
-                load_btn = gr.Button("📥 加载", variant="primary")
-                info_text = gr.Textbox(label="视频信息", interactive=False, lines=3,
-                                       elem_classes="status-box")
-
-            with gr.Group(visible=False) as batch_group:
-                gr.Markdown("### 📁 批量标定")
-                batch_video_selector = gr.Dropdown(
-                    label="视频列表（✅=已标定 ⬜=未标定）",
-                    choices=[],
-                    value=None,
-                    interactive=True,
-                    info="选择视频 → 加载到预览区 → 点击 2 点标定 → 保存标定")
-                with gr.Row():
-                    batch_load_btn = gr.Button("📥 加载到预览区", size="sm")
-                    batch_save_calib_btn = gr.Button("💾 保存标定", variant="primary", size="sm")
-                batch_calib_status = gr.Textbox(label="标定进度", interactive=False, lines=2,
-                                                elem_classes="status-box")
-
-            with gr.Group():
-                gr.Markdown("### 🎯 篮筐标定")
-                frame_slider = gr.Slider(minimum=0, maximum=1, value=0, step=1,
-                                         label="帧选择器（滑动到篮筐画面）")
-                preview_image = gr.Image(label="点击画面 2 个点标定篮筐（左上 + 右下）",
-                                         type="numpy", interactive=False, height=320)
-                with gr.Row():
-                    click_status = gr.Textbox(label="标定状态", interactive=False,
-                                              scale=3, elem_classes="status-box")
-                    reset_btn = gr.Button("🔄 重置", size="sm", scale=1)
-
-            with gr.Group():
-                gr.Markdown("### ⚙️ 检测参数")
-                with gr.Row():
-                    start_frame = gr.Number(label="起始帧", value=0, precision=0)
-                    end_frame = gr.Number(label="结束帧 (0=到末尾)", value=0, precision=0)
-                with gr.Row():
-                    ball_conf = gr.Slider(0.1, 0.9, value=0.3, step=0.05,
-                                          label="球检测置信度")
-                    min_gap = gr.Slider(1.0, 10.0, value=3.0, step=0.5,
-                                        label="最小进球间隔(秒)")
-
-                run_btn = gr.Button("🚀 开始检测", variant="primary")
-                batch_detect_btn = gr.Button("🚀 批量识别（检测所有已标定视频）",
-                                             variant="primary", visible=False)
-
-        with gr.Column(scale=1, min_width=480):
-            with gr.Group():
-                gr.Markdown("### 🎬 进球片段预览")
-                with gr.Row():
-                    goal_selector = gr.Dropdown(
-                        label="选择进球片段",
-                        choices=[],
-                        value=None,
-                        interactive=True,
-                        scale=4)
-                    refresh_preview_btn = gr.Button("▶️ 预览", size="sm", scale=1)
-                result_video = gr.Video(label="片段预览", height=280)
-                gr.Markdown("<small>勾选要保留的进球，取消勾选要删除的，然后点「确认保留」</small>")
-                kept_goals = gr.CheckboxGroup(
-                    label="保留/删除进球（勾选=保留）",
-                    choices=[],
-                    value=[],
-                    interactive=True)
-                with gr.Row():
-                    confirm_kept_btn = gr.Button("✅ 确认保留", variant="primary")
-                    keep_all_btn = gr.Button("全选", size="sm")
-                    clear_all_btn = gr.Button("全不选", size="sm")
-                kept_status = gr.Textbox(label="保留状态", interactive=False, lines=2,
-                                         elem_classes="status-box")
-                result_status = gr.Textbox(label="检测统计", interactive=False, lines=10,
+    with gr.Tabs() as top_tabs:
+        # ====== Tab 1: 检测 ======
+        with gr.Tab("🎯 检测"):
+            gr.Markdown("<p style='color:#64748b;'>视频路径 → 滑到篮筐画面 → 点击 2 点标定 → 开始检测</p>")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1, min_width=480):
+                    # 1. 加载视频
+                    video_path_input = gr.Textbox(
+                        label="视频文件或文件夹路径",
+                        value=_DEFAULT_VIDEO,
+                        placeholder=r"文件: D:\xxx.mp4 | 文件夹: D:\Videos\basketball",
+                        lines=1)
+                    load_btn = gr.Button("📥 加载", variant="primary")
+                    info_text = gr.Textbox(label="视频信息", interactive=False, lines=2,
                                            elem_classes="status-box")
 
-            with gr.Group():
-                gr.Markdown("### ✂️ 自动剪辑集锦")
-                with gr.Row():
-                    pre_roll = gr.Number(label="进球前(秒)", value=5, precision=0)
-                    post_roll = gr.Number(label="进球后(秒)", value=5, precision=0)
-                    cut_min_gap = gr.Number(label="合并间隔(秒)", value=8, precision=0)
-                cut_btn = gr.Button("✂️ 生成集锦", variant="primary")
-                highlights_video = gr.Video(label="集锦视频", height=240)
-                highlights_status = gr.Textbox(label="剪辑状态", interactive=False, lines=3,
-                                               elem_classes="status-box")
+                    # 2. 批量标定（折叠，仅文件夹模式显示）
+                    with gr.Accordion("📁 批量标定", open=False, visible=False) as batch_group:
+                        batch_video_selector = gr.Dropdown(
+                            label="视频列表（✅=已标定 ⬜=未标定）",
+                            choices=[], value=None, interactive=True,
+                            info="选择 → 加载到预览区 → 点击 2 点标定 → 保存标定")
+                        with gr.Row():
+                            batch_load_btn = gr.Button("📥 加载到预览区", size="sm")
+                            batch_save_calib_btn = gr.Button("💾 保存标定", variant="primary", size="sm")
+                        batch_calib_status = gr.Textbox(label="标定进度", interactive=False, lines=1,
+                                                        elem_classes="status-box")
 
-            with gr.Group():
-                gr.Markdown("### 📂 历史记录")
+                    # 3. 篮筐标定
+                    frame_slider = gr.Slider(minimum=0, maximum=1, value=0, step=1,
+                                             label="帧选择器（滑动到篮筐画面）")
+                    preview_image = gr.Image(label="点击画面 2 个点标定篮筐（左上 + 右下）",
+                                             type="numpy", interactive=False, height=320)
+                    with gr.Row():
+                        click_status = gr.Textbox(label="标定状态", interactive=False,
+                                                  scale=3, elem_classes="status-box")
+                        reset_btn = gr.Button("🔄 重置", size="sm", scale=1)
+
+                    # 4. 检测参数
+                    with gr.Accordion("⚙️ 检测参数", open=False):
+                        with gr.Row():
+                            start_frame = gr.Number(label="起始帧", value=0, precision=0)
+                            end_frame = gr.Number(label="结束帧 (0=到末尾)", value=0, precision=0)
+                        with gr.Row():
+                            ball_conf = gr.Slider(0.1, 0.9, value=0.3, step=0.05,
+                                                  label="球检测置信度")
+                            min_gap = gr.Slider(1.0, 10.0, value=3.0, step=0.5,
+                                                label="最小进球间隔(秒)")
+
+                    run_btn = gr.Button("🚀 开始检测", variant="primary")
+                    batch_detect_btn = gr.Button("🚀 批量识别（检测所有已标定视频）",
+                                                 variant="primary", visible=False)
+
+                with gr.Column(scale=1, min_width=480):
+                    # 5. 进球片段预览（Radio 点击即预览，✅=保留 ❌=未保留，勾选变化即时生效）
+                    with gr.Accordion("🎬 进球片段预览", open=True):
+                        goal_radio = gr.Radio(
+                            label="选择进球片段（点击即预览，✅=保留 ❌=未保留）",
+                            choices=[], value=None, interactive=True)
+                        result_video = gr.Video(label="片段预览", height=260)
+                        kept_goals = gr.CheckboxGroup(
+                            label="保留进球（勾选=保留，勾选变化即时生效，直接点「生成集锦」即可）",
+                            choices=[], value=[], interactive=True)
+                        with gr.Row():
+                            keep_all_btn = gr.Button("全选", size="sm")
+                            clear_all_btn = gr.Button("全不选", size="sm")
+                        kept_status = gr.Textbox(label="保留状态", interactive=False, lines=1,
+                                                 elem_classes="status-box")
+                        result_status = gr.Textbox(label="检测统计", interactive=False, lines=8,
+                                                   elem_classes="status-box")
+
+        # ====== Tab 2: 剪辑集锦 ======
+        with gr.Tab("✂️ 剪辑集锦"):
+            gr.Markdown("<p style='color:#64748b;'>在「检测」Tab 预览确认保留的进球 → 切到本 Tab 生成集锦</p>")
+            with gr.Row():
+                pre_roll = gr.Number(label="进球前(秒)", value=5, precision=0)
+                post_roll = gr.Number(label="进球后(秒)", value=5, precision=0)
+                cut_min_gap = gr.Number(label="合并间隔(秒)", value=8, precision=0)
+            cut_btn = gr.Button("✂️ 生成集锦", variant="primary")
+            highlights_video = gr.Video(label="集锦视频", height=320)
+            highlights_status = gr.Textbox(label="剪辑状态", interactive=False, lines=3,
+                                           elem_classes="status-box")
+
+        # ====== Tab 3: 历史记录 ======
+        with gr.Tab("📂 历史记录"):
+            gr.Markdown("### 📂 检测历史记录")
+            gr.Markdown("<p style='color:#64748b;'>选择历史记录 → 加载 → 自动切回检测 Tab 预览/确认保留 → 切到剪辑 Tab 生成集锦</p>")
+            with gr.Row():
                 history_selector = gr.Dropdown(
                     label="选择历史记录",
-                    choices=_history_choices(),
-                    value=None,
-                    interactive=True,
-                    info="[序号] 视频名 | 保留数/总数 | 时间")
-                with gr.Row():
-                    load_history_btn = gr.Button("📂 加载历史", variant="primary")
-                    refresh_history_btn = gr.Button("🔄 刷新", size="sm")
-                history_status = gr.Textbox(label="历史记录状态", interactive=False, lines=4,
-                                            elem_classes="status-box")
+                    choices=_history_choices(), value=None, interactive=True,
+                    info="[序号] 视频名 | 保留数/总数 | 时间",
+                    scale=4)
+                refresh_history_btn = gr.Button("🔄 刷新列表", size="sm", scale=1)
+            load_history_btn = gr.Button("📂 加载历史", variant="primary")
+            history_status = gr.Textbox(label="历史记录状态", interactive=False, lines=8,
+                                        elem_classes="status-box")
 
     # 事件绑定
     # 统一加载入口（自动判断文件/文件夹）
@@ -1205,23 +1217,20 @@ with gr.Blocks(title="篮球进球检测") as demo:
     # 单视频检测
     run_btn.click(on_run_detect,
                   inputs=[start_frame, end_frame, ball_conf, min_gap],
-                  outputs=[result_video, kept_goals, goal_selector, result_status])
+                  outputs=[result_video, kept_goals, goal_radio, result_status])
     # 批量检测
     batch_detect_btn.click(on_batch_detect,
                            inputs=[ball_conf, min_gap],
                            outputs=[result_status, history_selector])
-    # 下拉选择预览某个进球片段
-    goal_selector.change(on_preview_goal_by_idx, inputs=[goal_selector],
-                         outputs=[result_video])
-    refresh_preview_btn.click(on_preview_goal_by_idx, inputs=[goal_selector],
-                              outputs=[result_video])
-    # 全选/全不选
-    keep_all_btn.click(lambda: gr.update(value=[c for c in kept_goals.choices]),
-                       outputs=[kept_goals])
-    clear_all_btn.click(lambda: gr.update(value=[]), outputs=[kept_goals])
-    # 确认保留
-    confirm_kept_btn.click(on_update_kept_goals, inputs=[kept_goals],
-                           outputs=[kept_status])
+    # Radio 点击即预览（无需额外按钮）
+    goal_radio.change(on_preview_goal_by_idx, inputs=[goal_radio],
+                      outputs=[result_video])
+    # 勾选即生效：实时更新保留状态 + 刷新 Radio 选项的 ✅/❌ 标记
+    kept_goals.change(on_kept_goals_change, inputs=[kept_goals, goal_radio],
+                      outputs=[kept_status, goal_radio])
+    # 全选/全不选（触发 kept_goals.change 自动更新状态与 Radio 标记）
+    keep_all_btn.click(on_keep_all, outputs=[kept_goals])
+    clear_all_btn.click(on_clear_all, outputs=[kept_goals])
     cut_btn.click(on_generate_highlights,
                   inputs=[pre_roll, post_roll, cut_min_gap],
                   outputs=[highlights_video, highlights_status])
@@ -1231,11 +1240,17 @@ with gr.Blocks(title="篮球进球检测") as demo:
     batch_save_calib_btn.click(on_batch_save_calib,
                                outputs=[batch_calib_status, batch_video_selector, click_status])
     # 历史记录
-    load_history_btn.click(on_load_history,
+    def on_load_history_and_switch(*args):
+        """加载历史记录后自动切回检测 Tab。"""
+        result = on_load_history(args[0], args[1], args[2], args[3])
+        # on_load_history 返回 8 个值，追加 top_tabs 切换
+        return list(result) + [gr.Tabs(selected="🎯 检测")]
+
+    load_history_btn.click(on_load_history_and_switch,
                            inputs=[history_selector, pre_roll, post_roll, cut_min_gap],
                            outputs=[preview_image, frame_slider, info_text,
                                     history_status, result_video, kept_status,
-                                    goal_selector, kept_goals])
+                                    goal_radio, kept_goals, top_tabs])
     refresh_history_btn.click(
         lambda: gr.update(choices=_history_choices()),
         outputs=[history_selector])
