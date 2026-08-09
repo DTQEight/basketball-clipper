@@ -28,16 +28,17 @@ class GoalDetector:
                  hoop_above_margin=30, hoop_x_margin=25,
                  approach_dist=100, disappear_frames=3, confirm_below=True,
                  min_gap_sec=3.0,
-                 diff_threshold=25, min_blob_area=50, max_blob_area=5000,
-                 search_margin=60,
+                 diff_threshold=15, min_blob_area=30, max_blob_area=5000,
+                 search_margin=80,
                  audio_peaks=None, fusion_window=2.0,
                  fusion_mode="or",
                  loose_mode=False,
-                 yolo_confirm=False):
+                 yolo_confirm=False,
+                 rolling_baseline_sec=60.0):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
-        diff_threshold: 帧差二值化阈值（25 较保守，可降到 15 提灵敏度）
+        diff_threshold: 帧差二值化阈值（15 高灵敏度，可提到 25 降误报）
         min_blob_area: 最小连通域面积（过滤噪声）
         max_blob_area: 最大连通域面积（过滤大物体如人）
         search_margin: 篮筐周边搜索范围（像素）
@@ -56,6 +57,9 @@ class GoalDetector:
             True  - loose 触发时，检查同一帧 YOLO 球位置是否在篮筐框内
                     两者都满足才算进球（高精度，减少球员手/头误报）
             False - 不做 YOLO 确认（纯 diff loose）
+        rolling_baseline_sec: 滚动基准帧间隔（秒）
+            >0 - 每隔该秒数自动更新基准帧（解决长视频光线/背景变化导致基准失效）
+            0  - 禁用滚动基准帧（固定用初始基准帧）
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -77,9 +81,17 @@ class GoalDetector:
         self.fusion_mode = fusion_mode
         self.loose_mode = loose_mode  # 宽松模式：斑块进框即候选，配合 VLM 验证
         self.yolo_confirm = yolo_confirm  # YOLO 双确认：loose 触发时检查 YOLO 球位置
+        self.rolling_baseline_sec = float(rolling_baseline_sec)  # 滚动基准帧间隔
 
         # 基准帧（灰度）
         self.baseline_gray = None
+        self.last_baseline_frame_idx = -1  # 上次更新基准帧的帧号
+        self.baseline_update_count = 0     # 基准帧更新次数（诊断用）
+        # 滚动基准帧候选：在更新间隔内持续寻找运动量最小的帧作为下一个基准帧
+        # 避免把球/球员拍进基准帧导致 diff 失效
+        self._baseline_candidate_frame = None
+        self._baseline_candidate_diff = float("inf")
+        self._baseline_candidate_idx = -1
         if baseline_frame is not None:
             self.set_baseline(baseline_frame)
 
@@ -93,6 +105,7 @@ class GoalDetector:
         self.blob_above_hoop = False   # 斑块是否在篮筐上方
         self.blob_in_hoop = False      # 斑块是否在篮筐框内
         self.blob_in_hoop_frames = 0   # 斑块在框内的连续帧数
+        self.blob_persistent_frames = 0  # 斑块持续帧数（有运动物体的连续帧）
         self.blob_history = []         # 斑块 y 坐标历史
         self.last_blob_box = None      # 上一帧斑块位置
         self.last_above_frame = -999   # 上次斑块在篮筐上方的帧号
@@ -127,6 +140,7 @@ class GoalDetector:
             "timeout_goal": 0,     # 超时匹配成功
             "yolo_confirmed": 0,   # YOLO 双确认成功
             "yolo_rejected": 0,    # YOLO 双确认失败（diff 触发但 YOLO 没球）
+            "baseline_updates": 0, # 滚动基准帧更新次数
         }
 
     def set_baseline(self, frame):
@@ -222,7 +236,13 @@ class GoalDetector:
         # 首帧自动设为基准（如果未设置）
         if self.baseline_gray is None:
             self.set_baseline(frame)
+            self.last_baseline_frame_idx = frame_idx
             return None
+
+        # 修复：若基准帧是外部传入的（__init__ 中设置），last_baseline_frame_idx 仍为 -1
+        # 此时把它对齐到当前 frame_idx，否则滚动基准帧的触发条件 (>=0) 永远不满足
+        if self.last_baseline_frame_idx < 0:
+            self.last_baseline_frame_idx = frame_idx
 
         # 转灰度 + 模糊
         if len(frame.shape) == 3:
@@ -251,15 +271,49 @@ class GoalDetector:
         # 在篮筐周边找运动斑块
         blob = self._find_moving_blob(frame_gray)
 
+        # ====== 滚动基准帧更新（双触发：时间间隔 + 斑块持续） ======
+        # 旧逻辑只在 blob is None 时更新，球员常驻篮筐附近时永不更新导致 diff 失效。
+        # 新逻辑：① 不管有没有 blob 都检查触发条件；
+        #         ② 在更新间隔内持续寻找运动量最小的帧作为候选基准，避免把球拍进基准帧。
+        if self.rolling_baseline_sec > 0 and self.last_baseline_frame_idx >= 0:
+            gap_sec = (frame_idx - self.last_baseline_frame_idx) / fps
+            # 更新候选基准帧（选 diff 最小的帧 = 运动量最小的帧）
+            if self.last_diff_ratio < self._baseline_candidate_diff:
+                self._baseline_candidate_frame = frame.copy()
+                self._baseline_candidate_diff = self.last_diff_ratio
+                self._baseline_candidate_idx = frame_idx
+            # 触发条件1：时间间隔（默认 60 秒）
+            time_trigger = gap_sec >= self.rolling_baseline_sec
+            # 触发条件2：斑块持续超过 5 秒（球员常驻篮筐附近，基准帧需更新）
+            persistent_trigger = (blob is not None and
+                                  self.blob_persistent_frames > self.fps * 5)
+            if time_trigger or persistent_trigger:
+                cand = self._baseline_candidate_frame
+                if cand is not None:
+                    self.set_baseline(cand)
+                    self.last_baseline_frame_idx = self._baseline_candidate_idx
+                else:
+                    self.set_baseline(frame)
+                    self.last_baseline_frame_idx = frame_idx
+                self.baseline_update_count += 1
+                self.diag["baseline_updates"] += 1
+                # 重置候选
+                self._baseline_candidate_frame = None
+                self._baseline_candidate_diff = float("inf")
+                self._baseline_candidate_idx = -1
+
         if blob is None:
             # 没检测到运动物体，保持状态但衰减历史
             self.diag["reject_no_blob"] += 1
             if len(self.blob_history) > 5:
                 self.blob_history.pop(0)
             self.blob_in_hoop_frames = 0
+            self.blob_persistent_frames = 0  # 无斑块，重置持续计数
             self.last_blob_box = None
             return None
 
+        # 有运动斑块，增加持续计数（用于"球员常驻"触发基准帧更新）
+        self.blob_persistent_frames += 1
         cx, cy, bx1, by1, bx2, by2, area = blob
         self.last_blob_box = (bx1, by1, bx2, by2)
 
