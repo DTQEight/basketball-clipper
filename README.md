@@ -69,6 +69,39 @@ basketball-clipper/
 └── requirements.txt        # 依赖
 ```
 
+## 项目架构
+
+核心 5 个模块的分层与依赖（实线为模块调用，虚线为数据/文件读写）：
+
+```mermaid
+flowchart TD
+    UI["demo_nicegui.py · 应用入口<br/>NiceGUI 界面 · 检测/剪辑/历史编排"]
+    App["app.py<br/>模型加载与推理"]
+    TR["tracker.py<br/>GoalDetector 进球判断"]
+    VI["video_io.py<br/>PyAV 视频读取"]
+    CU["cutter/ffmpeg_cutter.py<br/>切片拼接"]
+    W["weights/ · YOLO 模型权重"]
+    CACHE["E:/bball_cache<br/>历史 · 片段 · 输出缓存"]
+    FF["ffmpeg · imageio-ffmpeg 内置"]
+    LG["legacy/ · 旧界面 · 训练/标注/调试工具"]
+
+    UI --> App
+    UI --> TR
+    UI --> VI
+    UI --> CU
+    App -. 读取 .-> W
+    UI -. 读写 .-> CACHE
+    CU --> FF
+```
+
+- **demo_nicegui.py**：唯一入口，负责界面渲染与检测 / 剪辑 / 历史全流程编排，后台线程执行耗时任务（`run.io_bound`）
+- **app.py**：YOLO 球检测模型懒加载与推理，检测循环实时调用
+- **tracker.py**：`GoalDetector` 进球判定（diff 帧差 + YOLO 软确认），消费 app 输出的球位置
+- **video_io.py**：PyAV 统一视频读取，被 app 与 demo_nicegui 共同依赖
+- **cutter/ffmpeg_cutter.py**：按进球时间戳切片拼接，输出到缓存目录
+- **外部资源**：`weights/`（模型权重）、`E:\bball_cache`（历史记录 / 片段 / 输出）、ffmpeg（imageio-ffmpeg 内置）
+- **legacy/**：仅归档保留，不参与运行
+
 ## 进球检测算法详解
 
 ### 整体架构：diff + YOLO 双确认
