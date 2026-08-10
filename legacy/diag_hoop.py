@@ -7,7 +7,7 @@ import sys
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 _CACHE_ROOT = r"E:\bball_cache"

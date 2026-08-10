@@ -34,7 +34,9 @@ class GoalDetector:
                  fusion_mode="or",
                  loose_mode=False,
                  yolo_confirm=False,
-                 rolling_baseline_sec=60.0):
+                 rolling_baseline_sec=60.0,
+                 min_circularity=0.35,
+                 min_in_hoop_frames=2):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
@@ -60,6 +62,13 @@ class GoalDetector:
         rolling_baseline_sec: 滚动基准帧间隔（秒）
             >0 - 每隔该秒数自动更新基准帧（解决长视频光线/背景变化导致基准失效）
             0  - 禁用滚动基准帧（固定用初始基准帧）
+        min_circularity: 最小圆形度（C = 4πA/P²）
+            篮球 ≈ 0.7-1.0（近圆），人体 ≈ 0.2-0.5（长条形）
+            0.35 阈值过滤球员躯干/手脚经过篮下导致的误报
+            设为 0 可禁用形状过滤
+        min_in_hoop_frames: 宽松模式下斑块进框触发所需的最小连续帧数
+            默认 2 帧（≈0.07秒@30fps），过滤单帧噪声
+            球在框内通常 2-4 帧，不宜设太高否则漏检
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -82,6 +91,8 @@ class GoalDetector:
         self.loose_mode = loose_mode  # 宽松模式：斑块进框即候选，配合 VLM 验证
         self.yolo_confirm = yolo_confirm  # YOLO 双确认：loose 触发时检查 YOLO 球位置
         self.rolling_baseline_sec = float(rolling_baseline_sec)  # 滚动基准帧间隔
+        self.min_circularity = float(min_circularity)  # 最小圆形度（形状过滤）
+        self.min_in_hoop_frames = int(min_in_hoop_frames)  # 宽松模式最小进框帧数
 
         # 基准帧（灰度）
         self.baseline_gray = None
@@ -134,6 +145,7 @@ class GoalDetector:
             "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
             "reject_in_x": 0,      # x 不在篮筐范围
             "reject_size": 0,      # 斑块太宽
+            "reject_shape": 0,     # 形状过滤失败（圆形度过低，疑似人）
             "reject_trend": 0,     # 趋势检查失败
             "reject_no_blob": 0,   # 没检测到运动斑块
             "side_goal": 0,        # 侧向进筐判定成功
@@ -156,6 +168,12 @@ class GoalDetector:
 
     def _find_moving_blob(self, frame_gray):
         """在篮筐周边搜索区域找最大运动连通域。
+
+        过滤条件：
+          1. 面积在 [min_blob_area, max_blob_area] 范围内
+          2. 宽度 ≤ 篮筐宽度 × 1.5
+          3. 圆形度 C = 4πA/P² ≥ min_circularity（过滤长条形人体）
+             篮球 ≈ 0.7-1.0，人体 ≈ 0.2-0.5，默认阈值 0.35
 
         返回: (cx, cy, x1, y1, x2, y2, area) 或 None
         """
@@ -185,35 +203,51 @@ class GoalDetector:
         diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN, kernel)
         diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, kernel)
 
-        # 连通域分析
-        num, labels, stats, centroids = cv2.connectedComponentsWithStats(diff_bin, connectivity=8)
+        # 用 findContours 替代 connectedComponents，以获取周长计算圆形度
+        contours, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         # 调试用：差分比例
         self.last_diff_ratio = float(np.sum(diff_bin > 0)) / diff_bin.size * 255
 
-        # 找最大的有效连通域（面积在范围内）
+        # 找最大的有效连通域（面积在范围内 + 形状过滤）
         best_blob = None
         best_area = 0
-        for k in range(1, num):
-            area = stats[k, cv2.CC_STAT_AREA]
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
             if not (self.min_blob_area <= area <= self.max_blob_area):
                 continue
-            bx = stats[k, cv2.CC_STAT_LEFT] + self.search_x1
-            by = stats[k, cv2.CC_STAT_TOP] + self.search_y1
-            bw = stats[k, cv2.CC_STAT_WIDTH]
-            bh = stats[k, cv2.CC_STAT_HEIGHT]
-            bcx = centroids[k][0] + self.search_x1
-            bcy = centroids[k][1] + self.search_y1
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            bx = x + self.search_x1
+            by = y + self.search_y1
 
             # 斑块宽度不能超过篮筐宽度太多（是球不是大物体）
             if bw > self.hoop_w * 1.5:
                 continue
 
+            # 圆形度过滤：C = 4πA/P²，过滤长条形人体（球员经过篮下）
+            if self.min_circularity > 0:
+                peri = cv2.arcLength(cnt, True)
+                if peri <= 0:
+                    continue
+                circularity = 4 * np.pi * area / (peri * peri)
+                if circularity < self.min_circularity:
+                    self.diag["reject_shape"] += 1
+                    continue
+
+            # 质心
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:
+                bcx = M["m10"] / M["m00"] + self.search_x1
+                bcy = M["m01"] / M["m00"] + self.search_y1
+            else:
+                bcx = bx + bw / 2.0
+                bcy = by + bh / 2.0
+
             if area > best_area:
                 best_area = area
                 best_blob = (float(bcx), float(bcy),
                              int(bx), int(by), int(bx + bw), int(by + bh),
-                             int(area))
+                             float(area))
 
         return best_blob
 
@@ -343,9 +377,9 @@ class GoalDetector:
                 self.blob_in_hoop_frames += 1
                 self.last_in_hoop_frame = frame_idx
 
-                # 宽松模式：斑块进框即标记候选（配合 VLM 二次验证）
-                # 不要求穿越上下沿、不检查趋势，最大化召回率
-                if self.loose_mode and self.blob_in_hoop_frames >= 1:
+                # 宽松模式：斑块进框连续 min_in_hoop_frames 帧即标记候选
+                # 默认 2 帧（≈0.07秒@30fps），过滤单帧噪声，不影响真实进球（球在框内 2-4 帧）
+                if self.loose_mode and self.blob_in_hoop_frames >= self.min_in_hoop_frames:
                     # YOLO 软确认：检查时间窗口内 YOLO 是否检测到球在篮筐附近
                     # YOLO 有球在篮筐附近 → 确认进球（yolo_confirmed）
                     # YOLO 没球或球不在附近 → 不否决，仍注册候选（yolo_no_evidence）

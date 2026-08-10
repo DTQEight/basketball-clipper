@@ -2,7 +2,7 @@
 import collections
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+ROOT = Path(__file__).parent.parent.resolve()
 LBL = ROOT / "train_data_manual" / "labels"
 cnt = collections.Counter()
 total = 0

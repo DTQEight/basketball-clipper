@@ -18,5 +18,5 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENIN
 )
 
 echo Starting service...
-E:\bball-env\python.exe demo_interactive.py
+E:\bball-env\python.exe demo_nicegui.py
 pause

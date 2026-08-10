@@ -7,7 +7,15 @@
 注意：本模块用 PyAV（而非 OpenCV）读取视频，兼容 HEVC 编码。
 """
 import argparse
+import sys
+from pathlib import Path
+
 import yaml
+
+# 本脚本位于 legacy/ 下：项目根（video_io/cutter）与 legacy（detector/logic）都要入路径
+ROOT = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 from video_io import get_video_info, VideoReader
 from detector.yolo_detector import YoloDetector

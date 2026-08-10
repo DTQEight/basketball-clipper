@@ -28,7 +28,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 from video_io import get_video_info, read_frame

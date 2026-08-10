@@ -53,15 +53,24 @@ def _build_encode_args(ffmpeg, quality="hq"):
 
 
 def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
-              output_path=None, ffmpeg_path=""):
+              output_path=None, ffmpeg_path="", progress_callback=None):
     """根据进球时间戳剪辑集锦（GPU 硬编加速）。
 
     timestamps: 进球时刻列表（秒，浮点）
     min_gap: 两个片段间隔小于此值则合并，避免连续得分重复切。
     output_path: 输出文件路径，None 则默认到 E:\\bball_cache\\demo_output\\highlights.mp4
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
+    progress_callback: 可选进度回调 (pct, msg)，0-100。
     返回: 输出文件路径 或 None（无进球）
     """
+
+    def _report(pct, msg):
+        if progress_callback:
+            try:
+                progress_callback(pct, msg)
+            except Exception:
+                pass
+
     if not timestamps:
         print("没有进球时间戳，跳过剪辑")
         return None
@@ -94,11 +103,13 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
     use_nvenc = _detect_nvenc(ffmpeg)
     encode_tag = "NVENC 硬编" if use_nvenc else "libx264 软编"
     print(f"[剪辑] 使用 {encode_tag} | 共 {len(segments)} 段", flush=True)
+    _report(10, f'初始化编码器（{len(segments)} 段，{encode_tag}）...')
 
     # 切片：用 -ss 在输入前做快速 seek，-t 控制时长
     # 集锦保持原画质：NVENC cq=20 / libx264 crf=18，不缩放
     encode_args = _build_encode_args(ffmpeg, quality="hq")
     for i, (start, end) in enumerate(segments):
+        _report(15 + 70 * i / len(segments), f'剪切片段 {i+1}/{len(segments)}...')
         clip_path = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
         duration = end - start
         cmd = [
@@ -122,6 +133,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
             f.write(f"file '{p_norm}'\n")
 
     # 拼接：用 re-encode 确保各片段编码一致
+    _report(90, '正在拼接集锦视频...')
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
         "-f", "concat", "-safe", "0", "-i", list_path,
@@ -131,6 +143,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         output_path,
     ]
     subprocess.run(cmd, check=True, creationflags=_SBOX)
+    _report(98, '清理临时文件...')
 
     # 清理临时文件
     for p in clip_files:
