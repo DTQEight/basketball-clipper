@@ -36,7 +36,9 @@ def get_video_info(path):
     """
     c = av_open(path)
     s = c.streams.video[0]
-    total = int(s.frames) or 0
+    # s.frames 可能为 None/0（部分视频头信息不全），or 0 兜底；
+    # 不能写 int(s.frames)，None 会抛 TypeError
+    total = int(s.frames or 0)
     fps = float(s.average_rate) if s.average_rate else 30.0
     width = s.width or 0
     height = s.height or 0
@@ -81,7 +83,10 @@ def read_frame(path, idx, total=0, fps=30.0):
             fps = float(stream.average_rate) if stream.average_rate else 30.0
         tb = float(stream.time_base) if stream.time_base else 1.0 / fps
         target_pts = int(idx / fps / tb) if tb > 0 else 0
-        container.seek(target_pts, stream=stream)
+        # 提前约 2 帧 seek：关键帧对齐可能使 seek 落在目标帧之后，
+        # 提前解码再跳到目标帧，保证返回的是目标帧而非更晚的帧
+        pre_pts = int(2.0 / fps / tb) if tb > 0 else 0
+        container.seek(max(0, target_pts - pre_pts), stream=stream)
         for f in container.decode(stream):
             cur_pts = f.pts if f.pts is not None else 0
             cur_idx = int(round(cur_pts * tb * fps))
@@ -111,15 +116,22 @@ class VideoReader:
     def __init__(self, path):
         self.container = av_open(path)
         self.stream = self.container.streams.video[0]
-        info = get_video_info(path)
-        self.total = info["total"]
-        self.fps = info["fps"]
+        # 直接复用已打开的容器读取信息，避免再 open 一次（get_video_info 会重开）
+        s = self.stream
+        self.total = int(s.frames or 0) or 0
+        self.fps = float(s.average_rate) if s.average_rate else 30.0
+        if self.total == 0 and s.duration and s.time_base:
+            duration = float(s.duration) * float(s.time_base)
+            if duration > 0:
+                self.total = int(duration * self.fps)
+        self.total = max(self.total, 1)
         self.tb = float(self.stream.time_base) if self.stream.time_base else 1.0 / self.fps
 
     def seek(self, frame_idx):
-        """seek 到指定帧号。"""
+        """seek 到指定帧号（提前约 2 帧，确保 decode 覆盖目标帧）。"""
         pts = int(frame_idx / self.fps / self.tb) if self.tb > 0 else 0
-        self.container.seek(pts, stream=self.stream)
+        pre = int(2.0 / self.fps / self.tb) if self.tb > 0 else 0
+        self.container.seek(max(0, pts - pre), stream=self.stream)
 
     def iter_frames(self, start=0, end=None, batch=1):
         """迭代帧序列。

@@ -1,5 +1,5 @@
 @echo off
-set "PROJECT_DIR=C:\Users\desktop\AppData\Roaming\TRAE SOLO CN\ModularData\ai-agent\work-mode-projects\6a7200e35b67445af423ce76\basketball-clipper"
+set "PROJECT_DIR=E:\basketball-project\basketball-clipper"
 cd /d "%PROJECT_DIR%"
 
 echo ============================================
@@ -18,5 +18,5 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENIN
 )
 
 echo Starting service...
-E:\bball-env\python.exe demo_nicegui.py
+E:\basketball-project\env\python.exe demo_nicegui.py
 pause

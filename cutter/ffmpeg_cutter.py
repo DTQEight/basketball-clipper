@@ -1,10 +1,10 @@
 """ffmpeg 剪辑模块：根据进球时间戳切片并拼接成集锦。
 
 修复点：
-  - 临时目录改到 E:\\bball_cache\\clips，避免 C 盘空间不足
+  - 临时目录改到 E:\\basketball-project\\cache\\clips，避免 C 盘空间不足
   - subprocess 加 creationflags=0x08000000 绕开沙箱限制
   - concat 改用 re-encode（-c:v libx264 -c:a aac）避免各片段编码不一致拼接失败
-  - 输出默认路径改到 E:\\bball_cache\\demo_output，避免 C 盘中文路径 URL 编码问题
+  - 输出默认路径改到 E:\\basketball-project\\cache\\demo_output，避免 C 盘中文路径 URL 编码问题
   - GPU 硬编：优先使用 h264_nvenc（NVIDIA GPU 加速），不可用则回退 libx264
 """
 import os
@@ -21,7 +21,7 @@ except Exception:
 _SBOX = 0x08000000 if os.name == "nt" else 0
 
 # 缓存根目录（与 demo_interactive.py 保持一致）
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 
 
 def _detect_nvenc(ffmpeg):
@@ -58,7 +58,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
 
     timestamps: 进球时刻列表（秒，浮点）
     min_gap: 两个片段间隔小于此值则合并，避免连续得分重复切。
-    output_path: 输出文件路径，None 则默认到 E:\\bball_cache\\demo_output\\highlights.mp4
+    output_path: 输出文件路径，None 则默认到 E:\\basketball-project\\cache\\demo_output\\highlights.mp4
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
     progress_callback: 可选进度回调 (pct, msg)，0-100。
     返回: 输出文件路径 或 None（无进球）

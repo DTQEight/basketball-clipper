@@ -10,7 +10,7 @@
   7. 历史记录支持加载后直接剪辑（无需重新检测）
 
 用法:
-    E:\\bball-env\\python.exe demo_nicegui.py
+    python demo_nicegui.py
 浏览器打开 http://127.0.0.1:7871
 """
 import os
@@ -20,8 +20,17 @@ from pathlib import Path
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-_CACHE_ROOT = r"E:\bball_cache"
-# Python 临时文件重定向到 E 盘，避免 C 盘空间不足
+# 缓存目录：优先用环境变量，否则按平台默认
+if os.environ.get("BBALL_CACHE_ROOT"):
+    _CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
+elif os.name == "nt":
+    _CACHE_ROOT = r"E:\basketball-project\cache"
+else:
+    _CACHE_ROOT = os.path.join(os.path.expanduser("~"), "basketball-project", "cache")
+
+# Windows subprocess 屏蔽控制台窗口（Linux 下为 0）
+_SBOX = 0x08000000 if os.name == "nt" else 0
+# 临时文件重定向到缓存目录
 _tmp_root = os.path.join(_CACHE_ROOT, "tmp")
 os.makedirs(_tmp_root, exist_ok=True)
 os.environ["TMPDIR"] = _tmp_root
@@ -37,7 +46,7 @@ import base64
 from nicegui import ui
 
 from video_io import get_video_info, read_frame, VideoReader
-from app import get_ball_model
+from app import get_ball_model, get_device
 from tracker import GoalDetector
 from cutter.ffmpeg_cutter import cut_clips, _build_encode_args
 
@@ -90,7 +99,6 @@ _calib = {
 _last_goals = []
 _last_goal_clips = []
 _kept_goal_indices = set()
-_last_goal_types = []
 
 # 检测取消标志（UI 点击「取消」时置 True，检测循环轮询后中断）
 _cancel_requested = False
@@ -146,9 +154,16 @@ def _add_history(video_path, hoop, goals, kept_goals):
 # ============ 视频工具 ============
 
 def _frame_to_base64(frame):
-    """将 cv2 帧转为 base64 PNG data URI。"""
+    """将 cv2 帧转为 base64 PNG data URI。
+
+    输入约定为 RGB（与 load_video / preview_frame / click_calibrate
+    等返回值一致），而 cv2.imencode 按 BGR 处理，
+    因此先转回 BGR 再编码，避免预览画面红蓝通道互换。
+    """
     if frame is None:
         return None
+    if len(frame.shape) == 3 and frame.shape[2] == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     _, buf = cv2.imencode('.png', frame)
     b64 = base64.b64encode(buf).decode('utf-8')
     return f'data:image/png;base64,{b64}'
@@ -329,7 +344,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 ball_pos = None
                 try:
                     res = model.predict(frame, conf=float(ball_conf), imgsz=1280,
-                                        device="cuda:0", verbose=False)[0]
+                                        device=get_device(), verbose=False)[0]
                     if res.boxes is not None and len(res.boxes) > 0:
                         names = res.names
                         clses = res.boxes.cls.cpu().numpy().astype(int)
@@ -377,6 +392,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         import imageio_ffmpeg
         import subprocess as _sp
         ff = imageio_ffmpeg.get_ffmpeg_exe()
+        # 编码参数只检测一次（NVENC 探测是子进程，循环内重复调用会显著拖慢）
+        _enc = _build_encode_args(ff, quality="preview")
 
         for gi, gts in enumerate(goals):
             if _cancel_requested:
@@ -390,17 +407,16 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             seg_start_sec = seg_start / fps
             seg_dur_sec = (seg_end - seg_start) / fps
             try:
-                _enc = _build_encode_args(ff, quality="preview")
                 _sp.run([ff, "-y", "-loglevel", "error",
                          "-ss", f"{seg_start_sec:.3f}", "-i", _video_state["path"],
                          "-t", f"{seg_dur_sec:.3f}",
                          "-vf", "scale=-2:480"] + _enc +
                         ["-movflags", "+faststart", clip_path],
-                        creationflags=0x08000000, capture_output=True, timeout=60)
+                        creationflags=_SBOX, capture_output=True, timeout=60)
                 if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
                     _last_goal_clips.append({"ts": gts, "path": clip_path, "idx": gi})
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}", flush=True)
             if len(goals) > 0:
                 _report(80 + 18 * (gi + 1) / len(goals), f'生成片段 {gi+1}/{len(goals)}')
 
@@ -450,10 +466,6 @@ def clip_action(action, idx):
         global _kept_goal_indices, _last_goals
         ts = _last_goal_clips[idx]["ts"]
         del _last_goal_clips[idx]
-        while len(_last_goal_types) < len(_last_goal_clips) + 1:
-            _last_goal_types.append("进球")
-        if idx < len(_last_goal_types):
-            del _last_goal_types[idx]
         new_kept = set()
         for old_i in sorted(_kept_goal_indices):
             if old_i < idx:
@@ -497,7 +509,7 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None):
         return None, f"❌ 剪辑失败: {e}\n{traceback.format_exc()}"
 
 
-def on_load_history(idx_choice, pre_roll, post_roll, cut_min_gap, progress_callback=None):
+def on_load_history(idx_choice, progress_callback=None):
     """从历史记录加载。"""
     global _last_goals, _video_state, _calib, _last_goal_clips, _kept_goal_indices
 
@@ -554,13 +566,15 @@ def on_load_history(idx_choice, pre_roll, post_roll, cut_min_gap, progress_callb
     cache_key = (video_path, tuple(round(t, 3) for t in all_goals))
     cached = _clip_cache.get(cache_key)
     if cached and all(os.path.exists(c["path"]) for c in cached):
-        # 命中缓存：直接复用已生成的片段，跳过 ffmpeg
+        # 命中缓存：直接复用已生成的片段，跳过 ffmpeg（进度保持 30，避免跳跃）
         _last_goal_clips.extend(list(cached))
-        _report(45, f'命中缓存，复用 {len(_last_goal_clips)} 个片段')
+        _report(30, f'命中缓存，复用 {len(_last_goal_clips)} 个片段')
     elif all_goals:
         import imageio_ffmpeg
         import subprocess as _sp
         ff = imageio_ffmpeg.get_ffmpeg_exe()
+        # 编码参数只检测一次，避免循环内重复子进程探测
+        _enc = _build_encode_args(ff, quality="preview")
         for gi, gts in enumerate(all_goals):
             pct = 30 + 60 * (gi + 1) / len(all_goals) if all_goals else 90
             _report(pct, f'生成片段 {gi+1}/{len(all_goals)}')
@@ -573,17 +587,16 @@ def on_load_history(idx_choice, pre_roll, post_roll, cut_min_gap, progress_callb
             seg_start_sec = seg_start / fps
             seg_dur_sec = (seg_end - seg_start) / fps
             try:
-                _enc = _build_encode_args(ff, quality="preview")
                 _sp.run([ff, "-y", "-loglevel", "error",
                          "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                          "-t", f"{seg_dur_sec:.3f}",
                          "-vf", "scale=-2:480"] + _enc +
                         ["-movflags", "+faststart", clip_path],
-                        creationflags=0x08000000, capture_output=True, timeout=60)
+                        creationflags=_SBOX, capture_output=True, timeout=60)
                 if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
                     _last_goal_clips.append({"ts": float(gts), "path": clip_path, "idx": gi})
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}", flush=True)
         # 写入缓存并持久化（保留最近 20 条，避免无限增长）
         if _last_goal_clips:
             _clip_cache[cache_key] = list(_last_goal_clips)
@@ -634,12 +647,12 @@ def on_batch_load_video(selected):
                         codec=info["codec"], current_frame=0,
                         width=info["width"], height=info["height"])
     frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
-    preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
-    if preview is not None and _calib["hoop"]:
+    if frame is not None and _calib["hoop"]:
         x1, y1, x2, y2 = _calib["hoop"]
-        cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(preview, "HOOP", (x1, max(y1 - 10, 20)),
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(frame, "HOOP", (x1, max(y1 - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
     status = (f"已加载: {os.path.basename(video_path)}\n"
@@ -965,6 +978,11 @@ def main_page():
         result = load_video(path)
         frame, info = result
         if frame is not None:
+            # 切换视频：清空上一轮的进球结果，避免列表残留旧视频数据
+            _last_goal_clips.clear()
+            _last_goals.clear()
+            _kept_goal_indices.clear()
+            _refresh_result_cards()
             b64 = _frame_to_base64(frame)
             preview_image.set_source(b64)
             preview_image.classes(remove='hidden')
@@ -1014,6 +1032,11 @@ def main_page():
             frame, info, status = on_batch_load_video(path)
             print(f"[BATCH-LOAD] frame={'OK' if frame is not None else 'None'} path={_video_state['path']!r}", flush=True)
             if frame is not None:
+                # 切换批量视频：清空上一轮的进球结果
+                _last_goal_clips.clear()
+                _last_goals.clear()
+                _kept_goal_indices.clear()
+                _refresh_result_cards()
                 b64 = _frame_to_base64(frame)
                 preview_image.set_source(b64)
                 preview_image.classes(remove='hidden')
@@ -1137,6 +1160,8 @@ def main_page():
         # 显示进度条
         progress_container.classes(remove='hidden')
         preview_image.classes(add='hidden')
+        result_video_el.classes(add='hidden')
+        highlights_video_el.classes(add='hidden')
         progress_bar.set_value(0)
         progress_text.set_text('正在加载模型...')
         progress_detail.set_text('')
@@ -1311,7 +1336,7 @@ def main_page():
                 pass
 
         from nicegui import run
-        result = await run.io_bound(on_load_history, int(idx), 5, 5, 8, _progress_callback)
+        result = await run.io_bound(on_load_history, int(idx), _progress_callback)
         frame, info, status = result
 
         progress_container.classes(add='hidden')
@@ -1342,13 +1367,14 @@ if __name__ == "__main__":
     try:
         import torch
         model, _ = get_ball_model()
-        if torch.cuda.is_available():
+        device = get_device()
+        if device != "cpu":
             warm = np.zeros((640, 640, 3), dtype=np.uint8)
-            model.predict(warm, conf=0.5, imgsz=640, device="cuda:0", verbose=False)
+            model.predict(warm, conf=0.5, imgsz=640, device=device, verbose=False)
             torch.cuda.empty_cache()
-            _msg = "WARMUP-OK: CUDA context created on main thread"
+            _msg = f"WARMUP-OK: {device} context created on main thread"
         else:
-            _msg = "WARMUP-SKIP: CUDA not available"
+            _msg = "WARMUP-SKIP: CUDA not available, using CPU"
     except Exception as e:
         _msg = f"WARMUP-FAIL: {e}"
     with open(_warmup_log, "w", encoding="utf-8") as _f:

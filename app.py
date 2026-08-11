@@ -11,8 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-# ============ 缓存目录改到 E 盘（C 盘空间不足）============
-_CACHE_ROOT = r"E:\bball_cache"
+# ============ 缓存目录（跨平台）============
+if os.environ.get("BBALL_CACHE_ROOT"):
+    _CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
+elif os.name == "nt":
+    _CACHE_ROOT = r"E:\basketball-project\cache"
+else:
+    _CACHE_ROOT = os.path.join(os.path.expanduser("~"), "basketball-project", "cache")
 os.environ["MPLCONFIGDIR"] = os.path.join(_CACHE_ROOT, "matplotlib")
 os.environ["ULTRALYTICS_CONFIG_DIR"] = os.path.join(_CACHE_ROOT, "ultralytics")
 os.environ["TORCH_HOME"] = os.path.join(_CACHE_ROOT, "torch")
@@ -22,6 +27,18 @@ for _d in [os.environ[k] for k in ["MPLCONFIGDIR",
 
 # 公共模块
 from video_io import read_frame
+
+
+def get_device():
+    """检测可用推理设备，优先 CUDA，回退 CPU。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
+
 
 # ============ 全局状态 ============
 _model_cache = {}
@@ -88,7 +105,7 @@ def detect_ball_yolo(frame, conf=None, imgsz=1280, augment=False):
     if conf is None:
         conf = _ball_conf
     model, _ = get_ball_model()
-    res = model.predict(frame, conf=conf, imgsz=imgsz, device="cuda:0",
+    res = model.predict(frame, conf=conf, imgsz=imgsz, device=get_device(),
                         augment=augment, verbose=False)[0]
     if res.boxes is None or len(res.boxes) == 0:
         return None

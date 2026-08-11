@@ -81,7 +81,7 @@ flowchart TD
     VI["video_io.py<br/>PyAV 视频读取"]
     CU["cutter/ffmpeg_cutter.py<br/>切片拼接"]
     W["weights/ · YOLO 模型权重"]
-    CACHE["E:/bball_cache<br/>历史 · 片段 · 输出缓存"]
+    CACHE["E:/basketball-project/cache<br/>历史 · 片段 · 输出缓存"]
     FF["ffmpeg · imageio-ffmpeg 内置"]
     LG["legacy/ · 旧界面 · 训练/标注/调试工具"]
 
@@ -99,7 +99,7 @@ flowchart TD
 - **tracker.py**：`GoalDetector` 进球判定（diff 帧差 + YOLO 软确认），消费 app 输出的球位置
 - **video_io.py**：PyAV 统一视频读取，被 app 与 demo_nicegui 共同依赖
 - **cutter/ffmpeg_cutter.py**：按进球时间戳切片拼接，输出到缓存目录
-- **外部资源**：`weights/`（模型权重）、`E:\bball_cache`（历史记录 / 片段 / 输出）、ffmpeg（imageio-ffmpeg 内置）
+- **外部资源**：`weights/`（模型权重）、`E:\basketball-project\cache`（历史记录 / 片段 / 输出）、ffmpeg（imageio-ffmpeg 内置）
 - **legacy/**：仅归档保留，不参与运行
 
 ## 进球检测算法详解
@@ -249,7 +249,7 @@ A: 浏览器不支持非 H.264 编码（如 HEVC）。预览片段和集锦均�
 A: `start.bat` 启动时会自动清理占用 7871 端口的旧进程。若仍无法访问，关闭旧标签页，用无痕窗口（Ctrl+Shift+N）或硬刷新（Ctrl+Shift+R）访问 http://127.0.0.1:7871。
 
 **Q: 开始识别后服务崩溃？**
-A: 大概率是后台线程首次初始化 CUDA 上下文导致的驱动层崩溃（Windows 事件日志可见 `nvcuda64.dll`）。程序启动时已在主线程预热模型，若仍崩溃请更新显卡驱动，并确认 `E:\bball_cache\warmup_status.log` 显示 `WARMUP-OK`。
+A: 大概率是后台线程首次初始化 CUDA 上下文导致的驱动层崩溃（Windows 事件日志可见 `nvcuda64.dll`）。程序启动时已在主线程预热模型，若仍崩溃请更新显卡驱动，并确认 `E:\basketball-project\cache\warmup_status.log` 显示 `WARMUP-OK`。
 
 **Q: YOLO 检测不到球 / 误检橙色腿为球？**
 A: ① 用 `legacy/label_tool.py` 手动标注高质量数据重训；② 降低置信度阈值；③ 增大帧差阈值、提高圆形度阈值减少误报。

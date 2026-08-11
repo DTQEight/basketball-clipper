@@ -335,6 +335,8 @@ class GoalDetector:
                 self._baseline_candidate_frame = None
                 self._baseline_candidate_diff = float("inf")
                 self._baseline_candidate_idx = -1
+                # 重置持续计数，避免"球员常驻"触发后每帧都重复更新基准帧
+                self.blob_persistent_frames = 0
 
         if blob is None:
             # 没检测到运动物体，保持状态但衰减历史

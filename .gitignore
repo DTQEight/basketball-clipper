@@ -33,7 +33,7 @@ weights/*.pt
 # 缓存
 .cache/
 *.cache
-E:\bball_cache\
+E:\basketball-project\cache\
 
 # IDE
 .vscode/
