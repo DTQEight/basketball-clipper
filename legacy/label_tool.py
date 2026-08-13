@@ -12,13 +12,13 @@
 
 用法:
     # 追加标注 200 帧（自动跳过已标注的 37 帧）
-    E:\bball-env\python.exe label_tool.py --video "E:\bball_tmp\bball_preview.mp4" --frames 200
+    E:\basketball-project\env\python.exe label_tool.py --video "E:\bball_tmp\bball_preview.mp4" --frames 200
 
     # 从第 1000 秒到第 2000 秒抽帧标注
-    E:\bball-env\python.exe label_tool.py --video "xxx.mp4" --frames 100 --start 1000 --end 2000
+    E:\basketball-project\env\python.exe label_tool.py --video "xxx.mp4" --frames 100 --start 1000 --end 2000
 
     # 用预标注辅助（现有模型预测，用户只需修正）
-    E:\bball-env\python.exe label_tool.py --video "xxx.mp4" --frames 100 --prelabel
+    E:\basketball-project\env\python.exe label_tool.py --video "xxx.mp4" --frames 100 --prelabel
 """
 import os
 import sys
@@ -30,7 +30,7 @@ ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 from video_io import get_video_info
 
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 OUT_DIR = ROOT / "train_data_manual"
 
 

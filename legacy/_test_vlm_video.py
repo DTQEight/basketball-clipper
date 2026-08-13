@@ -11,7 +11,7 @@ SBOX = 0x08000000
 
 # 1. 截取 5 秒片段
 src = r"D:\Downloads\highlights.mp4"
-clip = r"E:\bball_cache\vlm_test.mp4"
+clip = r"E:\basketball-project\cache\vlm_test.mp4"
 subprocess.run([
     FFMPEG, "-y", "-loglevel", "error",
     "-ss", "10", "-i", src, "-t", "5",

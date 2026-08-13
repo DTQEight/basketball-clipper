@@ -8,7 +8,7 @@ ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # 缓存目录
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 os.environ["GRADIO_TEMP_DIR"] = os.path.join(_CACHE_ROOT, "gradio")
 
 import cv2

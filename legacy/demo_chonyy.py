@@ -17,10 +17,10 @@
 依赖 YOLO 检测球，不依赖基准帧差法。
 
 用法:
-    E:\\bball-env\\python.exe demo_chonyy.py <视频路径> [开始帧] [结束帧]
+    E:\\basketball-project\\env\\python.exe demo_chonyy.py <视频路径> [开始帧] [结束帧]
 
 示例:
-    E:\\bball-env\\python.exe demo_chonyy.py "E:\\bball_cache\\2026.07.05 2nd.mp4" 0 3000
+    E:\\basketball-project\\env\\python.exe demo_chonyy.py "E:\\basketball-project\\cache\\2026.07.05 2nd.mp4" 0 3000
 """
 import sys
 import time
@@ -319,7 +319,7 @@ def run_demo(video_path, hoop_box, start_frame=0, end_frame=None,
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("用法: python demo_chonyy.py <视频路径> [开始帧] [结束帧]")
-        print("示例: python demo_chonyy.py \"E:\\bball_cache\\2026.07.05 2nd.mp4\" 0 3000")
+        print("示例: python demo_chonyy.py \"E:\\basketball-project\\cache\\2026.07.05 2nd.mp4\" 0 3000")
         sys.exit(1)
 
     video = sys.argv[1]

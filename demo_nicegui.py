@@ -20,13 +20,11 @@ from pathlib import Path
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-# 缓存目录：优先用环境变量，否则按平台默认
+# 缓存目录：优先用环境变量，否则用项目同级 cache 目录（跨平台、可移植）
 if os.environ.get("BBALL_CACHE_ROOT"):
     _CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
-elif os.name == "nt":
-    _CACHE_ROOT = r"E:\basketball-project\cache"
 else:
-    _CACHE_ROOT = os.path.join(os.path.expanduser("~"), "basketball-project", "cache")
+    _CACHE_ROOT = str(ROOT.parent / "cache")
 
 # Windows subprocess 屏蔽控制台窗口（Linux 下为 0）
 _SBOX = 0x08000000 if os.name == "nt" else 0
@@ -134,13 +132,14 @@ def _save_history(records):
         print(f"[WARN] 保存历史记录失败: {e}", flush=True)
 
 
-def _add_history(video_path, hoop, goals, kept_goals):
+def _add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1):
     records = _load_history()
     records = [r for r in records if r.get("video") != video_path]
     records.insert(0, {
         "video": video_path,
         "video_name": os.path.basename(video_path),
         "hoop": list(hoop) if hoop else None,
+        "baseline_idx": int(baseline_idx),
         "goals": [float(t) for t in goals],
         "kept_goals": [float(t) for t in kept_goals],
         "total": len(goals),
@@ -318,7 +317,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                 diff_threshold=int(diff_threshold),
                                 min_blob_area=int(min_blob_area),
                                 search_margin=int(search_margin),
-                                fusion_mode="visual_only", loose_mode=True,
+                                loose_mode=True,
                                 yolo_confirm=True, rolling_baseline_sec=60.0,
                                 min_circularity=float(min_circularity),
                                 min_in_hoop_frames=int(min_in_hoop_frames))
@@ -381,7 +380,6 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             reader.close()
 
         _report(80, '生成预览片段...')
-        detector.finalize()
         elapsed = time.time() - t0
 
         # 生成预览片段
@@ -447,7 +445,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         status = (f"检测完成 | 处理 {processed} 帧 | 耗时 {elapsed:.0f}s\n"
                   f"进球: {len(detector.goals)} 个 | "
                   f"YOLO确认: {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)")
-        _add_history(_video_state["path"], hoop, detector.goals, detector.goals)
+        _add_history(_video_state["path"], hoop, detector.goals, detector.goals,
+                     baseline_idx=_calib["baseline_idx"])
         return status, True
     except Exception as e:
         import traceback
@@ -543,10 +542,16 @@ def on_load_history(idx_choice, progress_callback=None):
     if hoop and len(hoop) == 4:
         _calib["hoop"] = tuple(int(v) for v in hoop)
         _calib["clicks"] = []
-        base_frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
+        # 用保存的标定帧号读取基准帧；旧记录无此字段则回退到第 0 帧
+        saved_baseline_idx = int(r.get("baseline_idx", 0))
+        base_frame = read_frame(video_path, saved_baseline_idx,
+                                total=info["total"], fps=info["fps"])
         if base_frame is not None:
             _calib["baseline_frame"] = base_frame.copy()
-            _calib["baseline_idx"] = 0
+            _calib["baseline_idx"] = saved_baseline_idx
+        else:
+            _calib["baseline_frame"] = None
+            _calib["baseline_idx"] = -1
     kept = [float(t) for t in r.get("kept_goals", [])]
     all_goals = [float(t) for t in r.get("goals", [])]
     _last_goals.clear()
@@ -730,7 +735,9 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         def _cb(pct, msg, vname=name, idx=i):
             if progress_callback:
                 try:
-                    progress_callback(pct, f'[{idx+1}/{n_total}] {vname} · {msg}')
+                    # 归一化：每个视频占 1/n_total 份，pct 为当前视频的 0-100
+                    overall = (idx + max(0, min(100, pct)) / 100.0) / n_total * 100.0
+                    progress_callback(overall, f'[{idx+1}/{n_total}] {vname} · {msg}')
                 except Exception:
                     pass
 

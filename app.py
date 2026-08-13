@@ -43,7 +43,7 @@ def get_device():
 # ============ 全局状态 ============
 _model_cache = {}
 _video_state = {"path": None, "total": 0, "fps": 30.0, "codec": "unknown"}
-_ball_conf = 0.25  # YOLO 球检测置信度阈值
+_ball_conf = 0.30  # YOLO 球检测置信度阈值（与 UI 滑块默认值对齐）
 _calib = {
     "clicks": [],   # 待确认的点击点 [(x,y), ...]
     "hoop": None,   # (x1,y1,x2,y2)
@@ -55,11 +55,11 @@ def get_model(weights):
     from ultralytics import YOLO
     if weights not in _model_cache:
         m = YOLO(weights)
-        # 加载后立即搬到 GPU，避免首次推理在 CPU 上跑
+        # 加载后立即搬到推理设备（与 get_device() 对齐），避免首次推理在 CPU 上跑
         try:
-            import torch
-            if torch.cuda.is_available():
-                m.to("cuda:0")
+            dev = get_device()
+            if dev != "cpu":
+                m.to(dev)
         except Exception:
             pass
         _model_cache[weights] = m

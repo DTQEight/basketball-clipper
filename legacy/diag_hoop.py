@@ -1,7 +1,7 @@
 """诊断脚本：在视频里找出球离篮筐最近的帧，导出图片供人工核对篮筐标定。
 
 用法:
-    E:\\bball-env\\python.exe diag_hoop.py
+    E:\\basketball-project\\env\\python.exe diag_hoop.py
 """
 import sys
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 os.environ["GRADIO_TEMP_DIR"] = os.path.join(_CACHE_ROOT, "gradio")
 
 import cv2
@@ -18,7 +18,7 @@ import numpy as np
 from video_io import VideoReader, get_video_info
 from app import get_ball_model
 
-VIDEO = r"E:\bball_cache\gradio\326de539ca77a062c476a6b8def084f37d4e0e3124d9127c53f05486a34919f8\2026.07.05 2nd.mp4"
+VIDEO = r"E:\basketball-project\cache\gradio\326de539ca77a062c476a6b8def084f37d4e0e3124d9127c53f05486a34919f8\2026.07.05 2nd.mp4"
 HOOP = (313, 130, 366, 236)  # 你刚才标定的篮筐框
 BALL_CONF = 0.3
 SAMPLE_EVERY = 3  # 每 3 帧采样 1 帧（加速）

@@ -1,8 +1,8 @@
 """调试 VLM 全否决问题：直接打印 VLM 对候选片段的完整回复。
 
 用法:
-    E:\\bball-env\\python.exe _debug_vlm.py <视频路径> <候选时间戳1> [候选时间戳2 ...]
-    E:\\bball-env\\python.exe _debug_vlm.py D:\\Downloads\\highlights.mp4 15.0 30.0 45.0
+    E:\\basketball-project\\env\\python.exe _debug_vlm.py <视频路径> <候选时间戳1> [候选时间戳2 ...]
+    E:\\basketball-project\\env\\python.exe _debug_vlm.py D:\\Downloads\\highlights.mp4 15.0 30.0 45.0
 """
 import os
 import sys

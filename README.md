@@ -8,17 +8,19 @@
 - **diff + YOLO 双确认检测**：基准帧差法高召回扫描候选进球，YOLO 软确认标记是否有球在篮筐附近，兼顾召回率与可信度
 - **滚动基准帧**：每 60 秒自动更新基准帧，解决长视频光线/背景变化导致的漏检
 - **独立片段预览 + 人工确认**：每个检测到的进球生成独立 480p 预览片段，卡片列表支持预览 / 导出 / 删除
-- **原画质集锦输出**：集锦视频保持原视频分辨率，NVENC 硬编 cq=20 接近无损
-- **GPU 加速**：YOLO 推理（CUDA）+ 视频编码（NVENC 硬编）
+- **原画质集锦输出**：集锦视频保持原视频分辨率，优先 NVENC 硬编 cq=20 / 回退 libx264 crf=18 接近无损
+- **智能设备适配**：有 NVIDIA GPU 自动用 CUDA 加速 + NVENC 硬编，无 GPU 自动回退 CPU 推理 + libx264 软编
 - **视频兼容性强**：PyAV 读取，支持 HEVC 编码和 moov atom 后置的 mp4
-- **历史记录**：保存检测数据，支持加载后直接剪辑（无需重新检测）
-- **NiceGUI 可视化界面**：深色主题卡片式布局，左侧功能区 + 右侧预览区，参数 / 集锦 / 历史折叠区
+- **跨平台**：Windows / Linux 均支持，缓存路径可通过环境变量 `BBALL_CACHE_ROOT` 自定义
+- **历史记录**：保存检测数据，支持加载后直接剪辑（无需重新检测）；片段缓存持久化，重启后复用已生成的预览片段
+- **文件夹批量模式**：加载文件夹自动扫描视频，逐个标定后一键批量识别，适合多场比赛录像
+- **NiceGUI 可视化界面**：深色主题卡片式布局，左侧功能区 + 右侧预览区，参数 / 集锦 / 历史折叠区；检测中可随时取消，进球列表出现后自动折叠功能区
 
 ## 环境要求
 
 - Windows / Linux
 - Python 3.10+
-- NVIDIA GPU（推荐 GTX 1650 4G 及以上），CUDA 环境
+- NVIDIA GPU（推荐 GTX 1650 4G 及以上，可选；无 GPU 自动回退 CPU 推理）
 - FFmpeg（含 libx264 + h264_nvenc，由 `imageio-ffmpeg` 自带）
 
 ## 快速开始
@@ -29,7 +31,8 @@
 pip install -r requirements.txt
 ```
 
-> 需安装 CUDA 版 PyTorch，参考 https://pytorch.org/get-started/locally/
+> GPU 用户需安装 CUDA 版 PyTorch：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`
+> CPU 用户：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`
 
 ### 2. 准备权重
 
@@ -42,7 +45,7 @@ python demo_nicegui.py
 # 浏览器打开 http://127.0.0.1:7871
 ```
 
-Windows 下也可双击 `start.bat` 一键启动（会自动清理占用端口 7871 的旧进程）。
+Windows 下可双击 `start.bat`，Linux 下运行 `./start.sh` 一键启动（会自动清理占用端口 7871 的旧进程）。
 
 ### 单视频操作流程
 
@@ -52,7 +55,16 @@ Windows 下也可双击 `start.bat` 一键启动（会自动清理占用端口 7
 4. 点击「开始识别」→ 检测过程中右侧显示进度，完成后生成每个进球的独立预览片段
 5. 进球列表卡片上点击「预览」查看片段、「导出」下载单个片段、「删除」剔除误报
 6. 在「集锦」折叠区设置提前 / 延后 / 合并间隔，点击「导出合集」→ 生成原画质集锦并自动下载
-7. 历史记录保存在「历史」折叠区，点击选择后「加载」即可直接剪辑（无需重新检测）
+7. 历史记录保存在「历史」折叠区，点击选择后「加载」即可直接剪辑（无需重新检测）；命中缓存时复用已有片段，无需重新生成
+
+### 文件夹批量模式操作流程
+
+1. 左侧输入文件夹路径（如 `D:\Videos\games`），点击「加载」→ 自动扫描所有视频文件
+2. 下拉框选择视频，点击画面 2 个点标定篮筐，点击「保存标定」→ 逐个完成所有视频标定
+3. 在「参数」折叠区设置检测参数（同单视频模式）
+4. 点击「批量识别」→ 依次处理所有视频，每个视频独立写入历史记录
+5. 处理过程中可点击「取消」中断，已完成的视频结果保留
+6. 批量结束后，最后一个视频的进球列表自动显示在右侧
 
 ## 项目结构
 
@@ -66,6 +78,7 @@ basketball-clipper/
 ├── legacy/                 # 归档：旧 Gradio 界面、训练/标注/调试工具
 ├── weights/                # YOLO 权重（不入库，用 Release 发布）
 ├── start.bat               # Windows 一键启动
+├── start.sh                # Linux 一键启动
 └── requirements.txt        # 依赖
 ```
 
@@ -81,7 +94,7 @@ flowchart TD
     VI["video_io.py<br/>PyAV 视频读取"]
     CU["cutter/ffmpeg_cutter.py<br/>切片拼接"]
     W["weights/ · YOLO 模型权重"]
-    CACHE["E:/basketball-project/cache<br/>历史 · 片段 · 输出缓存"]
+    CACHE["BBALL_CACHE_ROOT · 缓存目录<br/>历史 · 片段 · 输出缓存"]
     FF["ffmpeg · imageio-ffmpeg 内置"]
     LG["legacy/ · 旧界面 · 训练/标注/调试工具"]
 
@@ -99,7 +112,7 @@ flowchart TD
 - **tracker.py**：`GoalDetector` 进球判定（diff 帧差 + YOLO 软确认），消费 app 输出的球位置
 - **video_io.py**：PyAV 统一视频读取，被 app 与 demo_nicegui 共同依赖
 - **cutter/ffmpeg_cutter.py**：按进球时间戳切片拼接，输出到缓存目录
-- **外部资源**：`weights/`（模型权重）、`E:\basketball-project\cache`（历史记录 / 片段 / 输出）、ffmpeg（imageio-ffmpeg 内置）
+- **外部资源**：`weights/`（模型权重）、缓存目录（历史记录 / 片段 / 输出，默认 `~/basketball-project/cache`，可通过 `BBALL_CACHE_ROOT` 环境变量自定义）、ffmpeg（imageio-ffmpeg 内置）
 - **legacy/**：仅归档保留，不参与运行
 
 ## 进球检测算法详解
@@ -140,7 +153,7 @@ flowchart TD
 2. **灰度差分**：当前帧与基准帧转为灰度图，做 `cv2.absdiff` 绝对差分
 3. **二值化**：差分图按阈值（默认 25）二值化，像素差大于阈值的区域 = 运动物体
 4. **形态学去噪**：开运算去孤立噪点 + 闭运算连接相邻区域
-5. **连通域分析**：`cv2.connectedComponentsWithStats` 找所有连通域
+5. **连通域分析**：`cv2.findContours` 找所有连通域，可获取周长计算圆形度
 6. **斑块筛选**：
    - 面积在 `[min_blob_area, max_blob_area]` 范围内（默认 50-5000，过滤噪声和大物体）
    - 宽度不超过篮筐宽度的 1.5 倍（排除球员身体）
@@ -174,10 +187,10 @@ diff 触发候选后，检查 YOLO 是否在同一时间窗口内检测到球在
 
 ### YOLO 篮球检测
 
-- **模型**：自定义训练的 `basketball_custom.pt`（基于 YOLOv8n），由 `app.py` 懒加载并搬移到 GPU
+- **模型**：自定义训练的 `basketball_custom.pt`（基于 YOLOv8n），由 `app.py` 懒加载并搬移到 GPU（无 GPU 时使用 CPU）
 - **推理分辨率**：1280×1280（提升小目标检出）
 - **置信度阈值**：默认 0.3（可调 0.1-0.9）
-- **GPU 加速**：`device="cuda:0"`；检测循环每 100 帧 `torch.cuda.empty_cache()`，降低 4GB 显存长视频检测的峰值压力
+- **设备自动检测**：`get_device()` 自动检测 CUDA 可用性，有 GPU 用 `cuda:0`，无 GPU 回退 `cpu`；检测循环每 100 帧 `torch.cuda.empty_cache()`，降低显存峰值压力
 
 ### 可调参数
 
@@ -195,7 +208,7 @@ diff 触发候选后，检查 YOLO 是否在同一时间窗口内检测到球在
 
 ## 视频输出说明
 
-### 预览片段（480p，GPU 硬编加速）
+### 预览片段（480p）
 
 每个检测到的进球生成一段独立预览视频，供人工确认：
 - 分辨率：480p（原 1080p 降采样，加速生成）
@@ -204,7 +217,7 @@ diff 触发候选后，检查 YOLO 是否在同一时间窗口内检测到球在
 - 时长：进球前后各 3 秒
 - 生成方式：ffmpeg 直接切片 + 转码（单次完成，非逐帧处理）
 
-### 集锦视频（原画质，GPU 硬编）
+### 集锦视频（原画质）
 
 确认保留的进球拼接成集锦：
 - 分辨率：保持原视频（不缩放）
@@ -246,10 +259,10 @@ python legacy/auto_train.py --video "video.mp4" --frames 300 --epochs 50
 A: 浏览器不支持非 H.264 编码（如 HEVC）。预览片段和集锦均由 ffmpeg 输出为 H.264，可直接播放；原始视频以帧图方式预览，不受编码影响。
 
 **Q: 服务无法访问 / 端口被占用？**
-A: `start.bat` 启动时会自动清理占用 7871 端口的旧进程。若仍无法访问，关闭旧标签页，用无痕窗口（Ctrl+Shift+N）或硬刷新（Ctrl+Shift+R）访问 http://127.0.0.1:7871。
+A: `start.bat`（Windows）或 `start.sh`（Linux）启动时会自动清理占用 7871 端口的旧进程。若仍无法访问，关闭旧标签页，用无痕窗口（Ctrl+Shift+N）或硬刷新（Ctrl+Shift+R）访问 http://127.0.0.1:7871。
 
 **Q: 开始识别后服务崩溃？**
-A: 大概率是后台线程首次初始化 CUDA 上下文导致的驱动层崩溃（Windows 事件日志可见 `nvcuda64.dll`）。程序启动时已在主线程预热模型，若仍崩溃请更新显卡驱动，并确认 `E:\basketball-project\cache\warmup_status.log` 显示 `WARMUP-OK`。
+A: 大概率是后台线程首次初始化 CUDA 上下文导致的驱动层崩溃（Windows 事件日志可见 `nvcuda64.dll`）。程序启动时已在主线程预热模型，若仍崩溃请更新显卡驱动，并确认缓存目录下的 `warmup_status.log` 显示 `WARMUP-OK`。
 
 **Q: YOLO 检测不到球 / 误检橙色腿为球？**
 A: ① 用 `legacy/label_tool.py` 手动标注高质量数据重训；② 降低置信度阈值；③ 增大帧差阈值、提高圆形度阈值减少误报。
@@ -269,7 +282,7 @@ A: 底角视角下 YOLO 常跟错物体或漏检，确认率低是正常的。�
 - 进球检测状态机参考：chonyy/basketball-shot-detection
 - 多信号融合参考：ClarkWang1214/basketball-highlights
 - 视频读取：PyAV（替代 OpenCV，兼容 HEVC 和 moov 后置 mp4）
-- 视频编码：NVENC 硬编（NVIDIA GPU 加速）
+- 视频编码：优先 NVENC 硬编（NVIDIA GPU 加速），回退 libx264 软编
 
 ## License
 

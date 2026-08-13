@@ -8,7 +8,7 @@
   5. 界面内直接播放结果
 
 用法:
-    E:\\bball-env\\python.exe demo_interactive.py
+    E:\\basketball-project\\env\\python.exe demo_interactive.py
 浏览器打开 http://127.0.0.1:7870
 """
 # ====== 必须在导入 gradio 之前设置环境变量 ======
@@ -20,7 +20,7 @@ ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # 缓存目录改到 E 盘（C 盘空间不足会导致上传中断）
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 _gradio_tmp = os.path.join(_CACHE_ROOT, "gradio")
 os.makedirs(_gradio_tmp, exist_ok=True)
 os.environ["GRADIO_TEMP_DIR"] = _gradio_tmp

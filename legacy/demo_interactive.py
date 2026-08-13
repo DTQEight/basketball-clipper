@@ -13,7 +13,7 @@
 算法：diff 基准帧差法（候选筛选）+ YOLO 软确认（可信度标记）+ 滚动基准帧（长视频适应）
 
 用法:
-    E:\\bball-env\\python.exe demo_interactive.py
+    E:\\basketball-project\\env\\python.exe demo_interactive.py
 浏览器打开 http://127.0.0.1:7871
 """
 # ====== 必须在导入 gradio 之前设置环境变量 ======
@@ -25,7 +25,7 @@ ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # 缓存目录改到 E 盘（C 盘空间不足会导致上传中断）
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 _gradio_tmp = os.path.join(_CACHE_ROOT, "gradio")
 os.makedirs(_gradio_tmp, exist_ok=True)
 os.environ["GRADIO_TEMP_DIR"] = _gradio_tmp
@@ -266,7 +266,7 @@ _calib = {
 # 保存最近一次检测的进球时间戳，供「生成集锦」使用
 _last_goals = []
 # 保存每个进球的独立片段路径，供 UI 逐个预览/保留/删除
-# 格式: [{"ts": 5.1, "path": "E:/bball_cache/demo_output/goal_0_5s.mp4"}, ...]
+# 格式: [{"ts": 5.1, "path": "E:/basketball-project/cache/demo_output/goal_0_5s.mp4"}, ...]
 _last_goal_clips = []
 # 用户选择保留的进球索引（基于 _last_goal_clips）
 _kept_goal_indices = set()

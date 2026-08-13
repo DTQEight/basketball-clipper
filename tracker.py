@@ -1,20 +1,18 @@
-"""进球检测器：基准帧差法 + 连通域分析 + 音频峰值融合（固定机位专用）。
+"""进球检测器：基准帧差法 + 连通域分析 + 篮筐穿越检测（固定机位专用）。
 
 算法参考论文：Camera-based Basketball Scoring Detection Using CNN
-实践方案参考：CSDN 神投手（lyandgh）+ basketball-highlights 多信号融合
+实践方案参考：CSDN 神投手（lyandgh）
 
 工作原理：
   1. 标定时取一帧无球的画面作为基准帧
   2. 每帧与基准帧做灰度差分 → 二值化 → 连通域分析
   3. 在篮筐周边区域找最大连通域 = 运动的篮球
   4. 跟踪斑块：斑块先经过篮筐上沿 → 后经过篮筐下沿 = 视觉进球
-  5. 融合阶段：视觉进球 ± 时间窗口 内有音频峰值 = 高置信度进球
 
 优势（针对固定机位）：
   - 基准帧稳定，差分信号强（不依赖微小晃动）
   - 检测运动物体本身，不依赖 YOLO（不怕漏检）
   - 规则明确：上沿→下沿 = 进球，不靠猜
-  - 多信号融合：视觉+音频互证，减少误报漏报
 """
 
 import cv2
@@ -22,7 +20,7 @@ import numpy as np
 
 
 class GoalDetector:
-    """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测 + 音频融合。"""
+    """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测。"""
 
     def __init__(self, hoop_box, baseline_frame=None,
                  hoop_above_margin=30, hoop_x_margin=25,
@@ -30,8 +28,6 @@ class GoalDetector:
                  min_gap_sec=3.0,
                  diff_threshold=15, min_blob_area=30, max_blob_area=5000,
                  search_margin=80,
-                 audio_peaks=None, fusion_window=2.0,
-                 fusion_mode="or",
                  loose_mode=False,
                  yolo_confirm=False,
                  rolling_baseline_sec=60.0,
@@ -44,13 +40,6 @@ class GoalDetector:
         min_blob_area: 最小连通域面积（过滤噪声）
         max_blob_area: 最大连通域面积（过滤大物体如人）
         search_margin: 篮筐周边搜索范围（像素）
-        audio_peaks: 音频峰值时间戳列表（秒），None 表示不用音频
-        fusion_window: 音频视觉融合时间窗口（秒，±窗口）
-        fusion_mode: 融合模式
-            "or"  - 视觉或音频触发都算进球（默认，高召回）
-            "and" - 视觉和音频都必须触发（高精度）
-            "fused_only" - 仅输出双信号确认的进球
-            "visual_only" - 仅用视觉信号（兼容旧行为）
         loose_mode: 宽松模式（高召回，配合 VLM 二次验证使用）
             True  - 运动斑块进入篮筐框内就标记为候选进球（不需穿越上下沿）
                     用于 CV 扫候选 + VLM 验证精度 的工作流
@@ -84,10 +73,6 @@ class GoalDetector:
         self.max_blob_area = max_blob_area
         self.search_margin = search_margin
 
-        # 音频融合参数
-        self.audio_peaks = sorted([float(p) for p in audio_peaks]) if audio_peaks else []
-        self.fusion_window = float(fusion_window)
-        self.fusion_mode = fusion_mode
         self.loose_mode = loose_mode  # 宽松模式：斑块进框即候选，配合 VLM 验证
         self.yolo_confirm = yolo_confirm  # YOLO 双确认：loose 触发时检查 YOLO 球位置
         self.rolling_baseline_sec = float(rolling_baseline_sec)  # 滚动基准帧间隔
@@ -123,13 +108,11 @@ class GoalDetector:
         self.last_in_hoop_frame = -999 # 上次斑块在篮筐框内的帧号
         self.above_timeout_frames = 45 # 上方状态保持时长（约 1.5 秒 @30fps）
 
-        self.goals = []                # 视觉进球时间戳（兼容旧接口）
+        self.goals = []                # 进球时间戳（兼容旧接口）
         self.visual_goals = []         # 视觉进球时间戳
-        self.fused_goals = []          # 融合后最终进球时间戳
         self.last_goal_frame = -1
         self.fps = 30.0
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
-        self._audio_used = set()       # 已被匹配的音频峰值索引
 
         # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
         # 格式: [(frame_idx, cx, cy), ...]，保留最近 yolo_window_frames 帧
@@ -206,8 +189,8 @@ class GoalDetector:
         # 用 findContours 替代 connectedComponents，以获取周长计算圆形度
         contours, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # 调试用：差分比例
-        self.last_diff_ratio = float(np.sum(diff_bin > 0)) / diff_bin.size * 255
+        # 调试用：差分比例（0-1，画面变化区域占比）
+        self.last_diff_ratio = float(np.sum(diff_bin > 0)) / max(diff_bin.size, 1)
 
         # 找最大的有效连通域（面积在范围内 + 形状过滤）
         best_blob = None
@@ -430,30 +413,10 @@ class GoalDetector:
                         if above_in_time and not self.blob_above_hoop:
                             self.diag["timeout_goal"] += 1
                         ts = frame_idx / fps
-                        self.visual_goals.append(ts)
                         self.blob_above_hoop = False
                         self.last_above_frame = -999
                         self.blob_in_hoop_frames = 0
-                        self.blob_history = []
-                        has_audio_match = self._match_audio_peak(ts)
-                        if self.fusion_mode in ("or", "visual_only"):
-                            self.goals.append(ts)
-                            self.last_goal_frame = frame_idx
-                            if has_audio_match:
-                                self.fused_goals.append(ts)
-                            return ts
-                        elif self.fusion_mode in ("and", "fused_only"):
-                            if has_audio_match:
-                                self.goals.append(ts)
-                                self.fused_goals.append(ts)
-                                self.last_goal_frame = frame_idx
-                                return ts
-                            else:
-                                self.last_goal_frame = frame_idx
-                                return None
-                        else:
-                            self.goals.append(ts)
-                            self.last_goal_frame = frame_idx
+                        if self._register_goal(ts, frame_idx, fps, "visual"):
                             return ts
                 self.blob_above_hoop = False
 
@@ -469,29 +432,9 @@ class GoalDetector:
                     else:
                         self.diag["side_goal"] += 1
                     ts = frame_idx / fps
-                    self.visual_goals.append(ts)
                     self.blob_in_hoop_frames = 0
                     self.last_in_hoop_frame = -999
-                    self.blob_history = []
-                    has_audio_match = self._match_audio_peak(ts)
-                    if self.fusion_mode in ("or", "visual_only"):
-                        self.goals.append(ts)
-                        self.last_goal_frame = frame_idx
-                        if has_audio_match:
-                            self.fused_goals.append(ts)
-                        return ts
-                    elif self.fusion_mode in ("and", "fused_only"):
-                        if has_audio_match:
-                            self.goals.append(ts)
-                            self.fused_goals.append(ts)
-                            self.last_goal_frame = frame_idx
-                            return ts
-                        else:
-                            self.last_goal_frame = frame_idx
-                            return None
-                    else:
-                        self.goals.append(ts)
-                        self.last_goal_frame = frame_idx
+                    if self._register_goal(ts, frame_idx, fps, "side"):
                         return ts
             else:
                 self.diag["reject_no_above"] += 1
@@ -501,11 +444,10 @@ class GoalDetector:
         return None
 
     def _register_goal(self, ts, frame_idx, fps, source=""):
-        """注册一个进球时间戳（供宽松模式复用，避免重复代码）。
+        """注册一个进球时间戳（受冷却期控制）。
 
-        返回: True 表示已注册（受冷却期控制），False 表示被冷却期拒绝
+        返回: True 表示已注册，False 表示被冷却期拒绝
         """
-        # 冷却期检查
         if self.last_goal_frame >= 0:
             gap_sec = (frame_idx - self.last_goal_frame) / fps
             if gap_sec < self.min_gap_sec:
@@ -519,51 +461,6 @@ class GoalDetector:
         if source == "loose":
             self.diag["side_goal"] += 1  # 复用 side_goal 计数器
         return True
-
-    def _match_audio_peak(self, ts):
-        """检查时间戳 ts 附近 ±fusion_window 内是否有未使用的音频峰值。
-
-        匹配后标记该音频峰值为已使用（避免重复匹配）。
-        返回: True/False
-        """
-        if not self.audio_peaks:
-            return False
-        best_j = -1
-        best_dist = self.fusion_window
-        for j, a in enumerate(self.audio_peaks):
-            if j in self._audio_used:
-                continue
-            d = abs(a - ts)
-            if d < best_dist:
-                best_dist = d
-                best_j = j
-        if best_j >= 0:
-            self._audio_used.add(best_j)
-            return True
-        return False
-
-    def finalize(self):
-        """视频处理完毕后调用，处理仅音频触发的候选（fusion_mode="or" 时）。
-
-        返回: 仅音频触发的进球时间戳列表
-        """
-        audio_only = []
-        if not self.audio_peaks or self.fusion_mode != "or":
-            return audio_only
-        for j, a in enumerate(self.audio_peaks):
-            if j in self._audio_used:
-                continue
-            # 检查是否与已有进球冲突（避免重复）
-            conflict = False
-            for g in self.goals:
-                if abs(g - a) < self.min_gap_sec:
-                    conflict = True
-                    break
-            if not conflict:
-                self.goals.append(float(a))
-                self.goals.sort()
-                audio_only.append(float(a))
-        return audio_only
 
     def _check_downward_trend(self, n=4):
         """检查最近 n 帧斑块是否整体向下运动。"""
@@ -584,8 +481,4 @@ class GoalDetector:
             "blob_box": self.last_blob_box,
             "search_area": (self.search_x1, self.search_y1, self.search_x2, self.search_y2),
             "visual_goals": len(self.visual_goals),
-            "fused_goals": len(self.fused_goals),
-            "audio_peaks": len(self.audio_peaks),
-            "audio_used": len(self._audio_used),
-            "fusion_mode": self.fusion_mode,
         }

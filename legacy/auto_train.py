@@ -9,8 +9,8 @@
   6. 保存到 weights/basketball_custom.pt
 
 用法:
-    E:\bball-env\python.exe auto_train.py --video "path/to/video.mp4"
-    E:\bball-env\python.exe auto_train.py --video "video.mp4" --frames 300 --epochs 50
+    E:\basketball-project\env\python.exe auto_train.py --video "path/to/video.mp4"
+    E:\basketball-project\env\python.exe auto_train.py --video "video.mp4" --frames 300 --epochs 50
 """
 import os
 import sys
@@ -23,7 +23,7 @@ ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # 缓存目录
-_CACHE_ROOT = r"E:\bball_cache"
+_CACHE_ROOT = r"E:\basketball-project\cache"
 os.environ["ULTRALYTICS_CONFIG_DIR"] = os.path.join(_CACHE_ROOT, "ultralytics")
 os.environ["TORCH_HOME"] = os.path.join(_CACHE_ROOT, "torch")
 os.makedirs(os.environ["ULTRALYTICS_CONFIG_DIR"], exist_ok=True)
@@ -334,7 +334,7 @@ def main():
         if not data_yaml.exists():
             print(f"找不到 {data_yaml}")
             print("请先用 label_tool.py 标注数据：")
-            print(f"  E:\\bball-env\\python.exe label_tool.py --video \"xxx.mp4\" --frames 200 --prelabel")
+            print(f"  E:\\basketball-project\\env\\python.exe label_tool.py --video \"xxx.mp4\" --frames 200 --prelabel")
             return
         # 统计标注数量
         n_train = len(list((ROOT / "train_data_manual" / "images" / "train").glob("*.jpg")))
