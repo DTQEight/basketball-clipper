@@ -176,7 +176,7 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                min_blob_area=30, search_margin=80, progress_callback=None,
-               auto_threshold=True, yolo_step=2):
+               auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False):
     """运行进球检测。返回 (结果文本, 是否成功)。"""
     if state.video_state["path"] is None:
         return "❌ 请先加载视频", False
@@ -230,6 +230,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         print(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
         print(f"  Auto-thresh : {bool(auto_threshold)}")
         print(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
+        if skip_yolo_no_motion:
+            print(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
         print(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
         print(f"  min_circ    : {min_circularity}  in_hoop_f : {min_in_hoop_frames}")
         print("=" * 68, flush=True)
@@ -242,19 +244,31 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 篮球下落速度 ~8m/s，30fps 下每帧位移 <0.3m，连续 2 帧丢失不会漏检
         _yolo_step = max(1, int(yolo_step))
         _last_ball_pos = None
+        _stat_yolo_called = 0
+        _stat_yolo_skipped = 0
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
                 if state.cancel_requested:
                     break
                 ball_pos = None
                 need_yolo = False
+                _yolo_skipped = False  # 条件跳过标记（用于进度显示）
                 if auto_threshold and not detector._warmup_done:
                     # 预热期：只收集 P95 统计量，跳过 YOLO
                     _last_ball_pos = None
                 else:
                     # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果
                     need_yolo = ((processed % _yolo_step) == 0)
+                    if need_yolo and skip_yolo_no_motion:
+                        # 条件跳过：篮筐区域无运动像素时跳过 YOLO（省 ~60ms）
+                        if not detector.has_motion_near_hoop(frame):
+                            need_yolo = False
+                            ball_pos = None
+                            _last_ball_pos = None
+                            _yolo_skipped = True
+                            _stat_yolo_skipped += 1
                     if need_yolo:
+                        _stat_yolo_called += 1
                         try:
                             # classes=[0]：ultralytics 在 NMS 后直接过滤，只保留 basketball 类
                             # 省去 CPU 侧全量 .cpu().numpy() 拷贝 + 遍历查找
@@ -285,6 +299,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         phase = '预热'
                     elif need_yolo:
                         phase = '检测'
+                    elif _yolo_skipped:
+                        phase = '跳过'
                     else:
                         phase = '跳帧'
                     _report(pct, f'{phase}帧 {processed}/{n_frames} ({processed*100//n_frames}%)')
@@ -372,6 +388,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if goals:
             _timestamps_str = ", ".join(f"{g:.1f}s" for g in goals[:8]) + ("..." if len(goals) > 8 else "")
             print(f"                {_timestamps_str}")
+        if skip_yolo_no_motion:
+            _yolo_total_scheduled = _stat_yolo_called + _stat_yolo_skipped
+            _skip_rate = _stat_yolo_skipped / max(_yolo_total_scheduled, 1) * 100
+            print(f"  YOLO 调用   : 实际推理 {_stat_yolo_called} 次  |  条件跳过 {_stat_yolo_skipped} 次  ({_skip_rate:.0f}% 跳过率)")
         print(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
               f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
         if detector.auto_threshold:
@@ -594,7 +614,7 @@ def on_batch_save_calib():
 def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                      diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                      min_blob_area=30, search_margin=80, progress_callback=None,
-                     auto_threshold=True, yolo_step=2):
+                     auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False):
     """批量识别：遍历文件夹内全部视频逐个检测，每个视频独立写入历史。
 
     返回 (状态文本, 是否成功)。状态文本逐条列出每个视频的结果，
@@ -622,6 +642,8 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     print(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos")
     print(f"  Auto-thresh : {bool(auto_threshold)}")
     print(f"  YOLO step   : every {yolo_step} frames")
+    if skip_yolo_no_motion:
+        print(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
     print(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
     print("#" * 68, flush=True)
     for i, video_path in enumerate(state.batch_files):
@@ -662,7 +684,8 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             _status, ok = run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                      diff_threshold, min_circularity, min_in_hoop_frames,
                                      min_blob_area, search_margin, progress_callback=_cb,
-                                     auto_threshold=auto_threshold, yolo_step=yolo_step)
+                                     auto_threshold=auto_threshold, yolo_step=yolo_step,
+                                     skip_yolo_no_motion=skip_yolo_no_motion)
         except Exception as e:
             _status, ok = f"异常: {e}", False
         if state.cancel_requested:

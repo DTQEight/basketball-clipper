@@ -104,6 +104,8 @@ def main_page():
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
                                 yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=False).classes('w-full')
                                 ui.label('默认每2帧（推荐, 更准）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
+                                skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=False).classes('w-full')
+                                ui.label('篮筐区域无运动像素时跳过 YOLO 推理').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 with ui.row().classes('gap-2 w-full'):
                                     start_frame = ui.number(label='起始帧', value=0, format='%d').classes('flex-1')
                                     end_frame = ui.number(label='结束帧(0=末尾)', value=0, format='%d').classes('flex-1')
@@ -377,7 +379,8 @@ def main_page():
             min_blob_area.value, search_margin.value,
             progress_callback=_progress_callback,
             auto_threshold=auto_threshold_switch.value,
-            yolo_step=3 if yolo_3frame_switch.value else 2)
+            yolo_step=3 if yolo_3frame_switch.value else 2,
+            skip_yolo_no_motion=skip_yolo_switch.value)
 
         _batch_running["active"] = False
         batch_run_btn.set_text('批量识别')
@@ -466,7 +469,8 @@ def main_page():
             min_blob_area.value, search_margin.value,
             progress_callback=_progress_callback,
             auto_threshold=auto_threshold_switch.value,
-            yolo_step=3 if yolo_3frame_switch.value else 2)
+            yolo_step=3 if yolo_3frame_switch.value else 2,
+            skip_yolo_no_motion=skip_yolo_switch.value)
 
         _detecting["active"] = False
         # 隐藏进度条，显示结果

@@ -169,6 +169,32 @@ class GoalDetector:
         # 高斯模糊降噪
         self.baseline_gray = cv2.GaussianBlur(self.baseline_gray, (5, 5), 0)
 
+    def has_motion_near_hoop(self, frame, threshold=None):
+        """快速检查篮筐搜索区域是否有运动像素（用于条件跳过 YOLO）。
+
+        只做裁剪 + absdiff + countNonZero，不做形态学/连通域，~1ms。
+        返回: True=有运动（需要 YOLO），False=无运动（可跳过 YOLO）
+        """
+        if self.baseline_gray is None:
+            return True  # 基准帧还没设，不跳过
+        # 裁剪 ROI
+        sy2 = min(self.search_y2, frame.shape[0])
+        sx2 = min(self.search_x2, frame.shape[1])
+        frame_roi = frame[self.search_y1:sy2, self.search_x1:sx2]
+        if frame_roi.size == 0:
+            return True
+        if len(frame_roi.shape) == 3:
+            frame_roi = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY)
+        frame_roi = cv2.GaussianBlur(frame_roi, (5, 5), 0)
+        base_roi = self.baseline_gray[self.search_y1:sy2, self.search_x1:sx2]
+        diff = cv2.absdiff(frame_roi, base_roi)
+        thr = threshold if threshold is not None else (self._auto_threshold_value or self.diff_threshold)
+        _, diff_bin = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
+        # 运动像素超过搜索区域总像素的 1% 才算有运动
+        # 球经过时通常 2000+ 像素，噪声/光线微变通常 <200 像素
+        _motion_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
+        return _motion_ratio > 0.01
+
     def _find_moving_blob(self, frame_gray):
         """在篮筐周边搜索区域找最大运动连通域。
 
