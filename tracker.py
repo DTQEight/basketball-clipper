@@ -32,7 +32,8 @@ class GoalDetector:
                  yolo_confirm=False,
                  rolling_baseline_sec=60.0,
                  min_circularity=0.35,
-                 min_in_hoop_frames=2):
+                 min_in_hoop_frames=2,
+                 auto_threshold=True):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
@@ -58,6 +59,11 @@ class GoalDetector:
         min_in_hoop_frames: 宽松模式下斑块进框触发所需的最小连续帧数
             默认 2 帧（≈0.07秒@30fps），过滤单帧噪声
             球在框内通常 2-4 帧，不宜设太高否则漏检
+        auto_threshold: 自适应阈值（默认开启）
+            True  - 前 30 秒预热期收集 diff 的 P95 统计量，结束时自动计算阈值
+                    阈值 = median(P95s) + 8，clamp 到 [8, 50]
+                    预热期内只采样不判定进球
+            False - 使用 diff_threshold 固定值
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -79,6 +85,17 @@ class GoalDetector:
         self.min_circularity = float(min_circularity)  # 最小圆形度（形状过滤）
         self.min_in_hoop_frames = int(min_in_hoop_frames)  # 宽松模式最小进框帧数
 
+        # 自适应阈值：预热期收集 P95，结束时自动计算 diff_threshold
+        self.auto_threshold = bool(auto_threshold)
+        self._warmup_p95s = []                # 预热期每帧 P95（0-255）
+        self._warmup_target_sec = 30.0        # 预热时长（秒）
+        self._warmup_done = not self.auto_threshold  # 关闭自适应时视为已完成
+        self._warmup_start_frame = -1         # 预热起始帧（首次 feed 时设置）
+        self._user_diff_threshold = int(diff_threshold)  # 保存用户设定值
+        self._auto_threshold_value = None     # 自适应计算出的阈值（诊断用）
+        self._warmup_p95_median = None        # 预热结束时保存的 P95 中位数（诊断用，避免列表被清空）
+        self._warmup_sample_count = 0         # 预热期实际采样的帧数（诊断用）
+
         # 基准帧（灰度）
         self.baseline_gray = None
         self.last_baseline_frame_idx = -1  # 上次更新基准帧的帧号
@@ -96,6 +113,9 @@ class GoalDetector:
         self.search_y1 = max(0, self.hoop_y1 - search_margin)
         self.search_x2 = self.hoop_x2 + search_margin
         self.search_y2 = self.hoop_y2 + search_margin
+
+        # 形态学 kernel 缓存：_find_moving_blob 每帧都用，__init__ 创建一次复用
+        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
         # 进球状态机：跟踪斑块穿越篮筐
         self.blob_above_hoop = False   # 斑块是否在篮筐上方
@@ -179,18 +199,25 @@ class GoalDetector:
 
         # 帧差
         diff = cv2.absdiff(curr_roi, base_roi)
+
+        # 自适应阈值：预热期收集 P95 统计量（用于自动计算 diff_threshold）
+        # 降采样计算 P95：每 4 个像素取 1 个，计算量减少 16 倍，精度足够（统计量）
+        if self.auto_threshold and not self._warmup_done:
+            sample = diff[::4, ::4]
+            self._warmup_p95s.append(float(np.percentile(sample, 95)))
+
         _, diff_bin = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
 
-        # 形态学操作去噪 + 连接相邻区域
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN, kernel)
-        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, kernel)
+        # 形态学操作去噪 + 连接相邻区域（kernel 在 __init__ 缓存，避免每帧重建）
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN, self._morph_kernel)
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, self._morph_kernel)
 
         # 用 findContours 替代 connectedComponents，以获取周长计算圆形度
         contours, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         # 调试用：差分比例（0-1，画面变化区域占比）
-        self.last_diff_ratio = float(np.sum(diff_bin > 0)) / max(diff_bin.size, 1)
+        # cv2.countNonZero 直接计数，省去 np.sum(bin>0) 的 bool 数组创建开销
+        self.last_diff_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
 
         # 找最大的有效连通域（面积在范围内 + 形状过滤）
         best_blob = None
@@ -254,12 +281,15 @@ class GoalDetector:
         if self.baseline_gray is None:
             self.set_baseline(frame)
             self.last_baseline_frame_idx = frame_idx
+            self._warmup_start_frame = frame_idx
             return None
 
         # 修复：若基准帧是外部传入的（__init__ 中设置），last_baseline_frame_idx 仍为 -1
         # 此时把它对齐到当前 frame_idx，否则滚动基准帧的触发条件 (>=0) 永远不满足
         if self.last_baseline_frame_idx < 0:
             self.last_baseline_frame_idx = frame_idx
+        if self._warmup_start_frame < 0:
+            self._warmup_start_frame = frame_idx
 
         # 转灰度 + 模糊
         if len(frame.shape) == 3:
@@ -287,6 +317,24 @@ class GoalDetector:
 
         # 在篮筐周边找运动斑块
         blob = self._find_moving_blob(frame_gray)
+
+        # ====== 自适应阈值预热：只采样不判定 ======
+        if self.auto_threshold and not self._warmup_done:
+            warmup_sec = (frame_idx - self._warmup_start_frame) / fps
+            if warmup_sec >= self._warmup_target_sec and len(self._warmup_p95s) > 0:
+                # 预热结束：阈值 = median(P95) + 8，clamp 到 [8, 50]
+                median_p95 = float(np.median(self._warmup_p95s))
+                auto_thr = int(median_p95 + 8)
+                auto_thr = max(8, min(50, auto_thr))
+                self.diff_threshold = auto_thr
+                self._auto_threshold_value = auto_thr
+                self._warmup_p95_median = median_p95
+                self._warmup_sample_count = len(self._warmup_p95s)
+                self._warmup_done = True
+                self._warmup_p95s = []  # 清空释放内存
+            else:
+                # 预热期内不判定进球
+                return None
 
         # ====== 滚动基准帧更新（双触发：时间间隔 + 斑块持续） ======
         # 旧逻辑只在 blob is None 时更新，球员常驻篮筐附近时永不更新导致 diff 失效。
@@ -365,31 +413,19 @@ class GoalDetector:
                 # 宽松模式：斑块进框连续 min_in_hoop_frames 帧即标记候选
                 # 默认 2 帧（≈0.07秒@30fps），过滤单帧噪声，不影响真实进球（球在框内 2-4 帧）
                 if self.loose_mode and self.blob_in_hoop_frames >= self.min_in_hoop_frames:
-                    # YOLO 软确认：检查时间窗口内 YOLO 是否检测到球在篮筐附近
-                    # YOLO 有球在篮筐附近 → 确认进球（yolo_confirmed）
-                    # YOLO 没球或球不在附近 → 不否决，仍注册候选（yolo_no_evidence）
-                    #   理由：底角视角下 YOLO 常跟错物体或漏检，
-                    #         硬否决会导致真实进球被漏掉，交给 VLM 二次验证更可靠
-                    if self.yolo_confirm:
-                        margin_x = self.hoop_w * 1.0
-                        margin_y = self.hoop_h * 1.0
-                        x_lo = self.hoop_x1 - margin_x
-                        x_hi = self.hoop_x2 + margin_x
-                        y_lo = self.hoop_y1 - margin_y
-                        y_hi = self.hoop_y2 + margin_y
-                        yolo_near_hoop = any(
-                            x_lo <= bx <= x_hi and y_lo <= by <= y_hi
-                            for (_, bx, by) in self.ball_pos_history
-                        )
-                        if yolo_near_hoop:
+                    # YOLO 硬否决：篮筐附近±10帧内没检测到球 → 直接排除（预览片段没球的误检靠这里过滤）
+                    yolo_ok, yolo_status = self._check_yolo_near_hoop()
+                    if yolo_ok:
+                        if yolo_status == "confirmed":
                             self.diag["yolo_confirmed"] += 1
-                        else:
-                            self.diag["yolo_rejected"] += 1
-                            # 软确认：不 return，继续注册候选
-                    ts = frame_idx / fps
-                    if self._register_goal(ts, frame_idx, fps, "loose"):
+                        ts = frame_idx / fps
+                        if self._register_goal(ts, frame_idx, fps, "loose"):
+                            self.blob_in_hoop_frames = 0
+                            return ts
+                    else:
+                        self.diag["yolo_rejected"] += 1
                         self.blob_in_hoop_frames = 0
-                        return ts
+                        return None
 
         # 斑块在篮筐下方
         elif cy >= self.hoop_bot:
@@ -410,14 +446,21 @@ class GoalDetector:
                     if not trend_ok:
                         self.diag["reject_trend"] += 1
                     else:
-                        if above_in_time and not self.blob_above_hoop:
-                            self.diag["timeout_goal"] += 1
-                        ts = frame_idx / fps
-                        self.blob_above_hoop = False
-                        self.last_above_frame = -999
-                        self.blob_in_hoop_frames = 0
-                        if self._register_goal(ts, frame_idx, fps, "visual"):
-                            return ts
+                        # YOLO 硬否决：篮筐附近没球就不算进球
+                        yolo_ok, yolo_status = self._check_yolo_near_hoop()
+                        if not yolo_ok:
+                            self.diag["yolo_rejected"] += 1
+                        else:
+                            if yolo_status == "confirmed":
+                                self.diag["yolo_confirmed"] += 1
+                            if above_in_time and not self.blob_above_hoop:
+                                self.diag["timeout_goal"] += 1
+                            ts = frame_idx / fps
+                            self.blob_above_hoop = False
+                            self.last_above_frame = -999
+                            self.blob_in_hoop_frames = 0
+                            if self._register_goal(ts, frame_idx, fps, "visual"):
+                                return ts
                 self.blob_above_hoop = False
 
             # 路径2：侧向进筐（斑块在框内出现过 >=1 帧后到下方，不要求先到上方）
@@ -427,15 +470,22 @@ class GoalDetector:
                 elif not size_ok:
                     self.diag["reject_size"] += 1
                 else:
-                    if hoop_in_time and self.blob_in_hoop_frames < 1:
-                        self.diag["timeout_goal"] += 1
+                    # YOLO 硬否决：篮筐附近没球就不算进球
+                    yolo_ok, yolo_status = self._check_yolo_near_hoop()
+                    if not yolo_ok:
+                        self.diag["yolo_rejected"] += 1
                     else:
-                        self.diag["side_goal"] += 1
-                    ts = frame_idx / fps
-                    self.blob_in_hoop_frames = 0
-                    self.last_in_hoop_frame = -999
-                    if self._register_goal(ts, frame_idx, fps, "side"):
-                        return ts
+                        if yolo_status == "confirmed":
+                            self.diag["yolo_confirmed"] += 1
+                        if hoop_in_time and self.blob_in_hoop_frames < 1:
+                            self.diag["timeout_goal"] += 1
+                        else:
+                            self.diag["side_goal"] += 1
+                        ts = frame_idx / fps
+                        self.blob_in_hoop_frames = 0
+                        self.last_in_hoop_frame = -999
+                        if self._register_goal(ts, frame_idx, fps, "side"):
+                            return ts
             else:
                 self.diag["reject_no_above"] += 1
 
@@ -473,12 +523,42 @@ class GoalDetector:
         # y 整体增加（向下）且至少下降 5 像素（放宽，适配斜向运动）
         return (ys[-1] - ys[0]) > 5
 
+    def _check_yolo_near_hoop(self):
+        """检查 YOLO 历史中，篮筐附近（±1倍筐宽高）是否有球。
+
+        返回: (有球: bool, 用于诊断: 'confirmed'/'rejected'/'skipped')
+        """
+        if not self.yolo_confirm:
+            return True, "skipped"
+        margin_x = self.hoop_w * 1.0
+        margin_y = self.hoop_h * 1.0
+        x_lo = self.hoop_x1 - margin_x
+        x_hi = self.hoop_x2 + margin_x
+        y_lo = self.hoop_y1 - margin_y
+        y_hi = self.hoop_y2 + margin_y
+        has_ball = any(
+            x_lo <= bx <= x_hi and y_lo <= by <= y_hi
+            for (_, bx, by) in self.ball_pos_history
+        )
+        return has_ball, "confirmed" if has_ball else "rejected"
+
     def get_debug_info(self):
         """获取调试信息。"""
+        if self.auto_threshold and not self._warmup_done and self.fps > 0:
+            warmup_elapsed = (self._warmup_p95s and len(self._warmup_p95s) / self.fps) or 0.0
+        else:
+            warmup_elapsed = self._warmup_target_sec if self._warmup_done else 0.0
         return {
             "diff_ratio": self.last_diff_ratio,
             "blob_above": self.blob_above_hoop,
             "blob_box": self.last_blob_box,
             "search_area": (self.search_x1, self.search_y1, self.search_x2, self.search_y2),
             "visual_goals": len(self.visual_goals),
+            "auto_threshold": self.auto_threshold,
+            "warmup_done": self._warmup_done,
+            "warmup_elapsed_sec": round(float(warmup_elapsed), 1),
+            "warmup_target_sec": self._warmup_target_sec,
+            "diff_threshold": self.diff_threshold,
+            "auto_threshold_value": self._auto_threshold_value,
+            "user_diff_threshold": self._user_diff_threshold,
         }
