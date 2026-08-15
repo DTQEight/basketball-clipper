@@ -23,8 +23,6 @@ class GoalDetector:
     """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测。"""
 
     def __init__(self, hoop_box, baseline_frame=None,
-                 hoop_above_margin=30, hoop_x_margin=25,
-                 approach_dist=100, disappear_frames=3, confirm_below=True,
                  min_gap_sec=3.0,
                  diff_threshold=15, min_blob_area=30, max_blob_area=5000,
                  search_margin=80,
@@ -128,8 +126,7 @@ class GoalDetector:
         self.last_in_hoop_frame = -999 # 上次斑块在篮筐框内的帧号
         self.above_timeout_frames = 45 # 上方状态保持时长（约 1.5 秒 @30fps）
 
-        self.goals = []                # 进球时间戳（兼容旧接口）
-        self.visual_goals = []         # 视觉进球时间戳
+        self.goals = []                # 进球时间戳
         self.last_goal_frame = -1
         self.fps = 30.0
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
@@ -530,7 +527,6 @@ class GoalDetector:
                 self.diag["reject_cooldown"] += 1
                 return False
 
-        self.visual_goals.append(ts)
         self.goals.append(ts)
         self.last_goal_frame = frame_idx
         self.blob_history = []
@@ -567,24 +563,3 @@ class GoalDetector:
             for (_, bx, by) in self.ball_pos_history
         )
         return has_ball, "confirmed" if has_ball else "rejected"
-
-    def get_debug_info(self):
-        """获取调试信息。"""
-        if self.auto_threshold and not self._warmup_done and self.fps > 0:
-            warmup_elapsed = (self._warmup_p95s and len(self._warmup_p95s) / self.fps) or 0.0
-        else:
-            warmup_elapsed = self._warmup_target_sec if self._warmup_done else 0.0
-        return {
-            "diff_ratio": self.last_diff_ratio,
-            "blob_above": self.blob_above_hoop,
-            "blob_box": self.last_blob_box,
-            "search_area": (self.search_x1, self.search_y1, self.search_x2, self.search_y2),
-            "visual_goals": len(self.visual_goals),
-            "auto_threshold": self.auto_threshold,
-            "warmup_done": self._warmup_done,
-            "warmup_elapsed_sec": round(float(warmup_elapsed), 1),
-            "warmup_target_sec": self._warmup_target_sec,
-            "diff_threshold": self.diff_threshold,
-            "auto_threshold_value": self._auto_threshold_value,
-            "user_diff_threshold": self._user_diff_threshold,
-        }

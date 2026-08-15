@@ -107,7 +107,7 @@ def save_history(records):
         print(f"[WARN] 保存历史记录失败: {e}", flush=True)
 
 
-def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1,
+def add_history(video_path, hoop, goals, baseline_idx=-1,
                 ball_conf=None, min_gap_sec=None, diff_threshold=None,
                 auto_threshold=None, yolo_step=None, skip_yolo_no_motion=None,
                 min_circularity=None, min_in_hoop_frames=None,
@@ -136,9 +136,7 @@ def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1,
         "hoop": list(hoop) if hoop else None,
         "baseline_idx": int(baseline_idx),
         "goals": [float(t) for t in goals],
-        "kept_goals": [float(t) for t in kept_goals],
         "total": len(goals),
-        "kept": len(kept_goals),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     # 核心检测参数

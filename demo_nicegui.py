@@ -369,7 +369,31 @@ def main_page():
             else:
                 el.classes(add='hidden')
 
+    # ====== 全局任务互斥（B1）：检测/批量/集锦/加载运行期间，禁止其他改 state 的操作 ======
+    _busy = {"task": None}
+
+    def _task_label(task):
+        return {'detect': '开始识别', 'batch': '批量识别',
+                'highlights': '生成集锦', 'load': '加载视频'}.get(task, '后台任务')
+
+    def _try_acquire(task):
+        """尝试占用任务锁；已有任务运行则提示并返回 False。"""
+        if _busy["task"] is not None:
+            _set_status(f'「{_task_label(_busy["task"])}」正在进行，请等待完成或取消', 'err')
+            return False
+        _busy["task"] = task
+        return True
+
+    def _refuse_if_busy():
+        """轻量操作守卫：有任务运行时提示并返回 True（调用方直接 return）。"""
+        if _busy["task"] is not None:
+            _set_status(f'「{_task_label(_busy["task"])}」正在进行，请稍后再试', 'err')
+            return True
+        return False
+
     async def _on_load():
+        if _refuse_if_busy():
+            return
         path = path_input.value
         # 文件夹路径 → 批量标定 + 批量识别模式
         if path and os.path.isdir(path.strip().strip('"')):
@@ -392,8 +416,11 @@ def main_page():
             await _on_batch_load_video(files[0])
             _set_status(f'批量模式 | 扫描到 {len(files)} 个视频，逐个标定后批量识别', 'info')
             return
-        # 单视频文件路径 → 原有流程
+        # 单视频文件路径 → 原有流程（清空批量状态，避免写历史误带 batch_idx）
         batch_panel.classes(add='hidden')
+        state.batch_files = []
+        state.batch_calibs = {}
+        state.batch_current_video = None
         # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
         #       已下沉到 detection.load_video 业务层（切视频即清空），UI 层不再重复
         #       以避免 frame is None 分支漏清空导致旧数据残留
@@ -436,6 +463,8 @@ def main_page():
             path = path[0]
         if _batch_loading:
             return
+        if _refuse_if_busy():
+            return
         if path is None:
             path = batch_select.value
         if not path:
@@ -449,6 +478,9 @@ def main_page():
                 batch_select.set_value(path)
             return
         _batch_loading = True
+        if not _try_acquire('load'):
+            _batch_loading = False
+            return
         try:
             batch_select.set_value(path)
             # 若该视频已有检测结果，生成预览片段可能耗时，用 io_bound 避免阻塞 UI
@@ -475,18 +507,19 @@ def main_page():
             # 刷新结果卡片（已检测过的视频会显示进球列表）
             _refresh_result_cards()
         finally:
+            _busy["task"] = None
             _batch_loading = False
 
     def _on_batch_save_calib():
+        if _refuse_if_busy():
+            return
         status = detection.on_batch_save_calib()
         calib_status.set_text(status)
         _refresh_batch_list()
         _set_status(status, 'ok' if '已保存' in status else 'err')
 
-    _batch_running = {"active": False}
-
     async def _on_batch_run():
-        if _batch_running["active"]:
+        if _busy["task"] == 'batch':
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
             state.cancel_requested = True
             batch_run_btn.set_text('正在取消...')
@@ -495,7 +528,8 @@ def main_page():
         if not state.batch_files:
             _set_status('请先加载文件夹', 'err')
             return
-        _batch_running["active"] = True
+        if not _try_acquire('batch'):
+            return
         state.cancel_requested = False
         batch_run_btn.set_text('取消')
         batch_run_btn.enable()
@@ -517,7 +551,8 @@ def main_page():
         try:
             status, ok = await run.io_bound(
                 detection.run_batch_detect,
-                start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
+                int(start_frame.value or 0), int(end_frame.value or 0),
+                ball_conf.value, min_gap.value,
                 diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
                 min_blob_area.value, search_margin.value,
                 progress_callback=_progress_callback,
@@ -528,8 +563,8 @@ def main_page():
             import traceback
             status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"
             ok = False
-
-        _batch_running["active"] = False
+        finally:
+            _busy["task"] = None
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
         _show_right_pane('preview')
@@ -544,6 +579,9 @@ def main_page():
         使用 ui.interactive_image 的 on_mouse 事件，e.image_x/e.image_y
         已由前端按 显示尺寸/原始尺寸 比例换算为原始帧坐标。
         """
+        if _busy["task"] is not None:
+            calib_status.set_text('任务进行中，暂不能标定')
+            return
         try:
             x = int(round(e.image_x))
             y = int(round(e.image_y))
@@ -570,6 +608,8 @@ def main_page():
     batch_select.on_value_change(_on_batch_select_change)
 
     def _on_reset():
+        if _refuse_if_busy():
+            return
         status = detection.reset_hoop()
         calib_status.set_text(status)
         # 刷新预览
@@ -578,16 +618,15 @@ def main_page():
             if frame is not None:
                 preview_image.set_source(video_utils.frame_to_base64(frame))
 
-    _detecting = {"active": False}
-
     async def _on_detect():
-        if _detecting["active"]:
+        if _busy["task"] == 'detect':
             # 检测中点击 → 请求取消，run_detect 轮询后中断
             state.cancel_requested = True
             detect_btn.set_text('正在取消...')
             detect_btn.disable()
             return
-        _detecting["active"] = True
+        if not _try_acquire('detect'):
+            return
         state.cancel_requested = False
         detect_btn.set_text('取消')
         detect_btn.enable()
@@ -611,7 +650,8 @@ def main_page():
         try:
             status, ok = await run.io_bound(
                 detection.run_detect,
-                start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
+                int(start_frame.value or 0), int(end_frame.value or 0),
+                ball_conf.value, min_gap.value,
                 diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
                 min_blob_area.value, search_margin.value,
                 progress_callback=_progress_callback,
@@ -622,8 +662,8 @@ def main_page():
             import traceback
             status = f"❌ 检测异常: {_e}\n{traceback.format_exc()}"
             ok = False
-
-        _detecting["active"] = False
+        finally:
+            _busy["task"] = None
         # 隐藏进度条，显示预览图（无论成功/失败/取消，都回到一致的 preview 态，避免视频重叠）
         _show_right_pane('preview')
         if state.cancel_requested:
@@ -650,8 +690,10 @@ def main_page():
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
         for i, clip in enumerate(state.last_goal_clips):
             ts = clip["ts"]
-            t_min, t_sec = int(ts // 60), ts % 60
-            end_ts = ts + 10
+            # 预览片段实际为进球时刻 ±3s（见 _generate_preview_clips 的 clip_half）
+            start_ts = max(0.0, ts - 3)
+            end_ts = ts + 3
+            t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
             with result_container:
                 with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style('margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'):
@@ -684,12 +726,16 @@ def main_page():
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
     def _on_delete_clip(idx):
+        if _refuse_if_busy():
+            return
         # 点击直接删除，不弹确认框
         _, status = detection.clip_action("delete", idx)
         _refresh_result_cards()
         _set_status(status, 'info')
 
     async def _on_highlights():
+        if not _try_acquire('highlights'):
+            return
         from nicegui import run
         # 在右侧预览区显示进度
         _show_right_pane('progress')
@@ -713,6 +759,8 @@ def main_page():
         except Exception as _e:
             import traceback
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
+        finally:
+            _busy["task"] = None
 
         if path and os.path.exists(path):
             ui.download(path)
@@ -752,6 +800,8 @@ def main_page():
                     ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
     async def _on_load_history():
+        if _refuse_if_busy():
+            return
         idx = _selected_history_idx["idx"]
         if idx is None:
             _set_status('请先点击选择一条历史记录', 'err')

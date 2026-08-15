@@ -20,8 +20,7 @@ if not exist "%PYTHON%" set "PYTHON=python"
 REM --- Log dir + today's log filename (YYYYMMDD)
 set "LOG_DIR=%PROJECT_ROOT%\cache\logs"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
-for /f "tokens=2 delims==" %%i in ('wmic os get localdatetime /value ^| findstr "="') do set "_dt=%%i"
-set "DATE_TAG=%_dt:~0,8%"
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd"') do set "DATE_TAG=%%i"
 set "LOG_FILE=%LOG_DIR%\server-%DATE_TAG%.log"
 
 REM --- Purge log files older than 7 days
@@ -49,10 +48,10 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENIN
 )
 if "!_KILLED!"=="1" timeout /t 2 /nobreak >nul
 
-REM --- Start service (stdout/stderr -> console + log file via Tee)
+REM --- Start service (stdout/stderr -> console + log file; PowerShell 内置 Tee，不依赖外部 tee)
 cd /d "%SCRIPT_DIR%"
 echo Starting service...
-"%PYTHON%" -u demo_nicegui.py 2>&1 | tee -append "%LOG_FILE%"
+powershell -NoProfile -Command "& '%PYTHON%' -u demo_nicegui.py 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
 
 echo.
 echo Service stopped. Press any key to exit.

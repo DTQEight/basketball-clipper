@@ -59,6 +59,23 @@ def load_video(video_path):
     return preview, info_str
 
 
+def _draw_calib_overlay(frame, hoop, clicks):
+    """在 BGR 帧上叠加篮筐框 + 点击标记，返回新帧（BGR 上绘制，调用方再转 RGB）。"""
+    out = frame.copy()
+    if hoop:
+        x1, y1, x2, y2 = hoop
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(out, "HOOP", (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.line(out, (x1 - 30, y1), (x2 + 30, y1), (0, 255, 255), 1)
+        cv2.line(out, (x1 - 30, y2), (x2 + 30, y2), (255, 0, 255), 1)
+    for i, (x, y) in enumerate(clicks):
+        cv2.circle(out, (x, y), 10, (255, 255, 0), -1)
+        cv2.putText(out, str(i + 1), (x - 6, y - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    return out
+
+
 def preview_frame(frame_idx):
     """预览指定帧。"""
     if state.video_state["path"] is None:
@@ -67,18 +84,7 @@ def preview_frame(frame_idx):
                        total=state.video_state["total"], fps=state.video_state["fps"])
     if frame is None:
         return None, "读取帧失败"
-    out = frame.copy()
-    if state.calib["hoop"]:
-        x1, y1, x2, y2 = state.calib["hoop"]
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(out, "HOOP", (x1, max(y1 - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.line(out, (x1 - 30, y1), (x2 + 30, y1), (0, 255, 255), 1)
-        cv2.line(out, (x1 - 30, y2), (x2 + 30, y2), (255, 0, 255), 1)
-    for i, (x, y) in enumerate(state.calib["clicks"]):
-        cv2.circle(out, (x, y), 10, (255, 255, 0), -1)
-        cv2.putText(out, str(i + 1), (x - 6, y - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    out = _draw_calib_overlay(frame, state.calib["hoop"], state.calib["clicks"])
     ts = int(frame_idx) / state.video_state["fps"]
     return cv2.cvtColor(out, cv2.COLOR_BGR2RGB), f"帧 {frame_idx} ({ts:.1f}s)"
 
@@ -106,18 +112,7 @@ def click_calibrate(x, y):
                        total=state.video_state["total"], fps=state.video_state["fps"])
     if frame is None:
         return None, status
-    out = frame.copy()
-    if state.calib["hoop"]:
-        x1, y1, x2, y2 = state.calib["hoop"]
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(out, "HOOP", (x1, max(y1 - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.line(out, (x1 - 30, y1), (x2 + 30, y1), (0, 255, 255), 1)
-        cv2.line(out, (x1 - 30, y2), (x2 + 30, y2), (255, 0, 255), 1)
-    for i, (px, py) in enumerate(state.calib["clicks"]):
-        cv2.circle(out, (px, py), 10, (255, 255, 0), -1)
-        cv2.putText(out, str(i + 1), (px - 6, py - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    out = _draw_calib_overlay(frame, state.calib["hoop"], state.calib["clicks"])
     return cv2.cvtColor(out, cv2.COLOR_BGR2RGB), status
 
 
@@ -420,8 +415,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         )
 
         if state.cancel_requested:
-            # 用户取消：清空本次部分生成的片段，不写入历史
+            # 用户取消：删除本次已生成的片段文件，清空内存列表，不写入历史
             _t2 = time.time()
+            for _c in list(state.last_goal_clips):
+                try:
+                    os.remove(_c["path"])
+                except OSError:
+                    pass
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
@@ -527,7 +527,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 速度 vs 实时倍数
         _speed_vs_realtime = video_dur_min / max(_detect_elapsed / 60.0, 0.001)
 
-        state.add_history(state.video_state["path"], hoop, detector.goals, detector.goals,
+        state.add_history(state.video_state["path"], hoop, detector.goals,
                           baseline_idx=state.calib["baseline_idx"],
                           ball_conf=ball_conf,
                           min_gap_sec=min_gap_sec,
@@ -666,10 +666,9 @@ def on_load_history(idx_choice, progress_callback=None):
         else:
             state.calib["baseline_frame"] = None
             state.calib["baseline_idx"] = -1
-    kept = [float(t) for t in r.get("kept_goals", [])]
     all_goals = [float(t) for t in r.get("goals", [])]
     state.last_goals.clear()
-    state.last_goals.extend(kept if kept else all_goals)
+    state.last_goals.extend(all_goals)
 
     fps = info["fps"]
     total = info["total"]
@@ -696,17 +695,15 @@ def on_load_history(idx_choice, progress_callback=None):
                 state.clip_cache.pop(next(iter(state.clip_cache)))
             state.save_clip_cache()
 
-    kept_set = set(round(t, 3) for t in kept)
-    for i, clip in enumerate(state.last_goal_clips):
-        if round(clip["ts"], 3) in kept_set or not kept:
-            state.kept_goal_indices.add(i)
+    # 加载后全部进球默认保留（筛选结果不持久化，删除操作仅影响当前会话的集锦导出）
+    state.kept_goal_indices = set(range(len(state.last_goal_clips)))
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
     status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
-              f"进球: {len(all_goals)} 个 | 保留: {len(kept)} 个\n"
+              f"进球: {len(all_goals)} 个\n"
               f"已生成 {len(state.last_goal_clips)} 个预览片段")
     return preview, info_str, status
 
@@ -774,11 +771,10 @@ def on_batch_load_video(selected, progress_callback=None):
 
     if matched:
         _report(10, '找到检测记录，加载进球数据...')
-        kept = [float(t) for t in matched.get("kept_goals", [])]
         all_goals = [float(t) for t in matched.get("goals", [])]
         # 注：last_goals / last_goal_clips / kept_goal_indices 已在函数入口统一清空，
         # 这里直接 extend，不需要再 .clear() 一次
-        state.last_goals.extend(kept if kept else all_goals)
+        state.last_goals.extend(all_goals)
 
         fps = info["fps"]
         total = info["total"]
@@ -801,14 +797,12 @@ def on_batch_load_video(selected, progress_callback=None):
                     state.clip_cache.pop(next(iter(state.clip_cache)))
                 state.save_clip_cache()
 
-        kept_set = set(kept)
-        for i, clip in enumerate(state.last_goal_clips):
-            if clip["ts"] in kept_set or not kept:
-                state.kept_goal_indices.add(i)
+        # 加载后全部进球默认保留（筛选结果不持久化）
+        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
 
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
-                  f"进球: {len(all_goals)} 个 | 保留: {len(kept)} 个\n"
+                  f"进球: {len(all_goals)} 个\n"
                   f"已加载 {len(state.last_goal_clips)} 个预览片段")
     else:
         # 未检测过：函数入口已统一清空 state，这里只写状态文本，无需再清
