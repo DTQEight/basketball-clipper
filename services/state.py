@@ -33,7 +33,7 @@ HISTORY_FILE = os.path.join(CACHE_ROOT, "detection_history.json")
 # 预览片段缓存索引（持久化，重启后可复用上一次生成的片段）
 CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
 
-DEFAULT_VIDEO = r"D:\Downloads\highlights.mp4"
+DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 
 # ============ 运行时状态 ============

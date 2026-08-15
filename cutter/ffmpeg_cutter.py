@@ -58,13 +58,26 @@ def _build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
         return ["-c:v", "libx264", "-preset", "fast", "-crf", crf]
 
 
+def _cleanup_tmp(clip_files, list_path):
+    """清理临时切片文件和拼接列表。"""
+    for p in clip_files:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    try:
+        os.remove(list_path)
+    except OSError:
+        pass
+
+
 def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
               output_path=None, ffmpeg_path="", progress_callback=None):
     """根据进球时间戳剪辑集锦（GPU 硬编加速）。
 
     timestamps: 进球时刻列表（秒，浮点）
     min_gap: 两个片段间隔小于此值则合并，避免连续得分重复切。
-    output_path: 输出文件路径，None 则默认到 E:\\basketball-project\\cache\\demo_output\\highlights.mp4
+    output_path: 输出文件路径，None 则默认到 cache/demo_output/highlights.mp4
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
     progress_callback: 可选进度回调 (pct, msg)，0-100。
     返回: 输出文件路径 或 None（无进球）
@@ -170,19 +183,16 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         "-movflags", "+faststart",
         output_path,
     ]
-    subprocess.run(cmd, check=True, creationflags=_SBOX, timeout=1800)
+    try:
+        subprocess.run(cmd, check=True, creationflags=_SBOX, timeout=1800)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"[剪辑] 拼接失败: {e}", flush=True)
+        _cleanup_tmp(clip_files, list_path)
+        return None
     _report(98, '清理临时文件...')
 
     # 清理临时文件
-    for p in clip_files:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-    try:
-        os.remove(list_path)
-    except OSError:
-        pass
+    _cleanup_tmp(clip_files, list_path)
 
     total_dur = sum(e - s for s, e in segments)
     skip_info = f" | 跳过 {failed_segments} 段失败" if failed_segments > 0 else ""

@@ -251,6 +251,10 @@ def main_page():
                                             diff_threshold_label.set_text(f'帧差阈值: {diff_threshold.value}')
                                             diff_threshold.style(f'color: {_gray}')
                                     auto_threshold_switch.on_value_change(lambda e: _sync_diff_threshold(e.value))
+                                    def _on_diff_threshold_change(e):
+                                        if not auto_threshold_switch.value:
+                                            diff_threshold_label.set_text(f'帧差阈值: {e.value}')
+                                    diff_threshold.on_value_change(_on_diff_threshold_change)
                                     _sync_diff_threshold(True)
                         exp_hl = ui.expansion('集锦', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_hl:
