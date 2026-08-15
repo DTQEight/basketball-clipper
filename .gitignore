@@ -30,10 +30,13 @@ demo_output/
 weights/*.pt
 *.pt
 
-# 缓存
+# 缓存目录（项目根目录下的 cache/，内含 detection_history.json、preview 片段、输出缓存）
+cache/
 .cache/
 *.cache
-E:\basketball-project\cache\
+
+# 临时工作目录（本地曾把项目放在 basketball-clipper/ 子目录下，远端是扁平结构，应忽略）
+basketball-clipper/
 
 # IDE
 .vscode/
@@ -48,3 +51,4 @@ desktop.ini
 
 # 日志
 *.log
+server.log

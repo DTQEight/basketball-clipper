@@ -131,7 +131,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
             clip_path,
         ]
         try:
-            subprocess.run(cmd, check=True, creationflags=_SBOX)
+            subprocess.run(cmd, check=True, creationflags=_SBOX, timeout=300)
             # 验证产物有效（非空文件）
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
                 clip_files.append(clip_path)
@@ -141,6 +141,10 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         except subprocess.CalledProcessError as e:
             failed_segments += 1
             print(f"[WARN] 片段 {i+1}/{len(segments)} 切片失败，跳过 (start={start:.1f}s): {e}", flush=True)
+            continue
+        except subprocess.TimeoutExpired:
+            failed_segments += 1
+            print(f"[WARN] 片段 {i+1}/{len(segments)} 切片超时（>300s），跳过 (start={start:.1f}s)", flush=True)
             continue
 
     # 全部失败才返回 None，避免拼接空列表
@@ -166,7 +170,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         "-movflags", "+faststart",
         output_path,
     ]
-    subprocess.run(cmd, check=True, creationflags=_SBOX)
+    subprocess.run(cmd, check=True, creationflags=_SBOX, timeout=1800)
     _report(98, '清理临时文件...')
 
     # 清理临时文件

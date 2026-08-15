@@ -83,11 +83,30 @@ def save_history(records):
         print(f"[WARN] 保存历史记录失败: {e}", flush=True)
 
 
-def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1):
+def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1,
+                ball_conf=None, min_gap_sec=None, diff_threshold=None,
+                auto_threshold=None, yolo_step=None, skip_yolo_no_motion=None,
+                min_circularity=None, min_in_hoop_frames=None,
+                min_blob_area=None, search_margin=None,
+                elapsed_sec=None, batch_idx=None, batch_total=None,
+                detect_start_time=None, detect_end_time=None,
+                # ===== 视频元信息 =====
+                video_fps=None, video_width=None, video_height=None,
+                video_total_frames=None, video_duration_sec=None,
+                # ===== 处理速度指标 =====
+                processed_frames=None, proc_fps=None, speed_vs_realtime=None,
+                # ===== YOLO 跳过/条件跳过 =====
+                yolo_called=None, yolo_cond_skipped=None, yolo_skip_rate_pct=None,
+                # ===== YOLO 路径确认/否决 =====
+                yolo_confirmed=None, yolo_rejected=None, yolo_confirm_rate_pct=None,
+                # ===== 进球路径细分 =====
+                cross_above=None, cross_below=None, in_hoop=None, reject_cooldown=None,
+                # ===== 自适应阈值详情 =====
+                auto_threshold_value=None, warmup_p95_median=None, warmup_sample_count=None):
     """添加一条历史记录（同视频会覆盖旧记录）。"""
     records = load_history()
     records = [r for r in records if r.get("video") != video_path]
-    records.insert(0, {
+    rec = {
         "video": video_path,
         "video_name": os.path.basename(video_path),
         "hoop": list(hoop) if hoop else None,
@@ -97,7 +116,88 @@ def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1):
         "total": len(goals),
         "kept": len(kept_goals),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    }
+    # 核心检测参数
+    if ball_conf is not None:
+        rec["ball_conf"] = float(ball_conf)
+    if min_gap_sec is not None:
+        rec["min_gap_sec"] = float(min_gap_sec)
+    if diff_threshold is not None:
+        rec["diff_threshold"] = diff_threshold  # 可能为 int 或 str 'auto'
+    if auto_threshold is not None:
+        rec["auto_threshold"] = bool(auto_threshold)
+    if yolo_step is not None:
+        rec["yolo_step"] = int(yolo_step)
+    if skip_yolo_no_motion is not None:
+        rec["skip_yolo_no_motion"] = bool(skip_yolo_no_motion)
+    if min_circularity is not None:
+        rec["min_circularity"] = float(min_circularity)
+    if min_in_hoop_frames is not None:
+        rec["min_in_hoop_frames"] = int(min_in_hoop_frames)
+    if min_blob_area is not None:
+        rec["min_blob_area"] = int(min_blob_area)
+    if search_margin is not None:
+        rec["search_margin"] = int(search_margin)
+    # 时间/批量
+    if elapsed_sec is not None:
+        rec["elapsed_sec"] = round(float(elapsed_sec), 1)
+    if batch_idx is not None:
+        rec["batch_idx"] = int(batch_idx)
+    if batch_total is not None:
+        rec["batch_total"] = int(batch_total)
+    if detect_start_time is not None:
+        rec["detect_start_time"] = str(detect_start_time)
+    if detect_end_time is not None:
+        rec["detect_end_time"] = str(detect_end_time)
+    # 视频元信息
+    if video_fps is not None:
+        rec["video_fps"] = round(float(video_fps), 2)
+    if video_width is not None:
+        rec["video_width"] = int(video_width)
+    if video_height is not None:
+        rec["video_height"] = int(video_height)
+    if video_total_frames is not None:
+        rec["video_total_frames"] = int(video_total_frames)
+    if video_duration_sec is not None:
+        rec["video_duration_sec"] = round(float(video_duration_sec), 1)
+    # 处理速度指标
+    if processed_frames is not None:
+        rec["processed_frames"] = int(processed_frames)
+    if proc_fps is not None:
+        rec["proc_fps"] = round(float(proc_fps), 1)
+    if speed_vs_realtime is not None:
+        rec["speed_vs_realtime"] = round(float(speed_vs_realtime), 2)
+    # YOLO 跳过统计
+    if yolo_called is not None:
+        rec["yolo_called"] = int(yolo_called)
+    if yolo_cond_skipped is not None:
+        rec["yolo_cond_skipped"] = int(yolo_cond_skipped)
+    if yolo_skip_rate_pct is not None:
+        rec["yolo_skip_rate_pct"] = round(float(yolo_skip_rate_pct), 1)
+    # YOLO 确认/否决统计
+    if yolo_confirmed is not None:
+        rec["yolo_confirmed"] = int(yolo_confirmed)
+    if yolo_rejected is not None:
+        rec["yolo_rejected"] = int(yolo_rejected)
+    if yolo_confirm_rate_pct is not None:
+        rec["yolo_confirm_rate_pct"] = round(float(yolo_confirm_rate_pct), 1)
+    # 进球路径细分
+    if cross_above is not None:
+        rec["cross_above"] = int(cross_above)
+    if cross_below is not None:
+        rec["cross_below"] = int(cross_below)
+    if in_hoop is not None:
+        rec["in_hoop"] = int(in_hoop)
+    if reject_cooldown is not None:
+        rec["reject_cooldown"] = int(reject_cooldown)
+    # 自适应阈值详情
+    if auto_threshold_value is not None:
+        rec["auto_threshold_value"] = int(auto_threshold_value)
+    if warmup_p95_median is not None:
+        rec["warmup_p95_median"] = round(float(warmup_p95_median), 1)
+    if warmup_sample_count is not None:
+        rec["warmup_sample_count"] = int(warmup_sample_count)
+    records.insert(0, rec)
     records = records[:50]
     save_history(records)
 

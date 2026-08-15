@@ -41,64 +41,173 @@ state.init_clip_cache()
 def main_page():
     ui.dark_mode().enable()
     ui.add_head_html('''
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-    body { background: #0f172a !important; margin: 0; overflow: hidden; }
-    .nicegui-content { max-width: 100% !important; padding: 0 !important; }
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #1a2433; }
-    ::-webkit-scrollbar-thumb { background: #3b4a63; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #4a5a78; }
-    /* 折叠区头部标题不换行 */
+    /* ============ Dark Tech Theme (v2 design-taste-frontend) ============ */
+    :root {
+      /* 背景层级（off-black, 非 pure black） */
+      --bg-canvas:   #0A0A0A;   /* 最底层 */
+      --bg-surface:  #141414;   /* 卡片层 */
+      --bg-elevated: #1F1F1F;   /* 悬浮层 */
+      --border-subtle: #2A2A2A; /* 低对比分隔 */
+      --border-strong: #3A3A3A; /* 强分隔 */
+      /* 文字层级 */
+      --text-primary:   #FAFAFA; /* off-white */
+      --text-secondary:  #A3A3A3; /* zinc-400 */
+      --text-tertiary:   #525252; /* zinc-600 */
+      /* 单一 accent: Electric Cyan (v2 推荐 Electric Blue 类) */
+      --accent:          #22D3EE;
+      --accent-hover:    #67E8F9;
+      --accent-muted:    rgba(34, 211, 238, 0.12);
+      /* 语义色（仅状态用，不破坏单 accent 锁定） */
+      --ok:    #22C55E;
+      --err:   #EF4444;
+      --busy:  #22D3EE;
+      /* 字体栈 */
+      --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'Geist Mono', 'SF Mono', Menlo, monospace;
+    }
+    body {
+      background: var(--bg-canvas) !important;
+      margin: 0;
+      overflow: hidden;
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      font-feature-settings: "tnum" 1, "ss01" 1;
+    }
+    .nicegui-content { max-width: 100% !important; padding: 0 !important; font-family: var(--font-sans); }
+
+    /* 数字 tabular-nums 对齐 */
+    .font-mono, [class*="font-mono"] { font-family: var(--font-mono) !important; font-variant-numeric: tabular-nums; }
+
+    /* ============ 滚动条（accent 主题化） ============ */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(34, 211, 238, 0.25); border-radius: 3px; transition: background 0.2s; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(34, 211, 238, 0.5); }
+
+    /* ============ Quasar 组件覆盖 ============ */
     .q-expansion-item__header { white-space: nowrap; }
-    /* 输入框聚焦时金色边框 */
-    .q-field--outlined.q-field--focused .q-field__control { border-color: #FFB320 !important; }
-    .q-field--outlined.q-field--focused .q-field__label { color: #FFB320 !important; }
-    /* 透明金色按钮悬停时金色填充 */
-    .btn-gold-outline:hover { background: rgba(255, 179, 32, 0.12); border-color: #FFB320; color: #FFB320; }
+    /* 输入框聚焦 accent 边框 + 微发光 */
+    .q-field--outlined.q-field--focused .q-field__control {
+      border-color: var(--accent) !important;
+      box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.15);
+    }
+    .q-field--outlined.q-field--focused .q-field__label { color: var(--accent) !important; }
+
+    /* ============ 按钮交互态 ============ */
+    .q-btn { transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1); }
+    .q-btn:active { transform: scale(0.98); }
+    /* 透明 accent 描边按钮 hover */
+    .btn-accent-outline:hover {
+      background: var(--accent-muted);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* ============ 进球卡片：左侧色条 + hover 上浮 ============ */
+    .result-card {
+      position: relative;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      border-left: 3px solid transparent !important;
+    }
+    .result-card:hover {
+      background: var(--bg-elevated) !important;
+      border-left-color: var(--accent) !important;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .result-card:active { transform: translateY(0); }
+
+    /* ============ 视频区边框 + 屏幕感 ============ */
+    .q-video, video {
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.5), 0 0 20px rgba(34, 211, 238, 0.04);
+    }
+
+    /* ============ 进度条 accent 渐变 ============ */
+    .q-linear-progress__track { background: rgba(34, 211, 238, 0.12) !important; }
+    .q-linear-progress__model {
+      background: linear-gradient(90deg, #0E7490 0%, #22D3EE 50%, #67E8F9 100%) !important;
+      box-shadow: 0 0 8px rgba(34, 211, 238, 0.4);
+    }
+
+    /* ============ 历史记录选中态 ============ */
+    .history-row {
+      transition: all 0.15s ease;
+    }
+    .history-row:hover { background: var(--bg-elevated); }
+    .history-row.selected {
+      border-color: var(--accent) !important;
+      background: var(--accent-muted);
+    }
+
+    /* ============ 背景噪点纹理（去 digital flatness） ============ */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='0.9'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+    }
+    /* 确保内容层在噪点层之上 */
+    .nicegui-content, .q-page, .q-layout { position: relative; z-index: 1; }
+
+    /* 减少动效偏好 */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
     </style>
     ''')
 
-    with ui.column().classes('w-full h-[100dvh] bg-[#0f172a] p-0 gap-0').style('overflow: hidden'):
+    with ui.column().classes('w-full h-[100dvh] p-0 gap-0').style('overflow: hidden; background: var(--bg-canvas)'):
         # ====== 主容器：左右分栏 ======
         with ui.row().classes('w-full h-full'):
 
             # ========== 左侧面板 ==========
-            with ui.column().classes('w-[350px] min-w-[350px] bg-[#1a2433] border-r border-[#2d3a4f]').style('height: 100%; overflow: hidden'):
+            with ui.column().classes('w-[350px] min-w-[350px] border-r').style('height: 100%; overflow: hidden; background: var(--bg-surface); border-color: var(--border-subtle)'):
 
                 # 标题行 + 折叠功能区按钮（始终可见）
-                with ui.row().classes('w-full items-center justify-between px-3 py-2 border-b border-[#2d3a4f]').style('flex-shrink: 0'):
-                    ui.label('🏀 进球集锦助手').classes('text-white text-sm font-bold')
+                with ui.row().classes('w-full items-center justify-between px-3 py-2 border-b').style('flex-shrink: 0; border-color: var(--border-subtle)'):
+                    ui.label('🏀 进球集锦助手').classes('text-sm font-bold').style('color: var(--text-primary)')
                     collapse_btn = ui.button('▲ 收起功能区', on_click=lambda: _toggle_func_collapse()).classes(
-                        'bg-[#2d3a4f] text-gray-200 text-xs')
+                        'text-xs').style('background: var(--bg-elevated); color: var(--text-secondary)')
 
                 # 功能区域（固定高度，紧凑）
-                with ui.column().classes('w-full px-3 py-2 gap-1 border-b border-[#2d3a4f]').style('flex-shrink: 0') as func_container:
+                with ui.column().classes('w-full px-3 py-2 gap-1 border-b').style('flex-shrink: 0; border-color: var(--border-subtle)') as func_container:
 
                     # 输入框 + 加载按钮（一行）
                     path_input = ui.input(value=state.DEFAULT_VIDEO, placeholder='文件路径').classes('w-full').props('dense')
-                    info_text = ui.label('').classes('text-gray-400 text-xs font-mono hidden')
-                    calib_status = ui.label('').classes('text-gray-400 text-xs font-mono hidden')
+                    info_text = ui.label('').classes('text-gray-400 text-xs font-mono')
+                    calib_status = ui.label('').classes('text-gray-400 text-xs font-mono')
                     with ui.row().classes('w-full gap-2'):
-                        ui.button('加载', on_click=lambda: _on_load()).classes('flex-1 bg-[#2d3a4f] text-gray-200 text-sm')
-                        ui.button('重置', on_click=lambda: _on_reset()).classes('bg-[#2d3a4f] text-gray-200 text-sm')
+                        ui.button('加载', on_click=lambda: _on_load()).classes('flex-1 text-sm').props('ripple').style('background: var(--bg-elevated); color: var(--text-secondary)')
+                        ui.button('重置', on_click=lambda: _on_reset()).classes('text-sm').props('ripple').style('background: var(--bg-elevated); color: var(--text-secondary)')
 
                     # 开始识别
                     detect_btn = ui.button('开始识别', on_click=lambda: _on_detect()).classes(
-                        'w-full bg-[#FFB320] text-black font-bold text-sm')
+                        'w-full font-bold text-sm').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
 
                     # 文件夹批量模式面板（加载文件夹后显示）
                     batch_panel = ui.column().classes('w-full gap-1 hidden')
                     with batch_panel:
                         batch_select = ui.select(options={}, value=None).classes('w-full').props('outlined dense dark')
                         with ui.row().classes('w-full gap-2'):
-                            ui.button('保存标定', on_click=lambda: _on_batch_save_calib()).classes('flex-1 bg-[#2d3a4f] text-gray-200 text-xs')
-                            batch_run_btn = ui.button('批量识别', on_click=lambda: _on_batch_run()).classes('flex-1 bg-[#FFB320] text-black text-xs')
+                            ui.button('保存标定', on_click=lambda: _on_batch_save_calib()).classes('flex-1 text-xs').props('ripple').style('background: var(--bg-elevated); color: var(--text-secondary)')
+                            batch_run_btn = ui.button('批量识别', on_click=lambda: _on_batch_run()).classes('flex-1 text-xs').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
 
                     # 结果状态
                     result_status = ui.label('').classes('text-gray-400 text-xs')
 
                     # 折叠区域：参数 / 集锦 / 历史 合并到一个框（展开时占满整框）
-                    with ui.row().classes('w-full border border-[#2d3a4f] rounded-lg overflow-hidden').style('gap: 0; flex-wrap: wrap'):
+                    with ui.row().classes('w-full border rounded-lg overflow-hidden').style('gap: 0; flex-wrap: wrap; border-color: var(--border-subtle)'):
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
@@ -130,14 +239,17 @@ def main_page():
                                     ui.label().bind_text_from(search_margin, 'value', lambda v: f'搜索范围: {v}px').classes('text-gray-400 text-xs')
 
                                     def _sync_diff_threshold(auto_on):
+                                        # 直接用 .style 切颜色，比 classes(add/remove) 更稳，且不存在切换顺序导致颜色残留
+                                        _cyan = '#22D3EE'
+                                        _gray = 'var(--text-secondary)'
                                         if auto_on:
                                             diff_threshold.props('disable')
                                             diff_threshold_label.set_text('帧差阈值: 自动（预热后计算）')
-                                            diff_threshold_label.classes(add='text-[#FFB320]', remove='text-gray-400')
+                                            diff_threshold.style(f'color: {_cyan}')
                                         else:
                                             diff_threshold.props(remove='disable')
                                             diff_threshold_label.set_text(f'帧差阈值: {diff_threshold.value}')
-                                            diff_threshold_label.classes(add='text-gray-400', remove='text-[#FFB320]')
+                                            diff_threshold.style(f'color: {_gray}')
                                     auto_threshold_switch.on_value_change(lambda e: _sync_diff_threshold(e.value))
                                     _sync_diff_threshold(True)
                         exp_hl = ui.expansion('集锦', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
@@ -155,7 +267,7 @@ def main_page():
 
                     # 展开的折叠区占满整框，其余两个隐藏；折叠后恢复并排
                     _exp_list = [exp_params, exp_hl, exp_hist]
-                    def _sync_expand(exp=None):
+                    def _sync_expand():
                         # 从实际状态重新计算，避免触发顺序导致不一致
                         active = None
                         for _e in _exp_list:
@@ -172,7 +284,7 @@ def main_page():
                                 else:
                                     _e.classes(add='hidden', remove='w-1/3 w-full')
                     for _e in _exp_list:
-                        _e.on_value_change(lambda evt, x=_e: _sync_expand(x))
+                        _e.on_value_change(lambda evt: _sync_expand())
                     # 展开「历史」时自动加载记录，无需手动点刷新
                     exp_hist.on_value_change(lambda e: _refresh_history() if e.value else None)
                     _sync_expand()
@@ -180,7 +292,7 @@ def main_page():
                 # 导出集锦按钮（固定在列表上方，仅列表有内容时显示）
                 with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 hidden') as export_row:
                     ui.button('导出集锦', on_click=lambda: _on_highlights()).classes(
-                        'w-full bg-[#FFB320] text-black text-sm font-bold')
+                        'w-full text-sm font-bold').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
 
                 # 进球列表区域（独立滚动）
                 with ui.column().classes('w-full p-2 gap-1 overflow-y-auto flex-1').style('min-height: 0'):
@@ -196,19 +308,17 @@ def main_page():
                     if collapsed:
                         func_container.classes(add='hidden')
                         collapse_btn.set_text('▾ 展开功能区')
-                        collapse_btn.classes(remove='bg-[#2d3a4f] text-gray-200').classes(
-                            add='btn-gold-outline border border-[#FFB320]/60 bg-transparent text-[#FFB320]')
+                        collapse_btn.style('background: transparent; color: var(--accent); border: 1px solid var(--accent)')
                     else:
                         func_container.classes(remove='hidden')
                         collapse_btn.set_text('▲ 收起功能区')
-                        collapse_btn.classes(remove='btn-gold-outline border border-[#FFB320]/60 bg-transparent text-[#FFB320]').classes(
-                            add='bg-[#2d3a4f] text-gray-200')
+                        collapse_btn.style('background: var(--bg-elevated); color: var(--text-secondary); border: none')
 
                 def _toggle_func_collapse():
                     _set_func_collapsed(not _func_state["collapsed"])
 
             # ========== 右侧面板 ==========
-            with ui.column().classes('flex-1 bg-[#0f172a] p-4 gap-3'):
+            with ui.column().classes('flex-1 p-4 gap-3').style('background: var(--bg-canvas)'):
 
                 # 视频预览区
                 preview_image = ui.interactive_image(
@@ -221,9 +331,8 @@ def main_page():
                 # 进度显示区（检测时显示，居中）
                 progress_container = ui.column().classes('w-full hidden items-center justify-center').style('aspect-ratio: 16/9')
                 with progress_container:
-                    progress_text = ui.label('检测中...').classes('text-[#FFB320] text-lg font-semibold')
+                    progress_text = ui.label('检测中...').classes('text-lg font-semibold').style('color: var(--accent)')
                     progress_bar = ui.linear_progress(show_value=False).classes('w-64 mt-3')
-                    progress_bar.style('background-color: #2d3a4f; color: #FFB320')
                     progress_detail = ui.label('').classes('text-gray-400 text-xs mt-2')
 
                 # 底部留白
@@ -231,20 +340,32 @@ def main_page():
 
     # ====== 事件处理函数 ======
     def _set_status(text, kind='info'):
-        """设置结果状态文本并切换颜色（ok=绿 / err=红 / busy=金 / info=灰）。"""
+        """设置结果状态文本并切换颜色（ok=绿 / err=红 / busy=青 / info=灰）。"""
         result_status.set_text(text)
-        result_status.classes(
-            remove='text-green-400 text-red-400 text-[#FFB320] text-gray-400')
-        if kind == 'ok':
-            result_status.classes(add='text-green-400')
-        elif kind == 'err':
-            result_status.classes(add='text-red-400')
-        elif kind == 'busy':
-            result_status.classes(add='text-[#FFB320]')
-        else:
-            result_status.classes(add='text-gray-400')
+        _color_map = {
+            'ok': 'var(--ok)',
+            'err': 'var(--err)',
+            'busy': 'var(--busy)',
+        }
+        result_status.style(f'color: {_color_map.get(kind, "var(--text-secondary)")}')
 
-    def _on_load():
+    # ========== 公共辅助：切换右侧视频区可见性（避免每处重复 4 行 classes 切换，也避免遗漏） ==========
+    def _show_right_pane(mode):
+        """右侧 4 个元素互斥显示：'preview' | 'result' | 'highlights' | 'progress' | None（preview fallback）。"""
+        modes = {'preview', 'result', 'highlights', 'progress'}
+        if mode not in modes:
+            mode = 'preview'
+        # 全部先隐藏（一次性 remove/add，比每处写 4 行稳）
+        for el, name in [(preview_image, 'preview'),
+                         (result_video_el, 'result'),
+                         (highlights_video_el, 'highlights'),
+                         (progress_container, 'progress')]:
+            if name == mode:
+                el.classes(remove='hidden')
+            else:
+                el.classes(add='hidden')
+
+    async def _on_load():
         path = path_input.value
         # 文件夹路径 → 批量标定 + 批量识别模式
         if path and os.path.isdir(path.strip().strip('"')):
@@ -252,29 +373,36 @@ def main_page():
             if not files:
                 _set_status('文件夹内没有找到视频文件', 'err')
                 return
+            # 切换到批量模式：立即清空上一个视频的 state + 同步 UI 空列表
+            # （否则 _on_batch_load_video 异步生成预览期间，UI 会一直残留上一个视频的进球卡片）
+            state.last_goal_clips.clear()
+            state.last_goals.clear()
+            state.kept_goal_indices.clear()
+            _refresh_result_cards()
             state.batch_files = files
             state.batch_calibs = {}
             state.batch_current_video = None
             batch_panel.classes(remove='hidden')
             _refresh_batch_list()
             # 自动加载第一个视频（同时同步下拉框）
-            _on_batch_load_video(files[0])
+            await _on_batch_load_video(files[0])
             _set_status(f'批量模式 | 扫描到 {len(files)} 个视频，逐个标定后批量识别', 'info')
             return
         # 单视频文件路径 → 原有流程
         batch_panel.classes(add='hidden')
+        # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
+        #       已下沉到 detection.load_video 业务层（切视频即清空），UI 层不再重复
+        #       以避免 frame is None 分支漏清空导致旧数据残留
         frame, info = detection.load_video(path)
         if frame is not None:
-            # 切换视频：清空上一轮的进球结果，避免列表残留旧视频数据
-            state.last_goal_clips.clear()
-            state.last_goals.clear()
-            state.kept_goal_indices.clear()
+            # 切换视频：仅清 UI 卡片容器缓存（state 已由 load_video 清空）
             _refresh_result_cards()
             b64 = video_utils.frame_to_base64(frame)
             preview_image.set_source(b64)
-            preview_image.classes(remove='hidden')
-            result_video_el.classes(add='hidden')
-            highlights_video_el.classes(add='hidden')
+            _show_right_pane('preview')
+        else:
+            # 加载失败也必须刷新卡片（state 已在 load_video 里清空，UI 要同步显示空列表）
+            _refresh_result_cards()
         info_text.set_text(info)
         calib_status.set_text('请点击画面 2 个点标定篮筐' if frame is not None else info)
 
@@ -292,8 +420,12 @@ def main_page():
 
     _batch_loading = False  # 防重入（set_value 可能触发 change 事件）
 
-    def _on_batch_load_video(path=None):
-        """加载批量视频（从下拉或列表点击）。"""
+    async def _on_batch_load_video(path=None):
+        """加载批量视频（从下拉或列表点击）。
+
+        若该视频已有历史检测记录（批量识别完成后再点击），
+        自动加载检测结果和预览片段，无需再去历史记录里找。
+        """
         nonlocal _batch_loading
         # 兼容旧版（值,标签）元组，防御性解包
         if isinstance(path, (tuple, list)):
@@ -315,20 +447,29 @@ def main_page():
         _batch_loading = True
         try:
             batch_select.set_value(path)
-            frame, info, status = detection.on_batch_load_video(path)
+            # 若该视频已有检测结果，生成预览片段可能耗时，用 io_bound 避免阻塞 UI
+            from nicegui import run
+
+            def _progress_callback(pct, msg):
+                try:
+                    progress_text.set_text(msg)
+                except Exception:
+                    pass
+
+            try:
+                frame, info, status = await run.io_bound(
+                    detection.on_batch_load_video, path, _progress_callback)
+            except Exception as _e:
+                import traceback
+                frame, info, status = None, "", f"❌ 加载视频异常: {_e}\n{traceback.format_exc()}"
             if frame is not None:
-                # 切换批量视频：清空上一轮的进球结果
-                state.last_goal_clips.clear()
-                state.last_goals.clear()
-                state.kept_goal_indices.clear()
-                _refresh_result_cards()
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
-                preview_image.classes(remove='hidden')
-                result_video_el.classes(add='hidden')
-                highlights_video_el.classes(add='hidden')
+                _show_right_pane('preview')
             info_text.set_text(info)
             calib_status.set_text(status)
+            # 刷新结果卡片（已检测过的视频会显示进球列表）
+            _refresh_result_cards()
         finally:
             _batch_loading = False
 
@@ -355,10 +496,7 @@ def main_page():
         batch_run_btn.set_text('取消')
         batch_run_btn.enable()
         # 显示进度
-        progress_container.classes(remove='hidden')
-        preview_image.classes(add='hidden')
-        result_video_el.classes(add='hidden')
-        highlights_video_el.classes(add='hidden')
+        _show_right_pane('progress')
         progress_bar.set_value(0)
         progress_text.set_text('正在批量识别...')
         progress_detail.set_text('')
@@ -372,21 +510,25 @@ def main_page():
                 pass
 
         from nicegui import run
-        status, ok = await run.io_bound(
-            detection.run_batch_detect,
-            start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
-            diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
-            min_blob_area.value, search_margin.value,
-            progress_callback=_progress_callback,
-            auto_threshold=auto_threshold_switch.value,
-            yolo_step=3 if yolo_3frame_switch.value else 2,
-            skip_yolo_no_motion=skip_yolo_switch.value)
+        try:
+            status, ok = await run.io_bound(
+                detection.run_batch_detect,
+                start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
+                diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
+                min_blob_area.value, search_margin.value,
+                progress_callback=_progress_callback,
+                auto_threshold=auto_threshold_switch.value,
+                yolo_step=3 if yolo_3frame_switch.value else 2,
+                skip_yolo_no_motion=skip_yolo_switch.value)
+        except Exception as _e:
+            import traceback
+            status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"
+            ok = False
 
         _batch_running["active"] = False
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
-        progress_container.classes(add='hidden')
-        preview_image.classes(remove='hidden')
+        _show_right_pane('preview')
         _set_status(status, 'ok' if ok else 'err')
         # 批量结束后显示最后一个视频的结果
         _refresh_result_cards()
@@ -419,7 +561,9 @@ def main_page():
     preview_image.on_mouse(_on_image_click)
 
     # 下拉框选择视频后立即加载（无需再点「加载」按钮），直接用事件携带的新值
-    batch_select.on_value_change(lambda e: _on_batch_load_video(e.value))
+    async def _on_batch_select_change(e):
+        await _on_batch_load_video(e.value)
+    batch_select.on_value_change(_on_batch_select_change)
 
     def _on_reset():
         status = detection.reset_hoop()
@@ -444,38 +588,40 @@ def main_page():
         detect_btn.set_text('取消')
         detect_btn.enable()
         # 显示进度条
-        progress_container.classes(remove='hidden')
-        preview_image.classes(add='hidden')
-        result_video_el.classes(add='hidden')
-        highlights_video_el.classes(add='hidden')
+        _show_right_pane('progress')
         progress_bar.set_value(0)
         progress_text.set_text('正在加载模型...')
         progress_detail.set_text('')
 
-        # 进度回调函数
+        # 进度回调函数（修复 Bug#3：更新 progress_detail，让用户看到当前处理的帧/阶段）
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text(msg)
+                progress_detail.set_text(msg)
             except Exception:
                 pass
 
         # 使用 run.io_bound 在后台线程执行，避免阻塞事件循环
         from nicegui import run
-        status, ok = await run.io_bound(
-            detection.run_detect,
-            start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
-            diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
-            min_blob_area.value, search_margin.value,
-            progress_callback=_progress_callback,
-            auto_threshold=auto_threshold_switch.value,
-            yolo_step=3 if yolo_3frame_switch.value else 2,
-            skip_yolo_no_motion=skip_yolo_switch.value)
+        try:
+            status, ok = await run.io_bound(
+                detection.run_detect,
+                start_frame.value, end_frame.value, ball_conf.value, min_gap.value,
+                diff_threshold.value, min_circularity.value, int(min_in_hoop_frames.value),
+                min_blob_area.value, search_margin.value,
+                progress_callback=_progress_callback,
+                auto_threshold=auto_threshold_switch.value,
+                yolo_step=3 if yolo_3frame_switch.value else 2,
+                skip_yolo_no_motion=skip_yolo_switch.value)
+        except Exception as _e:
+            import traceback
+            status = f"❌ 检测异常: {_e}\n{traceback.format_exc()}"
+            ok = False
 
         _detecting["active"] = False
-        # 隐藏进度条，显示结果
-        progress_container.classes(add='hidden')
-        preview_image.classes(remove='hidden')
+        # 隐藏进度条，显示预览图（无论成功/失败/取消，都回到一致的 preview 态，避免视频重叠）
+        _show_right_pane('preview')
         if state.cancel_requested:
             _set_status(status, 'info')  # 用户取消属中性提示，不用红色
             _refresh_result_cards()      # 同步清空列表
@@ -504,28 +650,25 @@ def main_page():
             end_ts = ts + 10
             end_min, end_sec = int(end_ts // 60), end_ts % 60
             with result_container:
-                with ui.card().props('flat').classes('w-full bg-[#1f2b3d] rounded-lg px-2 py-1.5').style('margin: 0; border: 1px solid #334155'):
-                    # 第一行：序号 + 时间范围（紧凑）
+                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style('margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'):
+                    # 第一行：时间戳徽章（mono + tabular-nums）
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
-                        ui.label(str(i+1)).classes(
-                            'bg-[#FFB320] text-black font-bold text-xs w-5 h-5 flex items-center justify-center rounded-full')
-                        ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes('text-white text-sm font-bold font-mono')
-                    # 第二行：操作按钮（删除用危险色区分，填满宽度）
+                        ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
+                            'text-sm font-bold font-mono').style('color: var(--accent)')
+                    # 第二行：操作按钮（图标化，hover 才显文字）
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
-                            'flex-1 border border-gray-600 bg-transparent text-gray-300 text-xs rounded-lg py-1')
+                            'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
                         ui.button('导出', on_click=lambda e, idx=i: _on_export_clip(idx)).classes(
-                            'flex-1 border border-gray-600 bg-transparent text-gray-300 text-xs rounded-lg py-1')
+                            'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
                         ui.button('删除', on_click=lambda e, idx=i: _on_delete_clip(idx)).classes(
-                            'flex-1 border border-red-500/60 bg-transparent text-red-400 text-xs rounded-lg py-1')
+                            'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--err); border: 1px solid rgba(239, 68, 68, 0.3)')
 
     def _on_preview_clip(idx):
         path, status = detection.clip_action("preview", idx)
         if path and os.path.exists(path):
             result_video_el.set_source(path)
-            preview_image.classes(add='hidden')
-            result_video_el.classes(remove='hidden')
-            highlights_video_el.classes(add='hidden')
+            _show_right_pane('result')
             # 自动播放
             result_video_el.run_method('play')
         _set_status(status, 'info')
@@ -538,17 +681,14 @@ def main_page():
 
     def _on_delete_clip(idx):
         # 点击直接删除，不弹确认框
-        detection.clip_action("delete", idx)
+        _, status = detection.clip_action("delete", idx)
         _refresh_result_cards()
-        _set_status(f'已删除第 {idx+1} 个片段 | 剩余 {len(state.last_goal_clips)} 个', 'info')
+        _set_status(status, 'info')
 
     async def _on_highlights():
         from nicegui import run
         # 在右侧预览区显示进度
-        progress_container.classes(remove='hidden')
-        preview_image.classes(add='hidden')
-        result_video_el.classes(add='hidden')
-        highlights_video_el.classes(add='hidden')
+        _show_right_pane('progress')
         progress_bar.set_value(0)
         progress_text.set_text('正在生成集锦...')
         progress_detail.set_text('')
@@ -557,25 +697,28 @@ def main_page():
             try:
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text(msg)
+                progress_detail.set_text(msg)
             except Exception:
                 pass
 
         _set_status('正在生成集锦...', 'busy')
-        path, status = await run.io_bound(
-            detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
-            hl_min_gap.value, _progress_callback)
+        try:
+            path, status = await run.io_bound(
+                detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
+                hl_min_gap.value, _progress_callback)
+        except Exception as _e:
+            import traceback
+            path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
 
-        progress_container.classes(add='hidden')
         if path and os.path.exists(path):
             ui.download(path)
             highlights_video_el.set_source(path)
-            preview_image.classes(add='hidden')
-            result_video_el.classes(add='hidden')
-            highlights_video_el.classes(remove='hidden')
+            _show_right_pane('highlights')
         else:
-            preview_image.classes(remove='hidden')
+            _show_right_pane('preview')
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
+    # 历史记录选中索引（用 dict 包一层，让闭包内外都能读写；普通变量需要 nonlocal 但跨多个函数不便）
     _selected_history_idx = {"idx": None}
 
     def _refresh_history():
@@ -589,47 +732,50 @@ def main_page():
             video = r.get("video", "")
             name = os.path.basename(video) if video else "未知"
             goals = len(r.get("goals", []))
-            selected = (_selected_history_idx.get("idx") == i)
-            row_cls = ('border border-[#FFB320] bg-[#2a2f3e]'
-                       if selected else 'border border-transparent hover:bg-[#2a2f3e]')
+            selected = (_selected_history_idx["idx"] == i)
+            row_cls = 'history-row selected' if selected else 'history-row'
             with history_list:
-                def _make_click(idx=i):
+                def _make_click(idx):
                     async def _on_click():
                         _selected_history_idx["idx"] = idx
                         _refresh_history()
                         await _on_load_history()
                         exp_hist.set_value(False)  # 加载完成后自动收起历史面板
                     return _on_click
-                with ui.row().classes(f'w-full items-center gap-1 p-1 rounded cursor-pointer {row_cls}').on('click', _make_click(i)):
-                    ui.label(f'{i+1}.').classes('text-[#FFB320] text-xs font-bold')
-                    ui.label(name).classes('text-gray-300 text-xs flex-1 truncate')
-                    ui.label(f'{goals}球').classes('text-gray-400 text-xs')
+                with ui.row().classes(f'w-full items-center gap-1 p-1 rounded cursor-pointer border {row_cls}').on('click', _make_click(i)):
+                    ui.label(f'{i+1}.').classes('text-xs font-bold font-mono').style('color: var(--accent)')
+                    ui.label(name).classes('text-xs flex-1 truncate').style('color: var(--text-primary)')
+                    ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
     async def _on_load_history():
-        idx = _selected_history_idx.get("idx")
+        idx = _selected_history_idx["idx"]
         if idx is None:
             _set_status('请先点击选择一条历史记录', 'err')
             return
 
         # 显示进度
-        progress_container.classes(remove='hidden')
-        preview_image.classes(add='hidden')
+        _show_right_pane('progress')
         progress_bar.set_value(0)
         progress_text.set_text('正在加载历史记录...')
+        progress_detail.set_text('')
 
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text(msg)
+                progress_detail.set_text(msg)
             except Exception:
                 pass
 
         from nicegui import run
-        result = await run.io_bound(detection.on_load_history, int(idx), _progress_callback)
-        frame, info, status = result
+        try:
+            result = await run.io_bound(detection.on_load_history, int(idx), _progress_callback)
+            frame, info, status = result
+        except Exception as _e:
+            import traceback
+            frame, info, status = None, "", f"❌ 加载历史异常: {_e}\n{traceback.format_exc()}"
 
-        progress_container.classes(add='hidden')
-        preview_image.classes(remove='hidden')
+        _show_right_pane('preview')
         if frame is not None:
             preview_image.set_source(video_utils.frame_to_base64(frame))
         # 同步路径输入框，显示当前加载的视频

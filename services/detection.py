@@ -5,15 +5,12 @@ UI 层只需调用本模块的函数并传入参数。
 """
 import os
 import time
-import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from . import state
-from . import video_utils
-from .video_utils import frame_to_base64, scan_video_files
 
 # 项目根目录（basketball-clipper/）
 _ROOT = Path(__file__).parent.parent.resolve()
@@ -29,7 +26,11 @@ from cutter.ffmpeg_cutter import cut_clips, _build_encode_args
 # ============ 单视频操作 ============
 
 def load_video(video_path):
-    """加载视频，返回预览帧和信息字符串。"""
+    """加载视频，返回预览帧和信息字符串。
+
+    作为单视频模式的入口，切换视频时**必须同步清空上一个视频的检测 state**
+    （进球列表/预览片段/保留索引），避免 UI 层依赖某分支才清空导致旧数据残留。
+    """
     if not video_path or not video_path.strip():
         return None, "请输入视频文件路径"
     video_path = video_path.strip().strip('"').strip("'")
@@ -39,6 +40,11 @@ def load_video(video_path):
         info = get_video_info(video_path)
     except Exception as e:
         return None, f"读取失败: {e}"
+    # 切换新视频：先清空上一个视频的检测结果（无论当前视频是否能最终成功 read_frame，
+    # 只要路径合法 → state.video_state 会更新 → 旧进球列表就应清空）
+    state.last_goal_clips.clear()
+    state.last_goals.clear()
+    state.kept_goal_indices.clear()
     state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
                              codec=info["codec"], current_frame=0,
                              width=info["width"], height=info["height"])
@@ -195,24 +201,93 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     hoop = state.calib["hoop"]
     fps = state.video_state["fps"]
     total = state.video_state["total"]
-    start = int(start_frame)
+    start = max(0, int(start_frame))
     end = int(end_frame) if end_frame and int(end_frame) > 0 else total
-    end = min(end, total)
+    end = min(max(start + 1, end), total)
     if end <= start:
         return "❌ 结束帧必须大于起始帧", False
 
     _report(5, '初始化检测器...')
     try:
+        # ============================================================
+        # 步骤A（预热前置 pass）：auto_threshold=True 时先跑前 30s 帧算阈值
+        # 预热阶段不跑 YOLO，不判定进球，只收集 P95，算出最终自适应阈值。
+        # 然后正式检测用这个阈值 + auto_threshold=False 从帧0完整检测，
+        # 避免视频开头进球被预热期跳过。
+        # ============================================================
+        _warmup_info = None   # 保存预热阶段诊断（auto_threshold_value / median / samples）
+        _effective_diff_threshold = int(diff_threshold)
+        if bool(auto_threshold):
+            _report(6, '预热：收集前30s帧噪声水平...')
+            _warmup_detector = GoalDetector(
+                hoop, baseline_frame=state.calib["baseline_frame"],
+                min_gap_sec=float(min_gap_sec),
+                diff_threshold=int(diff_threshold),
+                min_blob_area=int(min_blob_area),
+                search_margin=int(search_margin),
+                loose_mode=True,
+                yolo_confirm=True, rolling_baseline_sec=60.0,
+                min_circularity=float(min_circularity),
+                min_in_hoop_frames=int(min_in_hoop_frames),
+                auto_threshold=True)
+            _warmup_end = min(end, start + int(30.0 * max(fps, 1.0)))
+            _warmup_n = max(0, _warmup_end - start)
+            _ws = time.time()
+            _warmup_reader = VideoReader(state.video_state["path"])
+            try:
+                for _wfidx, _wframe in _warmup_reader.iter_frames(start=start, end=_warmup_end, batch=1):
+                    # 预热期只跑 diff 收集 P95，ball_pos=None 跳过 YOLO（省显存/耗时）
+                    _warmup_detector.feed(None, _wfidx, fps, frame=_wframe)
+                    if _warmup_detector._warmup_done:
+                        break
+            finally:
+                _warmup_reader.close()
+            if _warmup_detector._warmup_done and _warmup_detector._auto_threshold_value is not None:
+                _effective_diff_threshold = int(_warmup_detector._auto_threshold_value)
+                _we = time.time()
+                print(f"[WARMUP DONE] 预热 {_we-_ws:.1f}s | "
+                      f"阈值 = median(P95)={_warmup_detector._warmup_p95_median:.1f} + 8 = {_effective_diff_threshold} "
+                      f"| 采样 {_warmup_detector._warmup_sample_count} 帧", flush=True)
+                _warmup_info = {
+                    "auto_threshold_value": _warmup_detector._auto_threshold_value,
+                    "warmup_p95_median": _warmup_detector._warmup_p95_median,
+                    "warmup_sample_count": _warmup_detector._warmup_sample_count,
+                }
+            else:
+                # 视频短于30s或预热失败，回退到用户传入的 diff_threshold
+                _we = time.time()
+                print(f"[WARMUP ABORT] 视频过短或未完成预热，回退固定阈值 {diff_threshold}", flush=True)
+                _warmup_info = {
+                    "auto_threshold_value": None,
+                    "warmup_p95_median": (
+                        float(np.median(_warmup_detector._warmup_p95s))
+                        if _warmup_detector._warmup_p95s else None
+                    ),
+                    "warmup_sample_count": len(_warmup_detector._warmup_p95s),
+                }
+            del _warmup_detector
+
+        # 步骤B：正式检测器。
+        # - auto_threshold=False：使用预热得到的 _effective_diff_threshold 作为固定阈值
+        # - 从 start 帧完整检测，前30s不会再跳过进球
+        _use_auto_for_detector = False   # 正式检测阶段永远关闭内部预热
         detector = GoalDetector(hoop, baseline_frame=state.calib["baseline_frame"],
                                 min_gap_sec=float(min_gap_sec),
-                                diff_threshold=int(diff_threshold),
+                                diff_threshold=_effective_diff_threshold,
                                 min_blob_area=int(min_blob_area),
                                 search_margin=int(search_margin),
                                 loose_mode=True,
                                 yolo_confirm=True, rolling_baseline_sec=60.0,
                                 min_circularity=float(min_circularity),
                                 min_in_hoop_frames=int(min_in_hoop_frames),
-                                auto_threshold=bool(auto_threshold))
+                                auto_threshold=_use_auto_for_detector)
+        # 把步骤A计算出的自适应阈值信息挂到正式 detector 上，保持旧代码读取逻辑兼容
+        if _warmup_info is not None:
+            detector._auto_threshold_value = _warmup_info["auto_threshold_value"]
+            detector._warmup_p95_median = _warmup_info["warmup_p95_median"]
+            detector._warmup_sample_count = _warmup_info["warmup_sample_count"]
+            detector.auto_threshold = bool(auto_threshold)   # 保留用户原始意图用于诊断显示/历史写入
+
         _report(10, '加载 YOLO 模型...')
         model, _ = get_ball_model()
 
@@ -228,7 +303,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         print(f"  Video       : {state.video_state['path']}")
         print(f"  Resolution  : {state.video_state.get('width', '?')}x{state.video_state.get('height', '?')}  @ {fps:.1f} fps")
         print(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
-        print(f"  Auto-thresh : {bool(auto_threshold)}")
+        if bool(auto_threshold):
+            print(f"  Auto-thresh : ON (已预热, 阈值={_effective_diff_threshold}, P95 中位={_warmup_info.get('warmup_p95_median') if _warmup_info else '?'})")
+        else:
+            print(f"  Auto-thresh : OFF (固定阈值 {diff_threshold})")
         print(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
         if skip_yolo_no_motion:
             print(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
@@ -253,51 +331,46 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 ball_pos = None
                 need_yolo = False
                 _yolo_skipped = False  # 条件跳过标记（用于进度显示）
-                if auto_threshold and not detector._warmup_done:
-                    # 预热期：只收集 P95 统计量，跳过 YOLO
-                    _last_ball_pos = None
+                # 预热已在前置 pass 完成，正式阶段从帧 0 直接跑检测（不再跳过前30s YOLO/进球）
+                # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果
+                need_yolo = ((processed % _yolo_step) == 0)
+                if need_yolo and skip_yolo_no_motion:
+                    # 条件跳过：篮筐区域无运动像素时跳过 YOLO（省 ~60ms）
+                    if not detector.has_motion_near_hoop(frame):
+                        need_yolo = False
+                        ball_pos = None
+                        _last_ball_pos = None
+                        _yolo_skipped = True
+                        _stat_yolo_skipped += 1
+                if need_yolo:
+                    _stat_yolo_called += 1
+                    try:
+                        # classes=[0]：ultralytics 在 NMS 后直接过滤，只保留 basketball 类
+                        # 省去 CPU 侧全量 .cpu().numpy() 拷贝 + 遍历查找
+                        # 注：basketball_custom.pt 的 names={0:'basketball'}，id 固定为 0
+                        res = model.predict(frame, conf=float(ball_conf), imgsz=960,
+                                            classes=[0],
+                                            device=get_device(), verbose=False)[0]
+                        if res.boxes is not None and len(res.boxes) > 0:
+                            xyxy = res.boxes.xyxy.cpu().numpy()
+                            confs = res.boxes.conf.cpu().numpy()
+                            best = int(np.argmax(confs))
+                            x1, y1, x2, y2 = xyxy[best]
+                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                            ball_pos = (float(cx), float(cy), float(x1), float(y1),
+                                        float(x2), float(y2), float(confs[best]))
+                        _last_ball_pos = ball_pos
+                    except Exception:
+                        pass
                 else:
-                    # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果
-                    need_yolo = ((processed % _yolo_step) == 0)
-                    if need_yolo and skip_yolo_no_motion:
-                        # 条件跳过：篮筐区域无运动像素时跳过 YOLO（省 ~60ms）
-                        if not detector.has_motion_near_hoop(frame):
-                            need_yolo = False
-                            ball_pos = None
-                            _last_ball_pos = None
-                            _yolo_skipped = True
-                            _stat_yolo_skipped += 1
-                    if need_yolo:
-                        _stat_yolo_called += 1
-                        try:
-                            # classes=[0]：ultralytics 在 NMS 后直接过滤，只保留 basketball 类
-                            # 省去 CPU 侧全量 .cpu().numpy() 拷贝 + 遍历查找
-                            # 注：basketball_custom.pt 的 names={0:'basketball'}，id 固定为 0
-                            res = model.predict(frame, conf=float(ball_conf), imgsz=960,
-                                                classes=[0],
-                                                device=get_device(), verbose=False)[0]
-                            if res.boxes is not None and len(res.boxes) > 0:
-                                xyxy = res.boxes.xyxy.cpu().numpy()
-                                confs = res.boxes.conf.cpu().numpy()
-                                best = int(np.argmax(confs))
-                                x1, y1, x2, y2 = xyxy[best]
-                                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                                ball_pos = (float(cx), float(cy), float(x1), float(y1),
-                                            float(x2), float(y2), float(confs[best]))
-                            _last_ball_pos = ball_pos
-                        except Exception:
-                            pass
-                    else:
-                        # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效）
-                        ball_pos = _last_ball_pos
+                    # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效）
+                    ball_pos = _last_ball_pos
                 detector.feed(ball_pos, fidx, fps, frame=frame)
                 processed += 1
                 # 每 10 帧更新一次进度
                 if processed % 10 == 0:
                     pct = 15 + 60 * processed / n_frames
-                    if auto_threshold and not detector._warmup_done:
-                        phase = '预热'
-                    elif need_yolo:
+                    if need_yolo:
                         phase = '检测'
                     elif _yolo_skipped:
                         phase = '跳过'
@@ -321,7 +394,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                     _overall_fps = processed / max((_now - t0), 0.001)
                     _pct = processed / max(n_frames, 1)
                     _eta = (n_frames - processed) / max(_overall_fps, 0.1)
-                    _phase_label = '预热' if (auto_threshold and not detector._warmup_done) else '检测'
+                    _phase_label = '检测'
                     print(f"[{time.strftime('%H:%M:%S')}] {_phase_label} {processed:>6d}/{n_frames:<6d} "
                           f"({_pct*100:5.1f}%) | 瞬时 {_instant_fps:>5.0f} f/s  平均 {_overall_fps:>5.1f} f/s | "
                           f"ETA {_eta/60:>4.1f} min | 进球累计 {len(detector.goals):>3d}", flush=True)
@@ -411,8 +484,93 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                   f"YOLO确认: {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)")
         if detector.auto_threshold and detector._auto_threshold_value is not None:
             status += f"\n自适应阈值: {detector._auto_threshold_value} (P95+8)"
+        # ===== 准备历史记录写入数据 =====
+        # auto_threshold 传入值 = 用户UI开关的意图；即使固定阈值模式（UI关闭）但预热算出了值，也一并保存便于诊断
+        _diff_for_history = (
+            'auto' if auto_threshold else
+            (detector._auto_threshold_value if (detector._auto_threshold_value is not None) else diff_threshold)
+        )
+        # auto_threshold_value 的最终值：
+        #   只要用户 UI 开了自动阈值且预热成功（_warmup_info is not None），
+        #   就直接用 _effective_diff_threshold（预热算出的最终 int 阈值），
+        #   不再依赖 detector 内部属性（主循环 feed 可能覆盖 _auto_threshold_value）。
+        if auto_threshold and _warmup_info is not None:
+            _auto_thr_for_history = int(_effective_diff_threshold)
+        else:
+            _auto_thr_for_history = detector._auto_threshold_value
+        _warmup_p95_for_history = (
+            detector._warmup_p95_median
+            if (detector._warmup_p95_median is not None)
+            else (_warmup_info.get("warmup_p95_median") if _warmup_info else None)
+        )
+        _warmup_count_for_history = (
+            detector._warmup_sample_count
+            if (detector._warmup_sample_count and detector._warmup_sample_count > 0)
+            else (_warmup_info.get("warmup_sample_count") if _warmup_info else 0)
+        )
+        _batch_idx = None
+        _batch_total = None
+        if state.batch_files and state.batch_current_video in state.batch_files:
+            _batch_total = len(state.batch_files)
+            try:
+                _batch_idx = state.batch_files.index(state.batch_current_video) + 1
+            except ValueError:
+                _batch_idx = None
+        _start_abs = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t0))
+        _end_abs = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_t2))
+        # YOLO 跳过统计（即使未开条件跳过也保存，便于对比）
+        _yolo_total_sched = _stat_yolo_called + _stat_yolo_skipped
+        _yolo_skip_rate_pct = _stat_yolo_skipped / max(_yolo_total_sched, 1) * 100
+        # YOLO 确认/否决统计
+        _total_yolo_path = d['yolo_confirmed'] + d['yolo_rejected']
+        _confirm_rate_pct = d['yolo_confirmed'] / max(_total_yolo_path, 1) * 100
+        # 速度 vs 实时倍数
+        _speed_vs_realtime = video_dur_min / max(_detect_elapsed / 60.0, 0.001)
+
         state.add_history(state.video_state["path"], hoop, detector.goals, detector.goals,
-                          baseline_idx=state.calib["baseline_idx"])
+                          baseline_idx=state.calib["baseline_idx"],
+                          ball_conf=ball_conf,
+                          min_gap_sec=min_gap_sec,
+                          diff_threshold=_diff_for_history,
+                          auto_threshold=auto_threshold,
+                          yolo_step=yolo_step,
+                          skip_yolo_no_motion=skip_yolo_no_motion,
+                          min_circularity=min_circularity,
+                          min_in_hoop_frames=min_in_hoop_frames,
+                          min_blob_area=min_blob_area,
+                          search_margin=search_margin,
+                          elapsed_sec=_total_elapsed,
+                          batch_idx=_batch_idx,
+                          batch_total=_batch_total,
+                          detect_start_time=_start_abs,
+                          detect_end_time=_end_abs,
+                          # ===== 视频元信息 =====
+                          video_fps=fps,
+                          video_width=state.video_state.get("width"),
+                          video_height=state.video_state.get("height"),
+                          video_total_frames=total,
+                          video_duration_sec=video_dur_min * 60.0,
+                          # ===== 处理速度指标 =====
+                          processed_frames=processed,
+                          proc_fps=_proc_fps,
+                          speed_vs_realtime=_speed_vs_realtime,
+                          # ===== YOLO 跳过统计 =====
+                          yolo_called=_stat_yolo_called,
+                          yolo_cond_skipped=_stat_yolo_skipped,
+                          yolo_skip_rate_pct=_yolo_skip_rate_pct,
+                          # ===== YOLO 确认/否决 =====
+                          yolo_confirmed=d['yolo_confirmed'],
+                          yolo_rejected=d['yolo_rejected'],
+                          yolo_confirm_rate_pct=_confirm_rate_pct,
+                          # ===== 进球路径细分 =====
+                          cross_above=d['cross_above'],
+                          cross_below=d['cross_below'],
+                          in_hoop=d['in_hoop'],
+                          reject_cooldown=d['reject_cooldown'],
+                          # ===== 自适应阈值详情 =====
+                          auto_threshold_value=_auto_thr_for_history,
+                          warmup_p95_median=_warmup_p95_for_history,
+                          warmup_sample_count=_warmup_count_for_history)
         return status, True
     except Exception as e:
         import traceback
@@ -428,7 +586,8 @@ def clip_action(action, idx):
     elif action == "export":
         return state.last_goal_clips[idx]["path"], f"已导出: {state.last_goal_clips[idx]['path']}"
     elif action == "delete":
-        ts = state.last_goal_clips[idx]["ts"]
+        deleted = state.last_goal_clips[idx]
+        ts = deleted["ts"]
         del state.last_goal_clips[idx]
         new_kept = set()
         for old_i in sorted(state.kept_goal_indices):
@@ -537,9 +696,9 @@ def on_load_history(idx_choice, progress_callback=None):
                 state.clip_cache.pop(next(iter(state.clip_cache)))
             state.save_clip_cache()
 
-    kept_set = set(kept)
+    kept_set = set(round(t, 3) for t in kept)
     for i, clip in enumerate(state.last_goal_clips):
-        if clip["ts"] in kept_set or not kept:
+        if round(clip["ts"], 3) in kept_set or not kept:
             state.kept_goal_indices.add(i)
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
@@ -554,12 +713,29 @@ def on_load_history(idx_choice, progress_callback=None):
 
 # ============ 文件夹批量模式 ============
 
-def on_batch_load_video(selected):
-    """批量模式：加载选中的视频，并应用该视频已保存的标定。"""
+def on_batch_load_video(selected, progress_callback=None):
+    """批量模式：加载选中的视频，应用该视频已保存的标定。
+
+    若该视频已有历史检测记录（批量识别完成后再点击下拉框），
+    自动加载检测结果和预览片段，无需再去历史记录里找。
+    """
+    def _report(pct, msg):
+        if progress_callback:
+            try:
+                progress_callback(pct, msg)
+            except Exception:
+                pass
+
     if not selected or not state.batch_files:
         return None, "", "请先扫描文件夹并选择视频"
     video_path = selected
     state.batch_current_video = video_path
+    # —— 切换批量视频：先统一清空上一个视频的进球 state（不论后续是否命中历史记录，都先清再填）——
+    # 这样避免「提前 return 分支漏清空」或者「异步生成预览期间 UI 残留旧卡片」。
+    # 和单文件模式的 load_video 保持一致的先清后填策略。
+    state.last_goal_clips.clear()
+    state.last_goals.clear()
+    state.kept_goal_indices.clear()
     if video_path in state.batch_calibs:
         cal = state.batch_calibs[video_path]
         state.calib["hoop"] = cal["hoop"]
@@ -587,8 +763,57 @@ def on_batch_load_video(selected):
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
-    status = (f"已加载: {os.path.basename(video_path)}\n"
-              f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
+
+    # —— 查找历史记录：批量识别完成后，下拉框选视频时自动加载检测结果 ——
+    records = state.load_history()
+    matched = None
+    for r in records:
+        if r.get("video") == video_path:
+            matched = r
+            break
+
+    if matched:
+        _report(10, '找到检测记录，加载进球数据...')
+        kept = [float(t) for t in matched.get("kept_goals", [])]
+        all_goals = [float(t) for t in matched.get("goals", [])]
+        # 注：last_goals / last_goal_clips / kept_goal_indices 已在函数入口统一清空，
+        # 这里直接 extend，不需要再 .clear() 一次
+        state.last_goals.extend(kept if kept else all_goals)
+
+        fps = info["fps"]
+        total = info["total"]
+        _stamp = int(time.time())
+
+        _report(30, f'生成 {len(all_goals)} 个预览片段...')
+        cache_key = (video_path, tuple(round(t, 3) for t in all_goals))
+        cached = state.clip_cache.get(cache_key)
+        if cached and all(os.path.exists(c["path"]) for c in cached):
+            state.last_goal_clips.extend(list(cached))
+            _report(30, f'命中缓存，复用 {len(state.last_goal_clips)} 个片段')
+        elif all_goals:
+            state.last_goal_clips.extend(
+                _generate_preview_clips(video_path, all_goals, 0, total,
+                                        fps, total, _stamp, progress_callback=_report)
+            )
+            if state.last_goal_clips:
+                state.clip_cache[cache_key] = list(state.last_goal_clips)
+                if len(state.clip_cache) > 20:
+                    state.clip_cache.pop(next(iter(state.clip_cache)))
+                state.save_clip_cache()
+
+        kept_set = set(kept)
+        for i, clip in enumerate(state.last_goal_clips):
+            if clip["ts"] in kept_set or not kept:
+                state.kept_goal_indices.add(i)
+
+        status = (f"已加载: {os.path.basename(video_path)}\n"
+                  f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
+                  f"进球: {len(all_goals)} 个 | 保留: {len(kept)} 个\n"
+                  f"已加载 {len(state.last_goal_clips)} 个预览片段")
+    else:
+        # 未检测过：函数入口已统一清空 state，这里只写状态文本，无需再清
+        status = (f"已加载: {os.path.basename(video_path)}\n"
+                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
     return preview, info_str, status
 
 
@@ -652,6 +877,7 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             break
         name = os.path.basename(video_path)
         print(f"\n>>> [{i+1}/{n_total}] {name} <<<", flush=True)
+        state.batch_current_video = video_path  # 同步当前视频，供 run_detect 内写历史时查 batch_idx
         if video_path not in state.batch_calibs:
             lines.append(f"✗ {name}: 未标定，跳过")
             print(f"    ↳ SKIP (未标定)", flush=True)

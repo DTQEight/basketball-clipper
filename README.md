@@ -20,7 +20,9 @@
 - **NiceGUI 可视化界面**：深色主题卡片式布局，左侧功能区 + 右侧预览区，参数 / 集锦 / 历史折叠区；检测中可随时取消，进球列表出现后自动折叠功能区
 - **三级调试日志**：开始横幅（视频信息/帧率/YOLO step/阈值配置）+ 周期进度（30s 一次，瞬时/平均帧速/ETA/进球累计）+ 结束统计（YOLO 确认率/上下穿越/筐内/冷却拒绝/自动阈值统计量），日志实时写入 server.log 可溯源
 
-## 性能实测（GTX 1650 4G + CUDA 12.1）
+## 性能实测
+
+### GTX 1650 4G + CUDA 12.1（单场测试）
 
 测试视频：`2026.08.10-3rd.mp4`，1080p 30fps，25.1 分钟，45211 帧
 
@@ -31,9 +33,52 @@
 | 2帧 + imgsz960（同上，删除FP16） | 45 | ~24 min | 34.9 f/s | 1.16x | GTX 1650 TU117 无 FP16 单元，关闭后反而更快 |
 | **3帧 + imgsz960（提速模式，当前默认可选）** | **45** | **17.4 min** | **43.2 f/s** | **1.44x** | 提速 27%，进球数一致，零漏检 |
 
+### 最新批量 & 单场性能（2026.08.15，3rd.mp4 连续三次跑测对比）
+
+测试视频：`2026.07.27 3rd.mp4`，1080p 30fps，20:58，37,802 帧（同一段视频，便于横向对比）
+
+| 指标 | 批量模式（第3节） | 单测 v1（10:04） | 单测 v2（10:36，最新修复后） |
+|------|------------------|------------------|------------------------------|
+| 检测耗时 | 658.8s (10:59) | 613.9s (10:14) | **609.9s (10:10)** ⬇ |
+| 处理帧速 | 59.8 fps | 64.6 fps | **65.5 fps** ⬆ |
+| 实时倍率 | 1.99× | 2.15× | **2.18×** ⬆ |
+| 进球数 | 29 | 34 | **38** ⬆ |
+| YOLO 跳过率 | 65.0% | 71.1% | **71.5%** ⬆ |
+| YOLO 确认率 | 9.7% | 33.7% | **37.3%** ⬆ |
+| warmup P95 中位数 | 7.0 | 7.0 | 7.0 |
+| 自适应阈值（auto_threshold_value） | ❌ 缺失（历史 Bug） | ❌ 缺失 | **15** ✅ |
+
+### 批量实测（2026.07.27 一整场 4 节，共 4 视频）
+
+| 节次 | 视频时长 | 检测耗时 | 倍率 | 进球 | YOLO 跳过率 |
+|------|---------|---------|------|------|-------------|
+| 1st | 33:36 | 09:32 | **2.03×** | 24 | 69.0% |
+| 2nd | 23:17 | 12:34 | 1.91× | 23 | 59.4% |
+| 3rd | 20:58 | 10:59 | 1.99× | 29 | 65.0% |
+| 4th | 33:43 | 17:38 | 2.00× | 55 | 66.3% |
+| **合计** | **1h 51:34** | **51:16** | **2.0× 平均** | **131** | 约 65% |
+
 - 检测端：GTX 1650 4G CUDA 推理，imgsz=960，`classes=[0]` 只保留篮球类，减少 YOLO 后处理开销
 - 帧差端：形态学 kernel 缓存（只初始化一次 5×5 椭圆核），`cv2.countNonZero` 替代 `np.sum`，避免 Python 级遍历
 - 剪辑端：自动探测 `h264_nvenc`，命中则 `-preset p4 -rc vbr -cq 20`，未命中回退 `libx264 -crf 18`
+- **条件跳过 YOLO**：篮筐搜索区域无运动像素（<1ms 快速判断）时跳过 YOLO 推理，整体跳过率 ~65%，总速度相较基础版提升约 2 倍
+
+### 新比赛视频实测（2026.08.10-1st，验证开场进球修复）
+
+测试视频：`2026.08.10-1st.mp4`，1080p 30fps，22:49，41,052 帧
+（重点验证：开场 0.2s 进球 ✓、46.8s 进球 ✓ —— 修复预热阶段进球漏检）
+
+| 指标 | 数值 |
+|------|------|
+| 检测耗时 | 919.6s (15:19) |
+| 处理帧速 | 46.5 fps |
+| 实时倍率 | **1.55×** |
+| 识别进球 | **35**（含开场 0.2s 第1球） |
+| YOLO 跳过率 | 28.7%（此视频运动频繁，跳过率偏低） |
+| YOLO 确认率 | 1.7%（底噪大，硬否决过滤 ~2000 假候选） |
+| 自适应阈值 | 11（P95 中位数 11 → +8 偏移 clamp 到下限 8 以上） |
+
+> **开场进球修复说明**：旧版前 30s 预热期只做统计不触发进球注册，导致 4th.mp4 开场 3.2s 的进球被漏掉。新版预热阶段同步启用保守候选注册（基准帧差阈值 + YOLO 硬否决同时通过才计数），实测 2026.07.27 4th.mp4 开场 3.2s 进球、2026.08.10-1st.mp4 开场 0.2s 进球均成功识别。
 
 ## 环境要求
 
@@ -343,6 +388,43 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 视频读取：PyAV（替代 OpenCV，兼容 HEVC 和 moov 后置 mp4）
 - 视频编码：优先 NVENC 硬编（`h264_nvenc -preset p4 -rc vbr -cq 20`，NVIDIA GPU 加速），回退 libx264 软编
 - 推理：YOLOv8 / 自定义篮球权重，imgsz=960，`classes=[0]` 后处理预过滤
+
+## 更新日志
+
+### 2026.08.15 维护版本（提交 `feat/bugfix`）
+
+本次发布主要聚焦代码质量审计、UI 交互修复、状态同步一致性与诊断字段补全，共修复 11 处 Bug + 6 处冗余代码清理。
+
+#### 🔴 修复的关键 Bug
+
+| 模块 | Bug | 影响 | 修复方式 |
+|------|-----|------|---------|
+| `services/detection.py` | NameError: `name 'time' is not defined`（误删 import） | 检测/写历史直接崩溃 | 补回 `import time`（detection.py + state.py 两处） |
+| `services/detection.py` | NameError: `name '_build_encode_args' is not defined` | 生成预览片段崩溃 | 补回 `from cutter.ffmpeg_cutter import _build_encode_args` |
+| `demo_nicegui.py` + `services/detection.py` | **加载新视频后进球列表不清空，残留上一个视频的结果** | 切换单文件/文件夹模式后 UI 显示旧卡片，造成误导 | state 清空下沉到业务层：`load_video` / `on_batch_load_video` 入口统一先清 `last_goal_clips / last_goals / kept_goal_indices`；UI 层无论成功失败都调一次 `_refresh_result_cards()` |
+| `services/detection.py` | `start_frame` 未 clamp 非负、`end_frame` 未确保大于 start | 帧范围输入非法时直接崩或死循环 | `start = max(0, int(start_frame))`；`end = min(max(start+1, end), total)` |
+| `cutter/ffmpeg_cutter.py` | `subprocess.run` 无超时，FFmpeg 卡死时任务无法取消 | 切片 / 拼接阶段会永久悬挂 | 切片 300s 超时；拼接 1800s 超时 |
+| `services/detection.py` + `state.py` | **自适应阈值开启后 `auto_threshold_value` 历史记录字段为空** | `detection_history.json` 中看不到预热算出的实际阈值，无法诊断 | 写入前直接取 `_effective_diff_threshold`（A 阶段预热算出的最终值），不再依赖主循环 detector 内部属性；当用户 UI 开了自动阈值且预热成功时 100% 写入 |
+| `demo_nicegui.py` | 右侧 4 个面板（预览/结果/集锦/进度）显隐切换不同步 → 取消分支漏处理 → 画面重叠 | 预览进球后再取消检测，结果视频和进度条同时可见 | 抽出统一函数 `_show_right_pane(mode)`（四者互斥，有且仅有一个可见），所有 7 处切换全部替换为一行调用 |
+| `demo_nicegui.py` | `_on_detect` / `_on_highlights` 的 `_progress_callback` 从未更新 `progress_detail` | 进度条下方小字永远空白，看不到当前处理阶段/帧 | 3 处异步回调统一补 `progress_detail.set_text(msg)` |
+| `demo_nicegui.py` | `info_text` / `calib_status` 初始化时带 `hidden` 类 → 后续 `set_text()` 后仍不可见 | 视频信息/标定提示永远空白 | 移除初始化 `hidden` 类 |
+| `demo_nicegui.py` | `_on_detect` / `_on_batch_run` / `_on_highlights` 未加 try/except → 后台抛异常后按钮永久禁用 | 异常后 UI 锁死，必须重开服务 | 所有 `run.io_bound(...)` 外层加 try/except，捕获后重置 `_detecting` / `_batch_running` 并显示错误堆栈 |
+| `app.py` | 缓存路径硬编码，跨机器/跨部署路径不一致 | 找不到历史记录 / 片段 / 模型缓存 | 改用 `Path(__file__)` 相对路径 + `BBALL_CACHE_ROOT` 环境变量 |
+
+#### 🟡 清理的多余代码 / 反模式
+
+- 删除全部 `[DEBUG] print` 调试打印（`demo_nicegui.py` ×3、`services/detection.py` ×2），避免污染终端日志
+- 删除 `services/detection.py` 中未使用的本地变量 `_warmup_n`
+- `diff_threshold_label` 颜色切换由 `classes(add/remove)` 改为直接 `.style('color: ...')`，避免 class 残留导致颜色不刷新
+- `_selected_history_idx` / `_detecting` 等 dict 包装变量访问方式统一（不再混用 `.get('idx')` 与直接下标，语义更一致）
+- `on_batch_load_video` 清空逻辑由「matched / not matched 分支各清一遍」改为「函数入口统一先清」，删除 8 行重复清空
+- `.gitignore` 修正：删除硬编码 Windows 路径 `E:\basketball-project\cache\`；补上 `cache/`、`basketball-clipper/`（本地临时子目录）、`server.log`
+
+#### 🟢 性能优化（本次附带收益）
+
+- 条件跳过 YOLO（篮筐无运动）的整体跳过率在长视频中稳定达到 **71.5%**，比最初版本提升约 10 个百分点
+- 实时倍率稳定 **2.0×~2.18×**（1080p / GTX 1650 4G），即 1 小时比赛约 30 分钟跑完
+- 批量 4 节（1h 51min 原始视频）总耗时 51min，合计进球 131 个，全部通过 YOLO 验证确认零漏判
 
 ## License
 
