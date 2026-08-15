@@ -36,6 +36,9 @@ CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
 DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 
+# 历史记录上限（防止 detection_history.json 无限增长）
+MAX_HISTORY_RECORDS = 50
+
 # ============ 运行时状态 ============
 video_state = {"path": None, "total": 0, "fps": 30.0, "codec": "unknown",
                "current_frame": 0, "width": 0, "height": 0}
@@ -198,7 +201,7 @@ def add_history(video_path, hoop, goals, kept_goals, baseline_idx=-1,
     if warmup_sample_count is not None:
         rec["warmup_sample_count"] = int(warmup_sample_count)
     records.insert(0, rec)
-    records = records[:50]
+    records = records[:MAX_HISTORY_RECORDS]
     save_history(records)
 
 
