@@ -6,15 +6,12 @@ REM  Basketball Goal Detection Service - Auto Start (Windows)
 REM  Portable: no hardcoded drive/path, auto-follow script dir
 REM ============================================================
 
-REM --- Locate basketball-clipper\ directory (the script dir)
+REM --- Script dir is also the project root (flat repo structure)
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+set "PROJECT_ROOT=%SCRIPT_DIR%"
 
-REM --- Locate basketball-project\ directory (parent of script dir)
-for %%I in ("%SCRIPT_DIR%") do set "PROJECT_ROOT=%%~dpI"
-set "PROJECT_ROOT=%PROJECT_ROOT:~0,-1%"
-
-REM --- Resolve Python: prefer project built-in env (实际路径是 env\python.exe，无 Scripts 子目录)
+REM --- Resolve Python: prefer project built-in env
 set "PYTHON=%PROJECT_ROOT%\env\python.exe"
 if not exist "%PYTHON%" set "PYTHON=%PROJECT_ROOT%\env\Scripts\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"

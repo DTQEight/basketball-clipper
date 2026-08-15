@@ -6,11 +6,9 @@
 
 set +e  # 即使脚本某步失败也不中断（方便看错误）
 
-# 定位脚本目录：basketball-clipper/
+# 定位脚本目录（同时也是项目根目录，扁平仓库结构）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-# 项目根：basketball-project/
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$SCRIPT_DIR"
 
 echo ""
 echo "============================================"
