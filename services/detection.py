@@ -577,47 +577,82 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         return f"❌ 检测失败: {e}\n{traceback.format_exc()}", False
 
 
-def clip_action(action, idx):
-    """处理卡片按钮操作。"""
-    if idx < 0 or idx >= len(state.last_goal_clips):
+def clip_action(action, idx, video_path=None):
+    """处理卡片按钮操作。
+
+    video_path=None: 单视频模式，操作全局 last_goal_clips（原逻辑不变）。
+    video_path 非空: 流水线快照模式，操作 batch_results[video_path] 内的数据，
+                     不触碰全局 state（后台批量检测运行中也可安全调用）。
+    """
+    # ===== 选择数据源：快照模式 or 全局模式 =====
+    if video_path is not None:
+        snap = state.batch_results.get(video_path)
+        if not snap:
+            return None, ""
+        clips = snap["clips"]
+        kept = snap["kept"]
+    else:
+        clips = state.last_goal_clips
+        kept = state.kept_goal_indices
+
+    if idx < 0 or idx >= len(clips):
         return None, ""
     if action == "preview":
-        return state.last_goal_clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
+        return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
     elif action == "export":
-        return state.last_goal_clips[idx]["path"], f"已导出: {state.last_goal_clips[idx]['path']}"
+        return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
     elif action == "delete":
-        deleted = state.last_goal_clips[idx]
+        deleted = clips[idx]
         ts = deleted["ts"]
-        del state.last_goal_clips[idx]
+        del clips[idx]
+        # kept 集合整体前移：删除 idx 后，大于 idx 的索引 -1
         new_kept = set()
-        for old_i in sorted(state.kept_goal_indices):
+        for old_i in sorted(kept):
             if old_i < idx:
                 new_kept.add(old_i)
             elif old_i > idx:
                 new_kept.add(old_i - 1)
-        state.kept_goal_indices = new_kept
-        kept_ts = [state.last_goal_clips[i]["ts"]
-                   for i in sorted(state.kept_goal_indices) if i < len(state.last_goal_clips)]
-        state.last_goals.clear()
-        state.last_goals.extend(kept_ts)
-        return None, f"已删除第 {idx+1} 个片段（{ts:.1f}s）| 剩余 {len(state.last_goal_clips)} 个"
+        kept.clear()
+        kept.update(new_kept)
+        # 同步 goals：按保留的片段时间戳重建（快照模式下直接改快照的 goals 列表）
+        kept_ts = [clips[i]["ts"] for i in sorted(kept) if i < len(clips)]
+        if video_path is not None:
+            snap["goals"] = kept_ts
+        else:
+            state.last_goals.clear()
+            state.last_goals.extend(kept_ts)
+        return None, f"已删除第 {idx+1} 个片段（{ts:.1f}s）| 剩余 {len(clips)} 个"
     return None, ""
 
 
-def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None):
-    """生成集锦视频。"""
-    if state.video_state["path"] is None:
-        return None, "❌ 请先加载视频并检测进球"
-    if not state.last_goals:
+def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
+                        video_path=None):
+    """生成集锦视频。
+
+    video_path=None: 单视频模式，用全局 video_state + last_goals（原逻辑不变）。
+    video_path 非空: 流水线快照模式，用 batch_results[video_path] 的 goals 生成，
+                     批量检测运行中也可调用（NVENC 硬编与 CUDA 推理是 GPU 独立单元，可并行）。
+    """
+    if video_path is not None:
+        snap = state.batch_results.get(video_path)
+        if not snap:
+            return None, "❌ 该视频没有检测结果"
+        goals = list(snap["goals"])
+        src = video_path
+    else:
+        if state.video_state["path"] is None:
+            return None, "❌ 请先加载视频并检测进球"
+        goals = list(state.last_goals)
+        src = state.video_state["path"]
+    if not goals:
         return None, "❌ 没有检测到进球"
     try:
-        out_path = cut_clips(state.video_state["path"], list(state.last_goals),
+        out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
                              progress_callback=progress_callback)
         if out_path and os.path.exists(out_path):
-            n = len(state.last_goals)
-            return out_path, f"集锦已生成（{n} 个进球片段）\n输出: {out_path}"
+            return out_path, f"集锦已生成（{len(goals)} 个进球片段）\n输出: {out_path}"
         return None, "❌ 集锦生成失败"
     except Exception as e:
         import traceback
@@ -761,6 +796,19 @@ def on_batch_load_video(selected, progress_callback=None):
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
 
+    # —— 流水线快照优先：批量识别后点视频，优先从快照水合 ——
+    # 快照里保留了人工删减后的 goals/clips，比走历史记录重新生成预览更快，且不丢删减结果
+    snap = state.batch_results.get(video_path)
+    if snap and snap.get("clips"):
+        state.last_goals.extend(snap["goals"])
+        state.last_goal_clips.extend([dict(c) for c in snap["clips"]])
+        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+        status = (f"已加载: {os.path.basename(video_path)}\n"
+                  f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
+                  f"进球: {len(snap['goals'])} 个（含人工删减）\n"
+                  f"复用 {len(state.last_goal_clips)} 个预览片段")
+        return preview, info_str, status
+
     # —— 查找历史记录：批量识别完成后，下拉框选视频时自动加载检测结果 ——
     records = state.load_history()
     matched = None
@@ -833,14 +881,20 @@ def on_batch_save_calib():
 def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                      diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                      min_blob_area=30, search_margin=80, progress_callback=None,
-                     auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False):
+                     auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False,
+                     per_video_callback=None):
     """批量识别：遍历文件夹内全部视频逐个检测，每个视频独立写入历史。
 
     返回 (状态文本, 是否成功)。状态文本逐条列出每个视频的结果，
     未标定/读取失败/检测失败都会单独说明，不再静默跳过。
+
+    per_video_callback(video_path, goal_count): 每个视频检测成功后回调（UI 打完成标记）。
+    结果同时存入 state.batch_results 快照，供流水线模式前台人工确认。
     """
     if not state.batch_files:
         return "请先加载文件夹", False
+    # 流水线快照：重跑批量时覆盖旧结果
+    state.batch_results.clear()
     # 当前视频若已标定但未点「保存标定」，批量前自动保存，避免漏处理
     cur = state.batch_current_video
     if (cur and cur in state.batch_files and cur not in state.batch_calibs
@@ -919,6 +973,19 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             total_goals += len(state.last_goals)
             lines.append(f"✓ {name}: 成功，{len(state.last_goals)} 个进球")
             print(f"    ↳ OK: {len(state.last_goals)} goals", flush=True)
+            # ===== 流水线快照：深拷贝当前视频结果，前台可立即查看/确认 =====
+            # 检测线程只写这个 key，之后永不触碰；前台删卡片只改快照，互不干扰
+            state.batch_results[video_path] = {
+                "goals": list(state.last_goals),
+                "clips": [dict(c) for c in state.last_goal_clips],
+                "kept": set(state.kept_goal_indices),
+                "finished_at": time.strftime("%H:%M:%S"),
+            }
+            if per_video_callback:
+                try:
+                    per_video_callback(video_path, len(state.last_goals))
+                except Exception:
+                    pass
         else:
             reason = _status.splitlines()[0] if _status else "失败"
             lines.append(f"✗ {name}: {reason}")

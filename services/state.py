@@ -84,6 +84,11 @@ batch_files = []
 batch_calibs = {}
 batch_current_video = None
 
+# 批量结果快照：视频路径 -> {"goals": [...], "clips": [...], "kept": set(), "finished_at": str}
+# 检测线程只写入新 key；前台人工确认（删卡片/导出集锦）只读写快照。
+# 与全局 last_goals/last_goal_clips 完全隔离，支持流水线：后台跑检测 + 前台确认已完成视频
+batch_results = {}
+
 
 # ============ 历史记录 ============
 def load_history():

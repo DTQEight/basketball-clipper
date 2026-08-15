@@ -293,6 +293,20 @@ def main_page():
                     exp_hist.on_value_change(lambda e: _refresh_history() if e.value else None)
                     _sync_expand()
 
+                # 后台批量识别进度条（流水线模式常驻：预览快照片段顶掉右侧进度面板后，
+                # 仍可从此处看到后台进度，点击切回完整进度视图）
+                with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 items-center gap-2 hidden cursor-pointer') \
+                        .on('click', lambda: _show_right_pane('progress')) as batch_progress_strip:
+                    ui.icon('sync', color='accent').classes('text-sm animate-spin')
+                    batch_mini_bar = ui.linear_progress(value=0, show_value=False).props('instant-feedback').classes('flex-1')
+                    batch_mini_text = ui.label('后台识别中').classes('text-xs flex-shrink-0').style('color: var(--text-secondary)')
+
+                # 流水线集锦进度条（批量运行中对快照视频生成集锦时显示，与批量进度条并列互不干扰）
+                with ui.row().classes('w-full px-3 pt-1 flex-shrink-0 items-center gap-2 hidden') as hl_progress_strip:
+                    ui.icon('movie', color='accent').classes('text-sm')
+                    hl_mini_bar = ui.linear_progress(value=0, show_value=False).props('instant-feedback').classes('flex-1')
+                    hl_mini_text = ui.label('集锦生成中').classes('text-xs flex-shrink-0').style('color: var(--text-secondary)')
+
                 # 导出集锦按钮（固定在列表上方，仅列表有内容时显示）
                 with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 hidden') as export_row:
                     ui.button('导出集锦', on_click=lambda: _on_highlights()).classes(
@@ -406,6 +420,7 @@ def main_page():
             state.last_goal_clips.clear()
             state.last_goals.clear()
             state.kept_goal_indices.clear()
+            _cards_video["path"] = None  # 离开快照查看模式
             _refresh_result_cards()
             state.batch_files = files
             state.batch_calibs = {}
@@ -421,6 +436,7 @@ def main_page():
         state.batch_files = []
         state.batch_calibs = {}
         state.batch_current_video = None
+        _cards_video["path"] = None  # 离开快照查看模式
         # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
         #       已下沉到 detection.load_video 业务层（切视频即清空），UI 层不再重复
         #       以避免 frame is None 分支漏清空导致旧数据残留
@@ -438,18 +454,31 @@ def main_page():
         calib_status.set_text('请点击画面 2 个点标定篮筐' if frame is not None else info)
 
     def _refresh_batch_list():
-        """刷新批量下拉框：文件名前带标定状态标记（✓已标定 / ○未标定），保留当前选中。"""
+        """刷新批量下拉框：三态标记（☑已完成n球 / ✓已标定 / ○未标定），保留当前选中。"""
         if not state.batch_files:
             return
         cur_val = batch_select.value if batch_select.value in state.batch_files else None
+
+        def _label(f):
+            name = os.path.basename(f)
+            if f in state.batch_results:  # 流水线快照：本轮批量已完成
+                return f'☑ {name} ({len(state.batch_results[f]["goals"])}球)'
+            if f in state.batch_calibs:
+                return f'✓ {name}'
+            return f'○ {name}'
+
         # 用 dict（值->标签）作为 options：dict 时 select 的值才是纯路径字符串；
         # 若用 [(值,标签)] 列表，NiceGUI 会把整个元组当值，导致加载失败
-        batch_select.set_options(
-            {f: (f'✓ {os.path.basename(f)}' if f in state.batch_calibs
-                 else f'○ {os.path.basename(f)}') for f in state.batch_files},
-            value=cur_val)
+        batch_select.set_options({f: _label(f) for f in state.batch_files},
+                                 value=cur_val)
 
     _batch_loading = False  # 防重入（set_value 可能触发 change 事件）
+
+    # 当前结果卡片显示的视频：None=全局模式（单视频/批量最后结果）
+    # 非空=批量快照模式（流水线：后台检测继续跑，前台确认该视频的快照结果）
+    _cards_video = {"path": None}
+    # 流水线集锦小锁：批量运行中对快照视频生成集锦，不占全局任务锁
+    _hl_busy = {"on": False}
 
     async def _on_batch_load_video(path=None):
         """加载批量视频（从下拉或列表点击）。
@@ -463,10 +492,22 @@ def main_page():
             path = path[0]
         if _batch_loading:
             return
-        if _refuse_if_busy():
-            return
         if path is None:
             path = batch_select.value
+        # ===== 流水线模式：批量识别运行中 =====
+        # 点已完成视频 → 只切换卡片到该视频快照（纯展示，不动全局 state/标定，不打断后台检测）
+        if _busy["task"] == 'batch':
+            if path and path in state.batch_results:
+                batch_select.set_value(path)
+                _cards_video["path"] = path
+                _refresh_result_cards()
+                _set_status(f'查看: {os.path.basename(path)} | '
+                            f'{len(state.batch_results[path]["goals"])} 个进球 | 后台检测继续', 'info')
+                return
+            _set_status('批量识别进行中，仅可点击「☑已完成」的视频查看结果', 'err')
+            return
+        if _refuse_if_busy():
+            return
         if not path:
             # 下拉框被重置（如重新扫描）时静默跳过，避免误报
             if state.batch_current_video is None:
@@ -478,6 +519,7 @@ def main_page():
                 batch_select.set_value(path)
             return
         _batch_loading = True
+        _cards_video["path"] = None  # 常规加载走全局 state，卡片回到全局模式
         if not _try_acquire('load'):
             _batch_loading = False
             return
@@ -531,6 +573,9 @@ def main_page():
         if not _try_acquire('batch'):
             return
         state.cancel_requested = False
+        batch_progress_strip.classes(remove='hidden')  # 显示常驻迷你进度条
+        batch_mini_bar.set_value(0)
+        batch_mini_text.set_text('后台识别中')
         batch_run_btn.set_text('取消')
         batch_run_btn.enable()
         # 显示进度
@@ -544,6 +589,17 @@ def main_page():
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text('批量识别中...')
                 progress_detail.set_text(msg)
+                # 迷你进度条同步（右侧面板被预览顶掉时，用户仍能看到后台进度）
+                batch_mini_bar.set_value(pct / 100)
+                batch_mini_text.set_text(f'{pct:.0f}%')
+            except Exception:
+                pass
+
+        def _per_video_done(video_path, goal_count):
+            """流水线回调：单个视频完成 → 更新下拉框标记 + 轻提示（不自动切换界面，不打断确认）"""
+            try:
+                _refresh_batch_list()
+                _set_status(f'☑ {os.path.basename(video_path)} 完成 | {goal_count} 个进球 | 可点击下拉查看', 'info')
             except Exception:
                 pass
 
@@ -558,7 +614,8 @@ def main_page():
                 progress_callback=_progress_callback,
                 auto_threshold=auto_threshold_switch.value,
                 yolo_step=3 if yolo_3frame_switch.value else 2,
-                skip_yolo_no_motion=skip_yolo_switch.value)
+                skip_yolo_no_motion=skip_yolo_switch.value,
+                per_video_callback=_per_video_done)
         except Exception as _e:
             import traceback
             status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"
@@ -567,9 +624,12 @@ def main_page():
             _busy["task"] = None
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
+        batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
         _show_right_pane('preview')
         _set_status(status, 'ok' if ok else 'err')
-        # 批量结束后显示最后一个视频的结果
+        # 批量结束后：用户查看中的快照保留显示；否则回全局模式显示最后一个视频的结果
+        if _cards_video["path"] not in state.batch_results:
+            _cards_video["path"] = None
         _refresh_result_cards()
         _refresh_batch_list()
 
@@ -627,6 +687,7 @@ def main_page():
             return
         if not _try_acquire('detect'):
             return
+        _cards_video["path"] = None  # 单视频检测结果显示在全局模式
         state.cancel_requested = False
         detect_btn.set_text('取消')
         detect_btn.enable()
@@ -677,18 +738,33 @@ def main_page():
             _refresh_result_cards()
 
     def _refresh_result_cards():
-        """刷新结果卡片列表。"""
+        """刷新结果卡片列表。
+
+        数据源：_cards_video 非空 → 批量快照（流水线确认模式）；
+                否则 → 全局 last_goal_clips（单视频/批量最后结果）。
+        """
         result_container.clear()
-        if not state.last_goal_clips:
+        vp = _cards_video["path"]
+        if vp is not None:
+            snap = state.batch_results.get(vp)
+            clips = snap["clips"] if snap else []
+        else:
+            clips = state.last_goal_clips
+        if not clips:
             with result_container:
-                ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
-                ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
+                if vp is not None:
+                    ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                        'text-xs text-center w-full py-4').style('color: var(--accent)')
+                    ui.label('该视频的片段已全部删除').classes('text-gray-400 text-xs text-center w-full')
+                else:
+                    ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
+                    ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
             export_row.classes(add='hidden')  # 无结果时隐藏导出按钮
             _set_func_collapsed(False)  # 列表为空时展开功能区
             return
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
-        for i, clip in enumerate(state.last_goal_clips):
+        for i, clip in enumerate(clips):
             ts = clip["ts"]
             # 预览片段实际为进球时刻 ±3s（见 _generate_preview_clips 的 clip_half）
             start_ts = max(0.0, ts - 3)
@@ -696,6 +772,10 @@ def main_page():
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
             with result_container:
+                if i == 0 and vp is not None:
+                    # 快照模式：首行显示当前查看的视频名，明确数据归属
+                    ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                        'text-xs font-bold w-full pb-1').style('color: var(--accent)')
                 with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style('margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'):
                     # 第一行：时间戳徽章（mono + tabular-nums）
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
@@ -711,7 +791,7 @@ def main_page():
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--err); border: 1px solid rgba(239, 68, 68, 0.3)')
 
     def _on_preview_clip(idx):
-        path, status = detection.clip_action("preview", idx)
+        path, status = detection.clip_action("preview", idx, video_path=_cards_video["path"])
         if path and os.path.exists(path):
             result_video_el.set_source(path)
             _show_right_pane('result')
@@ -720,20 +800,57 @@ def main_page():
         _set_status(status, 'info')
 
     def _on_export_clip(idx):
-        path, status = detection.clip_action("export", idx)
+        path, status = detection.clip_action("export", idx, video_path=_cards_video["path"])
         if path and os.path.exists(path):
             ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
     def _on_delete_clip(idx):
-        if _refuse_if_busy():
+        # 快照模式（查看批量已完成视频）随时可删，仅改快照；
+        # 全局模式有任务运行时拒绝（会与检测线程冲突）
+        if _cards_video["path"] is None and _refuse_if_busy():
             return
         # 点击直接删除，不弹确认框
-        _, status = detection.clip_action("delete", idx)
+        _, status = detection.clip_action("delete", idx, video_path=_cards_video["path"])
         _refresh_result_cards()
         _set_status(status, 'info')
 
     async def _on_highlights():
+        vp = _cards_video["path"]
+        # ===== 流水线分支：批量检测运行中，对快照视频生成集锦 =====
+        # 用独立小锁（不占全局任务锁），不切进度区（那里正显示批量进度），NVENC 与 CUDA 可并行
+        if vp is not None and _busy["task"] == 'batch':
+            if _hl_busy["on"]:
+                return
+            _hl_busy["on"] = True
+            from nicegui import run
+            # 显示集锦迷你进度条（不占右侧进度面板，那边正显示批量进度）
+            hl_progress_strip.classes(remove='hidden')
+            hl_mini_bar.set_value(0)
+            hl_mini_text.set_text(f'集锦: {os.path.basename(vp)}')
+
+            def _hl_progress(pct, msg):
+                try:
+                    hl_mini_bar.set_value(pct / 100)
+                    hl_mini_text.set_text(f'集锦 {pct:.0f}%')
+                except Exception:
+                    pass
+
+            _set_status(f'正在为 {os.path.basename(vp)} 生成集锦（后台检测不受影响）...', 'busy')
+            try:
+                path, status = await run.io_bound(
+                    detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
+                    hl_min_gap.value, _hl_progress, vp)
+            except Exception as _e:
+                import traceback
+                path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
+            finally:
+                _hl_busy["on"] = False
+                hl_progress_strip.classes(add='hidden')
+            if path and os.path.exists(path):
+                ui.download(path)
+            _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
+            return
         if not _try_acquire('highlights'):
             return
         from nicegui import run
@@ -755,7 +872,7 @@ def main_page():
         try:
             path, status = await run.io_bound(
                 detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
-                hl_min_gap.value, _progress_callback)
+                hl_min_gap.value, _progress_callback, vp)
         except Exception as _e:
             import traceback
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
