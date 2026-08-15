@@ -77,7 +77,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
 
     timestamps: 进球时刻列表（秒，浮点）
     min_gap: 两个片段间隔小于此值则合并，避免连续得分重复切。
-    output_path: 输出文件路径，None 则默认到 cache/demo_output/highlights.mp4
+    output_path: 输出文件路径，None 则默认到 cache/demo_output/{源视频名}-highlights.mp4
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
     progress_callback: 可选进度回调 (pct, msg)，0-100。
     返回: 输出文件路径 或 None（无进球）
@@ -112,11 +112,12 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
     os.makedirs(tmp_dir, exist_ok=True)
     clip_files = []
 
-    # 输出路径默认到 E 盘
+    # 输出路径默认到 cache/demo_output/，文件名带源视频名避免覆盖
     if output_path is None:
         out_dir = os.path.join(_CACHE_ROOT, "demo_output")
         os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, "highlights.mp4")
+        _vname = os.path.splitext(os.path.basename(video_path))[0]
+        output_path = os.path.join(out_dir, f"{_vname}-highlights.mp4")
 
     # 检测编码器一次，避免每个片段重复检测
     use_nvenc = _detect_nvenc(ffmpeg)
