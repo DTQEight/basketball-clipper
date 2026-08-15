@@ -39,6 +39,27 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 # 历史记录上限（防止 detection_history.json 无限增长）
 MAX_HISTORY_RECORDS = 50
 
+# 预览片段目录
+DEMO_OUTPUT_DIR = os.path.join(CACHE_ROOT, "demo_output")
+
+
+def _purge_old_clips(max_days=7):
+    """启动时自动清理 demo_output/ 下超过 max_days 天的旧预览片段。"""
+    out = DEMO_OUTPUT_DIR
+    if not os.path.isdir(out):
+        return
+    cutoff = time.time() - max_days * 86400
+    for fname in os.listdir(out):
+        fpath = os.path.join(out, fname)
+        try:
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+        except OSError:
+            pass
+
+
+_purge_old_clips()
+
 # ============ 运行时状态 ============
 video_state = {"path": None, "total": 0, "fps": 30.0, "codec": "unknown",
                "current_frame": 0, "width": 0, "height": 0}

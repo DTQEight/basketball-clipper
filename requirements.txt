@@ -19,6 +19,8 @@ pyyaml>=6.0
 # Web 界面
 nicegui>=1.4.0
 
-# 深度学习（GPU 版需单独安装，见下方说明）
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121  # CUDA 12.1
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu    # CPU 版
+# 深度学习（torch 不在此文件中，因 GPU/CPU 版本不同，需手动安装）
+# GPU 版（推荐，需 NVIDIA 显卡 + CUDA 12.x）:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU 版（无显卡时）:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
