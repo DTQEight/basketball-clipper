@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT))
 if os.environ.get("BBALL_CACHE_ROOT"):
     _CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
 else:
-    # 与 services/state.py 保持一致：basketball-project/cache（项目父目录）
-    _CACHE_ROOT = str(ROOT.parent / "cache")
+    # 与 services/state.py 保持一致：项目内 cache 目录
+    _CACHE_ROOT = str(ROOT / "cache")
 os.environ["MPLCONFIGDIR"] = os.path.join(_CACHE_ROOT, "matplotlib")
 os.environ["ULTRALYTICS_CONFIG_DIR"] = os.path.join(_CACHE_ROOT, "ultralytics")
 os.environ["TORCH_HOME"] = os.path.join(_CACHE_ROOT, "torch")

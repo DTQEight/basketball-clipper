@@ -9,14 +9,14 @@ import time
 from pathlib import Path
 
 # ============ 路径常量 ============
-# 项目根目录：basketball-clipper/
+# 项目根目录（扁平结构：代码直接在项目根下）
 _ROOT = Path(__file__).parent.parent.resolve()
 
-# 缓存目录：优先用环境变量，否则用项目同级 cache 目录（跨平台、可移植）
+# 缓存目录：优先用环境变量，否则用项目内 cache 目录
 if os.environ.get("BBALL_CACHE_ROOT"):
     CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
 else:
-    CACHE_ROOT = str(_ROOT.parent / "cache")
+    CACHE_ROOT = str(_ROOT / "cache")
 
 # Windows subprocess 屏蔽控制台窗口（Linux 下为 0）
 SBOX = 0x08000000 if os.name == "nt" else 0
