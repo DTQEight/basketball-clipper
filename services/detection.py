@@ -186,6 +186,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         return "❌ 请先点击画面标定篮筐", False
     if state.calib["baseline_frame"] is None:
         return "❌ 基准帧差法需要基准帧，请重新标定", False
+    # 不做 CPU 降级：无 CUDA 时直接拒绝检测（CPU 推理慢约 10 倍，
+    # 静默降级会让用户误以为服务正常而空等数小时）
+    if get_device() == "cpu":
+        return "❌ 未检测到可用 CUDA，请检查显卡驱动/CUDA 环境后重启服务（不支持 CPU 推理）", False
 
     def _report(pct, msg):
         if progress_callback:

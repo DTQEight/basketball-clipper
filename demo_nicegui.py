@@ -35,6 +35,53 @@ from services import state, detection, video_utils
 state.init_clip_cache()
 
 
+# ============ YOLO/CUDA 启动自检 ============
+
+YOLO_SELFCHECK = {"ok": False, "msg": ""}
+
+
+def _yolo_selfcheck():
+    """服务启动时在主线程做一次真实 YOLO 推理自检。
+
+    作用：
+      1. 提前在主线程创建 CUDA 上下文（后台线程首次创建可能触发驱动层崩溃）
+      2. 驱动升级/环境损坏导致推理失败时，启动即可发现并在页面横幅提示，
+         避免跑完整个视频（几十分钟）才发现 GPU 推理一直失败
+    策略：不做 CPU 降级 —— CUDA 不可用或推理失败均判为失败（红色横幅），
+    检测入口也会拒绝在 CPU 上运行（见 services/detection.py run_detect）。
+    结果写入 YOLO_SELFCHECK（页面横幅读取）和 cache/warmup_status.log。
+    """
+    try:
+        import torch
+        from app import get_ball_model, get_device
+        device = get_device()
+        if device == "cpu":
+            YOLO_SELFCHECK.update(ok=False,
+                                  msg="CUDA 不可用（本服务需要 GPU 推理，不支持 CPU 降级）")
+            _msg = "WARMUP-FAIL: CUDA not available, CPU fallback disabled"
+        else:
+            model, _weights = get_ball_model()
+            warm = np.zeros((640, 640, 3), dtype=np.uint8)
+            model.predict(warm, conf=0.5, imgsz=640, device=device, verbose=False)
+            torch.cuda.empty_cache()
+            YOLO_SELFCHECK.update(ok=True, msg=f"YOLO 自检通过（{device}）")
+            _msg = f"WARMUP-OK: {device} context created on main thread"
+    except Exception as e:
+        import traceback
+        YOLO_SELFCHECK.update(ok=False, msg=f"YOLO 自检失败：{e}")
+        _msg = f"WARMUP-FAIL: {e}\n{traceback.format_exc()}"
+    try:
+        os.makedirs(state.CACHE_ROOT, exist_ok=True)
+        with open(os.path.join(state.CACHE_ROOT, "warmup_status.log"), "w", encoding="utf-8") as f:
+            f.write(_msg)
+    except Exception:
+        pass
+    print(_msg, flush=True)
+
+
+_yolo_selfcheck()
+
+
 # ============ NiceGUI 界面 ============
 
 @ui.page('/')
@@ -168,6 +215,36 @@ def main_page():
     ''')
 
     with ui.column().classes('w-full h-[100dvh] p-0 gap-0').style('overflow: hidden; background: var(--bg-canvas)'):
+        # ====== YOLO 自检横幅（失败时醒目提示 + 确认重启） ======
+        if not YOLO_SELFCHECK["ok"]:
+            def _do_restart_service():
+                """os.execv 原地替换进程：旧进程终止自动释放端口，新进程重新自检。"""
+                os.execv(sys.executable, [sys.executable, '-u'] + sys.argv)
+
+            def _on_confirm_restart():
+                restart_dialog.close()
+                ui.notify('正在重启服务，请稍后刷新页面…', type='info', position='top')
+                # 延迟 1 秒让通知先送达浏览器
+                ui.timer(1.0, _do_restart_service, once=True)
+
+            with ui.row().classes('w-full items-center gap-2 px-3 py-2').style(
+                    'flex-shrink: 0; background: rgba(239, 68, 68, 0.12); border-bottom: 1px solid #EF4444;'):
+                ui.icon('error', color='red-5').classes('text-sm flex-shrink-0')
+                ui.label(f'{YOLO_SELFCHECK["msg"]} | 请检查显卡驱动/CUDA 环境后重启服务').classes(
+                    'text-xs flex-1').style('color: #FCA5A5')
+                ui.button('重启服务', on_click=lambda: restart_dialog.open()).props('dense unelevated').classes(
+                    'text-xs flex-shrink-0').style('background: #EF4444; color: white')
+
+            with ui.dialog() as restart_dialog, ui.card().classes('w-80'):
+                ui.label('确认重启服务？').classes('text-sm font-bold')
+                ui.label('将以相同参数重新启动进程并重新执行 YOLO 自检（适用于修复显卡驱动/CUDA 环境后）。').classes(
+                    'text-xs mt-1').style('color: var(--text-secondary)')
+                with ui.row().classes('w-full justify-end gap-2 mt-3'):
+                    ui.button('取消', on_click=restart_dialog.close).props('flat').classes(
+                        'text-xs').style('color: var(--text-secondary)')
+                    ui.button('确认重启', on_click=_on_confirm_restart).classes('text-xs').style(
+                        'background: #EF4444; color: white')
+
         # ====== 主容器：左右分栏 ======
         with ui.row().classes('w-full h-full'):
 
@@ -966,27 +1043,8 @@ if __name__ == "__main__":
     _out_dir = str(Path(state.CACHE_ROOT) / "demo_output")
     os.makedirs(_out_dir, exist_ok=True)
 
-    # 预加载 YOLO 模型到 GPU 并在主线程预热推理。
-    # 原因：检测在后台线程首次初始化 CUDA 上下文可能导致驱动层崩溃
-    # （Windows 事件日志: nvcuda64.dll 0xC0000409），预热后后台线程只复用主线程上下文。
-    _warmup_log = os.path.join(state.CACHE_ROOT, "warmup_status.log")
-    try:
-        import torch
-        from app import get_ball_model, get_device
-        model, _ = get_ball_model()
-        device = get_device()
-        if device != "cpu":
-            warm = np.zeros((640, 640, 3), dtype=np.uint8)
-            model.predict(warm, conf=0.5, imgsz=640, device=device, verbose=False)
-            torch.cuda.empty_cache()
-            _msg = f"WARMUP-OK: {device} context created on main thread"
-        else:
-            _msg = "WARMUP-SKIP: CUDA not available, using CPU"
-    except Exception as e:
-        _msg = f"WARMUP-FAIL: {e}"
-    with open(_warmup_log, "w", encoding="utf-8") as _f:
-        _f.write(_msg)
-    print(_msg, flush=True)
+    # YOLO/CUDA 自检已在模块加载时完成（见 _yolo_selfcheck），
+    # 失败/降级时页面顶部横幅提示。
 
     ui.run(host="127.0.0.1", port=7871, title="进球集锦助手",
            dark=True, reload=False)
