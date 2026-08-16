@@ -225,7 +225,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 min_circularity=float(min_circularity),
                 min_in_hoop_frames=int(min_in_hoop_frames),
                 auto_threshold=True)
-            _warmup_end = min(end, start + int(30.0 * max(fps, 1.0)))
+            # +1 修正：iter_frames 是半开区间 [start, end)，不 +1 时最后一帧为 29.97s < 30s，
+            # 预热完成判定（>=30s）永远差 1 帧不触发，自适应阈值从未算出、一直走 ABORT 回退
+            _warmup_end = min(end, start + int(30.0 * max(fps, 1.0)) + 1)
             _warmup_n = max(0, _warmup_end - start)
             _ws = time.time()
             _warmup_reader = VideoReader(state.video_state["path"])
@@ -299,7 +301,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         print(f"  Resolution  : {state.video_state.get('width', '?')}x{state.video_state.get('height', '?')}  @ {fps:.1f} fps")
         print(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
         if bool(auto_threshold):
-            print(f"  Auto-thresh : ON (已预热, 阈值={_effective_diff_threshold}, P95 中位={_warmup_info.get('warmup_p95_median') if _warmup_info else '?'})")
+            # 如实区分预热成功 / 预热失败回退，避免 ABORT 后仍显示"已预热"误导排查
+            _warmup_ok = (_warmup_info is not None
+                          and _warmup_info.get("auto_threshold_value") is not None)
+            if _warmup_ok:
+                print(f"  Auto-thresh : ON (已预热, 阈值={_effective_diff_threshold}, P95 中位={_warmup_info.get('warmup_p95_median')})")
+            else:
+                print(f"  Auto-thresh : ON (预热未完成, 回退固定阈值 {_effective_diff_threshold})")
         else:
             print(f"  Auto-thresh : OFF (固定阈值 {diff_threshold})")
         print(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
@@ -319,6 +327,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _last_ball_pos = None
         _stat_yolo_called = 0
         _stat_yolo_skipped = 0
+        _stat_yolo_failed = 0   # YOLO 推理异常次数（如驱动升级后 CUDA 上下文失效）
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
                 if state.cancel_requested:
@@ -355,8 +364,14 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                             ball_pos = (float(cx), float(cy), float(x1), float(y1),
                                         float(x2), float(y2), float(confs[best]))
                         _last_ball_pos = ball_pos
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 不能静默吞掉：CUDA 失效（如升级显卡驱动后未重启服务）会
+                        # 持续抛异常 → 球位置永远为空 → 所有进球被"YOLO确认"拒绝 → 0 进球空跑全程
+                        _stat_yolo_failed += 1
+                        if _stat_yolo_failed == 1:
+                            import traceback
+                            print(f"[YOLO ERROR] 首次推理失败: {e}\n{traceback.format_exc()}",
+                                  flush=True)
                 else:
                     # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效）
                     ball_pos = _last_ball_pos
@@ -397,6 +412,18 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                     _debug_last_processed = processed
         finally:
             reader.close()
+
+        # YOLO 失败率报警：推理环境损坏（如驱动升级后旧进程 CUDA 上下文失效）时，
+        # 结果不可信（所有候选进球都会被 YOLO 确认拒绝），直接报错让用户重启服务
+        if _stat_yolo_called >= 10 and _stat_yolo_failed >= _stat_yolo_called * 0.5:
+            _fail_pct = _stat_yolo_failed / _stat_yolo_called * 100
+            print(f"[YOLO FAIL] 推理失败率过高: {_stat_yolo_failed}/{_stat_yolo_called} "
+                  f"({_fail_pct:.0f}%)，本次结果不可信，已中止", flush=True)
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+            state.last_goals.clear()
+            return (f"❌ YOLO 推理失败率过高 ({_stat_yolo_failed}/{_stat_yolo_called})，"
+                    f"疑似 CUDA 环境失效（如升级显卡驱动后未重启服务），请重启服务后重试", False)
 
         _t1 = time.time()
         _detect_elapsed = _t1 - t0
@@ -465,6 +492,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             _yolo_total_scheduled = _stat_yolo_called + _stat_yolo_skipped
             _skip_rate = _stat_yolo_skipped / max(_yolo_total_scheduled, 1) * 100
             print(f"  YOLO 调用   : 实际推理 {_stat_yolo_called} 次  |  条件跳过 {_stat_yolo_skipped} 次  ({_skip_rate:.0f}% 跳过率)")
+        if _stat_yolo_failed > 0:
+            print(f"  YOLO 异常   : {_stat_yolo_failed}/{_stat_yolo_called} 次推理失败（详见 [YOLO ERROR] 日志）")
         print(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
               f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
         if detector.auto_threshold:
@@ -474,7 +503,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 else:
                     print(f"  AutoThresh  : value={detector._auto_threshold_value}  |  (P95 数据未保存)")
             else:
-                print(f"  AutoThresh  : 预热未结束  warmup_done={detector._warmup_done}")
+                print(f"  AutoThresh  : 预热未完成，实际使用固定阈值 {detector.diff_threshold}")
         else:
             print(f"  DiffThresh  : 固定 {diff_threshold}")
         print("=" * 68 + "\n", flush=True)
