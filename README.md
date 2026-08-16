@@ -10,7 +10,7 @@
 - **滚动基准帧**：每 60 秒自动更新基准帧，解决长视频光线/背景变化导致的漏检
 - **独立片段预览 + 人工确认**：每个检测到的进球生成独立 480p 预览片段，卡片列表支持预览 / 导出 / 删除
 - **原画质集锦输出 + GPU 加速**：集锦视频保持原视频分辨率，自动探测 NVIDIA NVENC 硬编码（cq=20），无 NVENC 回退 libx264（crf=18）接近无损；剪辑环节走 ffmpeg 直接切片转码
-- **智能设备适配**：有 NVIDIA GPU 自动用 CUDA 加速 + NVENC 硬编，无 GPU 自动回退 CPU 推理 + libx264 软编
+- **GPU 硬性要求 + 启动自检**：YOLO 推理必须使用 CUDA（不支持 CPU 降级）；服务启动时主线程执行真实 YOLO 推理自检，失败则页面顶部红色横幅提示并支持一键确认重启，避免跑完才发现 CUDA 异常
 - **提速模式开关（YOLO 每 3 帧推理）**：参数面板最顶部一键切换，默认每 2 帧（推荐，更准），勾选后每 3 帧推理（提速 ~27%，1st.mp4 实测进球数一致，漏检风险极低）
 - **条件跳过 YOLO（篮筐无运动时跳过推理）**：参数面板顶部开关，YOLO 推理帧先快速检查篮筐搜索区域是否有运动像素（1ms），无运动则跳过 YOLO 推理（省 ~60ms），实测跳过率 30-41%，总提速 40%（25 min → 15 min）
 - **视频兼容性强**：PyAV 读取，支持 HEVC 编码和 moov atom 后置的 mp4
@@ -18,7 +18,7 @@
 - **历史记录**：保存检测数据，支持加载后直接剪辑（无需重新检测）；片段缓存持久化，重启后复用已生成的预览片段
 - **文件夹批量模式**：加载文件夹自动扫描视频，逐个标定后一键批量识别，适合多场比赛录像
 - **NiceGUI 可视化界面**：深色主题卡片式布局，左侧功能区 + 右侧预览区，参数 / 集锦 / 历史折叠区；检测中可随时取消，进球列表出现后自动折叠功能区
-- **三级调试日志**：开始横幅（视频信息/帧率/YOLO step/阈值配置）+ 周期进度（30s 一次，瞬时/平均帧速/ETA/进球累计）+ 结束统计（YOLO 确认率/上下穿越/筐内/冷却拒绝/自动阈值统计量），日志实时写入 server.log 可溯源
+- **三级调试日志**：开始横幅（视频信息/帧率/YOLO step/阈值配置）+ 周期进度（30s 一次，瞬时/平均帧速/ETA/进球累计）+ 结束统计（YOLO 确认率/上下穿越/筐内/冷却拒绝/自动阈值统计量），日志按日写入 `cache/logs/server-YYYYMMDD.log`（保留 7 天）可溯源
 
 ## 性能实测
 
@@ -84,7 +84,7 @@
 
 - Windows / Linux
 - Python 3.10+
-- NVIDIA GPU（推荐 GTX 1650 4G 及以上，可选；无 GPU 自动回退 CPU 推理）
+- NVIDIA GPU（**必需**，推荐 GTX 1650 4G 及以上；CUDA 不可用时服务拒绝检测，不做 CPU 降级）
 - FFmpeg（含 libx264 + h264_nvenc，由 `imageio-ffmpeg` 自带）
 
 ## 快速开始
@@ -95,8 +95,7 @@
 pip install -r requirements.txt
 ```
 
-> GPU 用户需安装 CUDA 版 PyTorch：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`
-> CPU 用户：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`
+> 需安装 CUDA 版 PyTorch（GPU 为硬性要求）：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`
 
 ### 2. 准备权重
 
@@ -116,7 +115,7 @@ Windows 下可双击 `start.bat`，Linux 下运行 `./start.sh` 一键启动（�
 1. 左侧输入视频文件路径（支持超大文件，不走浏览器上传），点击「加载」
 2. 在预览画面点击 2 个点框选篮筐（同时采集无球基准帧），可「重置」重新标定
 3. 在「参数」折叠区最顶部可开启 **提速模式**（YOLO 每 3 帧推理一次，提速约 27%）；下方设置起始帧、结束帧、球检测置信度、最小进球间隔；高级项可开关自适应阈值（默认开，30s 预热后自动计算帧差阈值）或手动调帧差阈值、圆形度、进框帧数、最小斑块、搜索范围
-4. 点击「开始识别」→ 检测过程中右侧显示进度，控制台/`server.log` 每 30 秒打印一次瞬时帧速、ETA、累计进球数；完成后生成每个进球的独立预览片段
+4. 点击「开始识别」→ 检测过程中右侧显示进度，控制台/`cache/logs/server-YYYYMMDD.log` 每 30 秒打印一次瞬时帧速、ETA、累计进球数；完成后生成每个进球的独立预览片段
 5. 进球列表卡片上点击「预览」查看片段、「导出」下载单个片段、「删除」剔除误报
 6. 在「集锦」折叠区设置提前 / 延后 / 合并间隔，点击「导出合集」→ 生成原画质集锦并自动下载
 7. 历史记录保存在「历史」折叠区，点击选择后「加载」即可直接剪辑（无需重新检测）；命中缓存时复用已有片段，无需重新生成
@@ -145,11 +144,10 @@ basketball-clipper/
 │   ├── state.py            # detection_history.json 读写（历史记录 / 标定 / 进球时间戳）
 │   └── video_utils.py      # 视频元信息获取（fps/分辨率/时长）
 ├── cutter/ffmpeg_cutter.py # ffmpeg 剪辑（自动探测 NVENC，保持原画质）
-├── legacy/                 # 归档：旧 Gradio 界面、训练/标注/调试工具
 ├── weights/                # YOLO 权重（不入库，用 Release 发布）
-├── start.bat               # Windows 一键启动（自动清理 7871 端口）
-├── start.sh                # Linux 一键启动
-├── server.log              # 运行时日志（三级调试信息，便于复盘）
+├── start.bat               # Windows 一键启动（自动清理 7871 端口，日志按日轮转）
+├── start.sh                # Linux 一键启动（日志按日轮转）
+├── cache/logs/             # 运行时日志 server-YYYYMMDD.log（保留 7 天，三级调试信息）
 └── requirements.txt        # 依赖
 ```
 
@@ -169,7 +167,6 @@ flowchart TD
     W["weights/ · YOLO 模型权重"]
     CACHE["BBALL_CACHE_ROOT · 缓存目录<br/>历史 · 片段 · 输出缓存"]
     FF["ffmpeg · imageio-ffmpeg 内置"]
-    LG["legacy/ · 旧界面 · 训练/标注/调试工具"]
 
     UI --> DS
     DS --> App
@@ -191,7 +188,6 @@ flowchart TD
 - **services/state.py**：`detection_history.json` 读写（视频路径 / 标定 / 进球 / 保留进球 / 时间戳）
 - **cutter/ffmpeg_cutter.py**：按进球时间戳切片拼接，自动探测 `h264_nvenc`，命中则 NVENC 硬编，未命中回退 libx264
 - **外部资源**：`weights/`（模型权重）、缓存目录（历史记录 / 片段 / 输出，默认 `~/basketball-project/cache`，可通过 `BBALL_CACHE_ROOT` 环境变量自定义）、ffmpeg（imageio-ffmpeg 内置）
-- **legacy/**：仅归档保留，不参与运行
 
 ## 进球检测算法详解
 
@@ -279,7 +275,7 @@ diff 触发候选后，分三条路径注册进球，每条路径均需通过 **
 
 ### YOLO 篮球检测
 
-- **模型**：自定义训练的 `basketball_custom.pt`（基于 YOLOv8n），由 `app.py` 懒加载并搬移到 GPU（无 GPU 时使用 CPU）
+- **模型**：自定义训练的 `basketball_custom.pt`（基于 YOLOv8n），由 `app.py` 懒加载并搬移到 GPU（GPU 为硬性要求，无 CUDA 时拒绝推理）
 - **推理分辨率**：`imgsz=960`（默认，平衡小目标检出与推理速度；基准 1280 降 ~20% 速度）
 - **类别预过滤**：`classes=[0]`，仅保留篮球类后再做 NMS，减少后处理开销（非篮球类即使被检测到也直接丢弃）
 - **置信度阈值**：默认 0.3（可调 0.1-0.9）
@@ -326,27 +322,11 @@ diff 触发候选后，分三条路径注册进球，每条路径均需通过 **
 - 音频：AAC 128k
 - 合并逻辑：相邻片段间隔小于 `min_gap`（默认 8 秒）则自动合并
 
-## 模型训练（工具已归档至 legacy/）
+## 模型训练（自定义权重）
 
-训练与标注工具不再参与主程序运行，已归档到 `legacy/` 目录，按需使用：
+标注 / 训练工具（旧 Gradio 界面、`label_tool.py`、`auto_train.py` 等）已从仓库移除以精简主程序；如需追溯，可从 git 历史中的 `legacy/` 目录找回（最后版本：提交 `cb66637` 之前）。当前仓库只保留推理所需代码。
 
-### 1. 手动标注（推荐，质量高）
-
-```bash
-python legacy/label_tool.py --video "video.mp4" --frames 200
-```
-
-快捷键：`n` 下一帧 / `p` 上一帧 / `s` 跳过 / `u` 撤销 / `a` 预标注 / `d` 删除 / `w` 保存 / `q` 保存退出
-
-### 2. 自动训练（伪标注，快速但需人工清洗）
-
-```bash
-python legacy/auto_train.py --video "video.mp4" --frames 300 --epochs 50
-```
-
-自动抽帧 → 颜色 + 形状约束伪标注 → 训练 → 输出 `weights/basketball_custom.pt`
-
-### 3. 训练建议
+### 训练建议
 
 - 推理分辨率 `imgsz=960`（默认，兼顾速度与小目标检出），要求更高可用 1280
 - 置信度阈值 `0.3-0.4` 平衡检出率与误报
@@ -392,6 +372,30 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 推理：YOLOv8 / 自定义篮球权重，imgsz=960，`classes=[0]` 后处理预过滤
 
 ## 更新日志
+
+### 2026.08.16 稳定性加固版本（提交 `fe4d53f` ~ `86881f9`）
+
+聚焦运行时故障排查与硬性依赖收敛：杜绝静默失败，故障在第一时间暴露。
+
+#### 🔴 关键修复
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| `2026.08.15-3rd_720p.mp4` 全程 0 进球（872 候选全被否决，帧速异常 128 f/s） | 服务长跑期间升级 NVIDIA 驱动导致 CUDA 上下文失效，YOLO 推理异常被 `except: pass` 静默吞掉 | YOLO 推理异常带堆栈写入日志并计数，失败率 >50% 中止检测并提示重启服务 |
+| 自适应阈值预热永不完成，回退固定阈值 15 | 解码器帧号存在 +1 偏移，按帧号换算时间的判定永远差一帧 | 预热完成改为**样本计数判定**（`len(_warmup_p95s) >= int(target_sec × fps)`），与帧号偏移彻底解耦 |
+| 预热 ABORT 时日志仍打印"已预热"误导排查 | 状态分支文案未区分 | 如实输出 ABORT 状态 |
+| `start.bat` 启动报 `& '' -u ...` 错误 | LF 行尾导致 cmd.exe 变量解析失败 + 中文注释 GBK 解码问题 | 转 CRLF 行尾、注释改英文；`start.sh` 补记可执行位 |
+
+#### 🚫 GPU 硬性要求（用户决策）
+
+- 移除全部 CPU 降级代码：`get_device()` 返回 cpu 时检测入口直接拒绝执行
+- 启动自检（主线程真实 YOLO 推理，日志 `WARMUP-OK`）失败 → 页面顶部红色横幅 + 确认重启按钮（`os.execv` 原地重启）
+- 动机：CPU 推理慢约 10 倍且极易被误认为服务正常；驱动升级后必须重启服务，自检把这类问题拦在启动阶段
+
+#### 🧹 仓库精简
+
+- 删除 `legacy/`（旧 Gradio 界面、训练/标注/调试工具，-4171 行），需要时可从 git 历史找回
+- 删除本地残留的 `basketball-clipper/` 旧副本（含嵌套 `.git`，存在误启动旧代码的风险）
 
 ### 2026.08.16 流水线版本（提交 `feat/pipeline`）
 
