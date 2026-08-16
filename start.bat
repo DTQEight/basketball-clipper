@@ -48,7 +48,7 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENIN
 )
 if "!_KILLED!"=="1" timeout /t 2 /nobreak >nul
 
-REM --- Start service (stdout/stderr -> console + log file; PowerShell 内置 Tee，不依赖外部 tee)
+REM --- Start service (stdout/stderr -> console + log file, PowerShell built-in Tee)
 cd /d "%SCRIPT_DIR%"
 echo Starting service...
 powershell -NoProfile -Command "& '%PYTHON%' -u demo_nicegui.py 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
