@@ -3,6 +3,7 @@
 从原 demo_nicegui.py 抽离，通过 services.state 模块访问/修改运行时状态，
 UI 层只需调用本模块的函数并传入参数。
 """
+import math
 import os
 import time
 from pathlib import Path
@@ -225,9 +226,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 min_circularity=float(min_circularity),
                 min_in_hoop_frames=int(min_in_hoop_frames),
                 auto_threshold=True)
-            # +1 修正：iter_frames 是半开区间 [start, end)，不 +1 时最后一帧为 29.97s < 30s，
-            # 预热完成判定（>=30s）永远差 1 帧不触发，自适应阈值从未算出、一直走 ABORT 回退
-            _warmup_end = min(end, start + int(30.0 * max(fps, 1.0)) + 1)
+            # ceil 修正：iter_frames 是半开区间 [start, end)，需要保证区间内存在
+            # 满足 (fidx-start)/fps >= 30s 的帧，预热完成判定才能触发。
+            # fps=30.0 时 int(900)+1=901 即可（900/30=30.0s 但取不到）；
+            # fps=30.04 时 int(901.2)+1=902 → 902/30.04=30.03s ✓
+            # 若用 int+1 会得到 901 → 29.99s < 30s，预热永远差 1 帧不触发（ABORT 回退）
+            _warmup_end = min(end, start + int(math.ceil(30.0 * max(fps, 1.0))) + 1)
             _warmup_n = max(0, _warmup_end - start)
             _ws = time.time()
             _warmup_reader = VideoReader(state.video_state["path"])
