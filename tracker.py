@@ -343,8 +343,12 @@ class GoalDetector:
 
         # ====== 自适应阈值预热：只采样不判定 ======
         if self.auto_threshold and not self._warmup_done:
-            warmup_sec = (frame_idx - self._warmup_start_frame) / fps
-            if warmup_sec >= self._warmup_target_sec and len(self._warmup_p95s) > 0:
+            # 按样本计数判定，不按帧号换算时间：
+            # iter_frames 的 fidx 由 pts 浮点换算，可能整体偏移（首帧从 1 起而非 0），
+            # 用 (frame_idx - start)/fps >= 30s 判定会因偏移差一帧而永远不触发。
+            # 样本数 = 真实数据量，N 个样本 @fps 就是 N/fps 秒，与帧号偏移无关。
+            _n_needed = int(self._warmup_target_sec * max(fps, 1.0))
+            if len(self._warmup_p95s) >= _n_needed:
                 # 预热结束：阈值 = median(P95) + 8，clamp 到 [8, 50]
                 median_p95 = float(np.median(self._warmup_p95s))
                 auto_thr = int(median_p95 + 8)
