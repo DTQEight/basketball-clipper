@@ -2,7 +2,8 @@
 
 - 临时目录 / 输出目录统一走 BBALL_CACHE_ROOT（跨平台）
 - subprocess 加 creationflags=0x08000000 绕开 Windows 沙箱限制
-- concat 改用 re-encode 避免各片段编码不一致拼接失败
+- concat 优先 -c copy 流拷贝（各片段由同一命令模板切出，参数天然一致），
+  流拷贝失败时回退整体 re-encode 兜底
 - GPU 硬编：优先使用 h264_nvenc（NVIDIA GPU 加速），不可用则回退 libx264
 """
 import os
@@ -174,9 +175,19 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
             p_norm = os.path.abspath(p).replace("\\", "/")
             f.write(f"file '{p_norm}'\n")
 
-    # 拼接：用 re-encode 确保各片段编码一致
-    _report(90, '正在拼接集锦视频...')
-    cmd = [
+    # 拼接：各片段由同一命令模板 + 同一组 encode_args 切出，编码参数天然一致，
+    # 优先 -c copy 流拷贝（秒级完成、零质量损失）；失败时回退整体重编码兜底。
+    # 旧实现无条件 re-encode，拼接时长与集锦总时长成正比（十几分钟集锦需多花
+    # 数分钟），且二次编码带来代际质量损失，与"接近无损"目标相悖。
+    _report(90, '正在拼接集锦视频（流拷贝）...')
+    concat_copy_cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", list_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    concat_encode_cmd = [
         ffmpeg, "-y", "-loglevel", "error",
         "-f", "concat", "-safe", "0", "-i", list_path,
     ] + encode_args + [
@@ -185,11 +196,25 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         output_path,
     ]
     try:
-        subprocess.run(cmd, check=True, creationflags=_SBOX, timeout=1800)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print(f"[剪辑] 拼接失败: {e}", flush=True)
-        _cleanup_tmp(clip_files, list_path)
-        return None
+        # 流拷贝不做编解码，600s 超时已非常宽裕
+        subprocess.run(concat_copy_cmd, check=True, creationflags=_SBOX, timeout=600)
+    except subprocess.TimeoutExpired:
+        print("[剪辑] 流拷贝拼接超时（>600s），回退重编码拼接...", flush=True)
+        try:
+            subprocess.run(concat_encode_cmd, check=True, creationflags=_SBOX, timeout=1800)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"[剪辑] 拼接失败: {e}", flush=True)
+            _cleanup_tmp(clip_files, list_path)
+            return None
+    except subprocess.CalledProcessError:
+        # 流拷贝失败（个别片段参数异常，如源视频中途变分辨率）→ 回退重编码
+        print("[剪辑] 流拷贝拼接失败，回退重编码拼接...", flush=True)
+        try:
+            subprocess.run(concat_encode_cmd, check=True, creationflags=_SBOX, timeout=1800)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"[剪辑] 拼接失败: {e}", flush=True)
+            _cleanup_tmp(clip_files, list_path)
+            return None
     _report(98, '清理临时文件...')
 
     # 清理临时文件

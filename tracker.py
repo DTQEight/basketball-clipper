@@ -94,23 +94,25 @@ class GoalDetector:
         self._warmup_p95_median = None        # 预热结束时保存的 P95 中位数（诊断用，避免列表被清空）
         self._warmup_sample_count = 0         # 预热期实际采样的帧数（诊断用）
 
-        # 基准帧（灰度）
+        # 搜索区域（篮筐周边扩展 margin）
+        # 注意：必须在基准帧初始化之前定义 —— set_baseline/_roi_gray 依赖这些坐标
+        self.search_x1 = max(0, self.hoop_x1 - search_margin)
+        self.search_y1 = max(0, self.hoop_y1 - search_margin)
+        self.search_x2 = self.hoop_x2 + search_margin
+        self.search_y2 = self.hoop_y2 + search_margin
+
+        # 基准帧（只存搜索区域 ROI 的灰度模糊图，见 _roi_gray）
         self.baseline_gray = None
         self.last_baseline_frame_idx = -1  # 上次更新基准帧的帧号
         self.baseline_update_count = 0     # 基准帧更新次数（诊断用）
         # 滚动基准帧候选：在更新间隔内持续寻找运动量最小的帧作为下一个基准帧
         # 避免把球/球员拍进基准帧导致 diff 失效
+        # （只存 ROI 灰度图 ~90KB，不拷整帧 BGR ~6MB）
         self._baseline_candidate_frame = None
         self._baseline_candidate_diff = float("inf")
         self._baseline_candidate_idx = -1
         if baseline_frame is not None:
             self.set_baseline(baseline_frame)
-
-        # 搜索区域（篮筐周边扩展 margin）
-        self.search_x1 = max(0, self.hoop_x1 - search_margin)
-        self.search_y1 = max(0, self.hoop_y1 - search_margin)
-        self.search_x2 = self.hoop_x2 + search_margin
-        self.search_y2 = self.hoop_y2 + search_margin
 
         # 形态学 kernel 缓存：_find_moving_blob 每帧都用，__init__ 创建一次复用
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -155,16 +157,31 @@ class GoalDetector:
             "baseline_updates": 0, # 滚动基准帧更新次数
         }
 
+    def _roi_gray(self, frame):
+        """裁剪篮筐搜索区域 → 灰度 → 高斯模糊。
+
+        差分计算只关心搜索区域（1080p 典型篮筐下约占整帧 5% 面积），
+        先裁 ROI 再做 cvtColor/GaussianBlur，避免整帧处理浪费 ~95% 计算量。
+        （与基准帧 baseline_gray 的存储格式保持一致：ROI 灰度模糊图）
+        """
+        sy2 = min(self.search_y2, frame.shape[0])
+        sx2 = min(self.search_x2, frame.shape[1])
+        roi = frame[self.search_y1:sy2, self.search_x1:sx2]
+        if len(roi.shape) == 3:
+            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        return cv2.GaussianBlur(roi, (5, 5), 0)
+
     def set_baseline(self, frame):
-        """设置基准帧。"""
+        """设置基准帧（整帧 BGR 输入，内部只保留搜索区域 ROI 的灰度模糊图）。"""
         if frame is None:
             return
-        if len(frame.shape) == 3:
-            self.baseline_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        else:
-            self.baseline_gray = frame.copy()
-        # 高斯模糊降噪
-        self.baseline_gray = cv2.GaussianBlur(self.baseline_gray, (5, 5), 0)
+        self.baseline_gray = self._roi_gray(frame)
+
+    def _set_baseline_roi(self, roi):
+        """直接用已处理好的 ROI 灰度图设置基准（滚动基准候选复用，避免重复处理）。"""
+        if roi is None:
+            return
+        self.baseline_gray = roi.copy()
 
     def has_motion_near_hoop(self, frame, threshold=None):
         """快速检查篮筐搜索区域是否有运动像素（用于条件跳过 YOLO）。
@@ -174,17 +191,10 @@ class GoalDetector:
         """
         if self.baseline_gray is None:
             return True  # 基准帧还没设，不跳过
-        # 裁剪 ROI
-        sy2 = min(self.search_y2, frame.shape[0])
-        sx2 = min(self.search_x2, frame.shape[1])
-        frame_roi = frame[self.search_y1:sy2, self.search_x1:sx2]
-        if frame_roi.size == 0:
+        frame_roi = self._roi_gray(frame)
+        if frame_roi.size == 0 or frame_roi.shape != self.baseline_gray.shape:
             return True
-        if len(frame_roi.shape) == 3:
-            frame_roi = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY)
-        frame_roi = cv2.GaussianBlur(frame_roi, (5, 5), 0)
-        base_roi = self.baseline_gray[self.search_y1:sy2, self.search_x1:sx2]
-        diff = cv2.absdiff(frame_roi, base_roi)
+        diff = cv2.absdiff(frame_roi, self.baseline_gray)
         thr = threshold if threshold is not None else (self._auto_threshold_value or self.diff_threshold)
         _, diff_bin = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
         # 运动像素超过搜索区域总像素的 1% 才算有运动
@@ -192,8 +202,11 @@ class GoalDetector:
         _motion_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
         return _motion_ratio > 0.01
 
-    def _find_moving_blob(self, frame_gray):
-        """在篮筐周边搜索区域找最大运动连通域。
+    def _find_moving_blob(self, frame_roi_gray):
+        """在篮筐周边搜索区域 ROI 内找最大运动连通域。
+
+        frame_roi_gray: 由 _roi_gray 产出的搜索区域灰度模糊图
+                        （与 baseline_gray 同格式，直接做差分）
 
         过滤条件：
           1. 面积在 [min_blob_area, max_blob_area] 范围内
@@ -206,14 +219,8 @@ class GoalDetector:
         if self.baseline_gray is None:
             return None
 
-        h, w = frame_gray.shape[:2]
-        # 限制搜索区域不超过画面
-        sx2 = min(self.search_x2, w)
-        sy2 = min(self.search_y2, h)
-
-        # 提取搜索区域 ROI
-        curr_roi = frame_gray[self.search_y1:sy2, self.search_x1:sx2]
-        base_roi = self.baseline_gray[self.search_y1:sy2, self.search_x1:sx2]
+        curr_roi = frame_roi_gray
+        base_roi = self.baseline_gray
 
         if curr_roi.size == 0 or base_roi.size == 0:
             return None
@@ -314,12 +321,9 @@ class GoalDetector:
         if self._warmup_start_frame < 0:
             self._warmup_start_frame = frame_idx
 
-        # 转灰度 + 模糊
-        if len(frame.shape) == 3:
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        else:
-            frame_gray = frame
-        frame_gray = cv2.GaussianBlur(frame_gray, (5, 5), 0)
+        # 搜索区域 ROI：灰度 + 模糊（只处理篮筐周边 ~5% 画面，不碰整帧，
+        # 旧实现对整幅 1080p 做 cvtColor+GaussianBlur 后又丢弃 ~95% 结果）
+        frame_roi = self._roi_gray(frame)
 
         # 冷却期检查
         if self.last_goal_frame >= 0:
@@ -339,7 +343,7 @@ class GoalDetector:
             self.ball_pos_history.pop(0)
 
         # 在篮筐周边找运动斑块
-        blob = self._find_moving_blob(frame_gray)
+        blob = self._find_moving_blob(frame_roi)
 
         # ====== 自适应阈值预热：只采样不判定 ======
         if self.auto_threshold and not self._warmup_done:
@@ -370,8 +374,10 @@ class GoalDetector:
         if self.rolling_baseline_sec > 0 and self.last_baseline_frame_idx >= 0:
             gap_sec = (frame_idx - self.last_baseline_frame_idx) / fps
             # 更新候选基准帧（选 diff 最小的帧 = 运动量最小的帧）
+            # 只存 ROI 灰度图（与 baseline_gray 同格式，~90KB），
+            # 旧实现 frame.copy() 拷整帧 BGR ~6MB，60s 窗口内可能拷贝上百次
             if self.last_diff_ratio < self._baseline_candidate_diff:
-                self._baseline_candidate_frame = frame.copy()
+                self._baseline_candidate_frame = frame_roi.copy()
                 self._baseline_candidate_diff = self.last_diff_ratio
                 self._baseline_candidate_idx = frame_idx
             # 触发条件1：时间间隔（默认 60 秒）
@@ -382,7 +388,8 @@ class GoalDetector:
             if time_trigger or persistent_trigger:
                 cand = self._baseline_candidate_frame
                 if cand is not None:
-                    self.set_baseline(cand)
+                    # 候选已是 ROI 灰度模糊图，直接采用（无需再处理整帧）
+                    self._set_baseline_roi(cand)
                     self.last_baseline_frame_idx = self._baseline_candidate_idx
                 else:
                     self.set_baseline(frame)
