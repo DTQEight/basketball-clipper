@@ -143,7 +143,7 @@ basketball-clipper/
 │   ├── detection.py        # run_detect / run_batch_detect：逐帧检测循环 + 三级调试日志 + 进度回调
 │   ├── state.py            # detection_history.json 读写（历史记录 / 标定 / 进球时间戳）
 │   └── video_utils.py      # 视频元信息获取（fps/分辨率/时长）
-├── cutter/ffmpeg_cutter.py # ffmpeg 剪辑（自动探测 NVENC，保持原画质）
+├── cutter/ffmpeg_cutter.py # ffmpeg 剪辑（自动探测 NVENC；切片转码 + 流拷贝拼接，保持原画质）
 ├── weights/                # YOLO 权重（不入库，用 Release 发布）
 ├── start.bat               # Windows 一键启动（自动清理 7871 端口，日志按日轮转）
 ├── start.sh                # Linux 一键启动（日志按日轮转）
@@ -319,6 +319,7 @@ diff 触发候选后，分三条路径注册进球，每条路径均需通过 **
   - NVENC 参数：`-preset p4 -rc vbr -cq 20`
   - libx264 回退：`-crf 18`
 - 质量：NVENC cq=20 / libx264 crf=18（接近无损）
+- 拼接：各切片参数一致，concat 优先流拷贝（`-c copy`，秒级完成、无二次质量损失），失败自动回退整体重编码
 - 音频：AAC 128k
 - 合并逻辑：相邻片段间隔小于 `min_gap`（默认 8 秒）则自动合并
 
@@ -372,6 +373,29 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 推理：YOLOv8 / 自定义篮球权重，imgsz=960，`classes=[0]` 后处理预过滤
 
 ## 更新日志
+
+### 2026.08.17 性能优化版本（ad 分支，提交 `d51d4cd`）
+
+四项性能优化，聚焦检测循环与剪辑管线（对应代码审核报告 #6 #8 #9 #10）：
+
+#### ⚡ 优化项
+
+| 模块 | 优化 | 收益 |
+|------|------|------|
+| `tracker.py` | **帧处理 ROI 化**：新增 `_roi_gray()`，先裁剪篮筐搜索区域再灰度+模糊，替代旧的整帧 `cvtColor+GaussianBlur`（结果 ~95% 被丢弃）；基准帧只存 ROI 灰度图；滚动基准候选拷贝从整帧 ~6MB 降为 ROI ~90KB | 合成帧微基准 1.09ms → 0.10ms/帧（**10.9×**），45k 帧视频该段估算省 ~0.7min；整程估算省 3-4min（1080p） |
+| `services/detection.py` | **device 循环外缓存**：`get_device()` 进入检测循环前算一次复用，不再每次推理重复 `import torch + is_available`（全程 ~2 万次冗余调用） | 微秒级/次，主要收益是语义清晰 |
+| `cutter/ffmpeg_cutter.py` | **concat 流拷贝**：各切片由同一命令模板+同一组 encode_args 产出，参数天然一致，拼接优先 `-c copy`（秒级、零代际质量损失）；失败/超时自动回退原 re-encode 兜底 | 集锦导出耗时**约减半**，且画质严格更优（消除二次编码损失） |
+| `services/detection.py` | **预览片段并行生成**：`ThreadPoolExecutor` 并行跑 ffmpeg（NVENC 限 2 路——消费卡驱动会话限制；libx264 3 路），进度回调保持单线程语义，完成后按进球序排序 | 预览阶段约 **2.5-3×** 提速（50 球 ~2min → ~40s，估算） |
+
+#### 🔧 附带修复
+
+- `tracker.py` `__init__` 初始化顺序：搜索区域坐标必须先于 `set_baseline` 定义（ROI 化后 `set_baseline` 依赖这些坐标，旧顺序会 `AttributeError`）
+
+#### ✅ 验证
+
+- `py_compile` 三文件语法通过
+- 合成帧冒烟测试 4 项全过：baseline ROI 形状（310×310 = 整帧 4.6%）/ 静帧与有球运动检测 / loose+YOLO 进球路径正常注册 / 滚动基准帧更新正常
+- 微基准：ROI 化段落 10.9×；其余为估算值，**建议真实视频跑一轮对比（进球数 + 耗时）后再合入 main**
 
 ### 2026.08.16 稳定性加固版本（提交 `fe4d53f` ~ `86881f9`）
 
