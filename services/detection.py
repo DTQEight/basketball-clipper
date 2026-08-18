@@ -425,6 +425,11 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _ball_classes = get_ball_class_ids(model, _weights_path)
         if not _ball_classes:
             # names 解析不出球类别 = 权重不可信：拒绝检测而不是把 person 当球确认
+            # 同步清空旧结果：同一视频重跑失败时 UI 卡片不应残留上一次的
+            # 进球/片段（与 YOLO 熔断、异常路径的清理策略对齐）
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+            state.last_goals.clear()
             return "❌ 无法从模型类别表识别球类别（model.names 异常），请检查权重文件", False
 
         t0 = time.time()

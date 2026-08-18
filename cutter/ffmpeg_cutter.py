@@ -317,6 +317,15 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                 subprocess.run(concat_encode_cmd, check=True, capture_output=True,
                                text=True, creationflags=_SBOX, timeout=1800)
 
+        def _remove_incomplete_output():
+            # ffmpeg -y 失败中断会在 output_path 留下半截文件（无 moov/索引损坏），
+            # 播放器无法打开却占用磁盘：流拷贝与重编码均失败时主动清理，
+            # 避免 demo_output 目录残留无效视频被误当成品
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
         try:
             # 流拷贝不做编解码，600s 超时已非常宽裕
             subprocess.run(concat_copy_cmd, check=True, capture_output=True, text=True,
@@ -327,6 +336,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                 _run_concat_encode()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 _log.warning(f"[剪辑] 拼接失败: {_stderr_tail(e) or e}")
+                _remove_incomplete_output()
                 return None
         except subprocess.CalledProcessError as e:
             # 流拷贝失败（个别片段参数异常，如源视频中途变分辨率）→ 回退重编码
@@ -335,6 +345,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                 _run_concat_encode()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
                 _log.warning(f"[剪辑] 拼接失败: {_stderr_tail(e2) or e2}")
+                _remove_incomplete_output()
                 return None
         _report(98, '清理临时文件...')
     finally:
