@@ -8,7 +8,7 @@ import cv2
 from . import state
 
 
-def frame_to_base64(frame):
+def frame_to_base64(frame) -> "str | None":
     """将 cv2 帧转为 base64 PNG data URI。
 
     输入约定为 RGB（与 load_video / preview_frame / click_calibrate
@@ -24,7 +24,7 @@ def frame_to_base64(frame):
     return f'data:image/png;base64,{b64}'
 
 
-def scan_video_files(folder):
+def scan_video_files(folder: str) -> list:
     """扫描文件夹内的视频文件，按自然顺序排序。"""
     folder = folder.strip().strip('"').strip("'")
     if not folder or not os.path.isdir(folder):

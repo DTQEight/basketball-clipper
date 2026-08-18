@@ -13,9 +13,6 @@ numpy>=1.24.0
 # 视频转码（自带含 libx264 + nvenc 的 ffmpeg）
 imageio-ffmpeg>=0.4.9
 
-# 配置文件
-pyyaml>=6.0
-
 # Web 界面
 nicegui>=1.4.0
 

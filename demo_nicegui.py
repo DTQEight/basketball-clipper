@@ -76,7 +76,7 @@ def _yolo_selfcheck():
             f.write(_msg)
     except Exception:
         pass
-    print(_msg, flush=True)
+    print(_msg, flush=True)  # 自检在 setup_logging 之前执行，直接 print（start 脚本会 tee）
 
 
 _yolo_selfcheck()
@@ -640,7 +640,7 @@ def main_page():
     async def _on_batch_run():
         if _busy["task"] == 'batch':
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
-            state.cancel_requested = True
+            state.cancel_event.set()
             batch_run_btn.set_text('正在取消...')
             batch_run_btn.disable()
             return
@@ -649,7 +649,7 @@ def main_page():
             return
         if not _try_acquire('batch'):
             return
-        state.cancel_requested = False
+        state.cancel_event.clear()
         batch_progress_strip.classes(remove='hidden')  # 显示常驻迷你进度条
         batch_mini_bar.set_value(0)
         batch_mini_text.set_text('后台识别中')
@@ -758,14 +758,14 @@ def main_page():
     async def _on_detect():
         if _busy["task"] == 'detect':
             # 检测中点击 → 请求取消，run_detect 轮询后中断
-            state.cancel_requested = True
+            state.cancel_event.set()
             detect_btn.set_text('正在取消...')
             detect_btn.disable()
             return
         if not _try_acquire('detect'):
             return
         _cards_video["path"] = None  # 单视频检测结果显示在全局模式
-        state.cancel_requested = False
+        state.cancel_event.clear()
         detect_btn.set_text('取消')
         detect_btn.enable()
         # 显示进度条
@@ -804,7 +804,7 @@ def main_page():
             _busy["task"] = None
         # 隐藏进度条，显示预览图（无论成功/失败/取消，都回到一致的 preview 态，避免视频重叠）
         _show_right_pane('preview')
-        if state.cancel_requested:
+        if state.cancel_event.is_set():
             _set_status(status, 'info')  # 用户取消属中性提示，不用红色
             _refresh_result_cards()      # 同步清空列表
         else:
@@ -843,9 +843,11 @@ def main_page():
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
         for i, clip in enumerate(clips):
             ts = clip["ts"]
-            # 预览片段实际为进球时刻 ±3s（见 _generate_preview_clips 的 clip_half）
-            start_ts = max(0.0, ts - 3)
-            end_ts = ts + 3
+            # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常量，
+            # 旧实现两处各写一个 3，改一处必漏另一处）
+            half = detection.PREVIEW_CLIP_HALF_SEC
+            start_ts = max(0.0, ts - half)
+            end_ts = ts + half
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
             with result_container:
@@ -1043,8 +1045,13 @@ if __name__ == "__main__":
     _out_dir = str(Path(state.CACHE_ROOT) / "demo_output")
     os.makedirs(_out_dir, exist_ok=True)
 
+    # 日志落盘（控制台 + cache/logs/app.log 按日轮转）：
+    # 不再依赖 start 脚本 tee，直接 python demo_nicegui.py 启动也有日志文件
+    state.setup_logging()
+
     # YOLO/CUDA 自检已在模块加载时完成（见 _yolo_selfcheck），
     # 失败/降级时页面顶部横幅提示。
 
-    ui.run(host="127.0.0.1", port=7871, title="进球集锦助手",
-           dark=True, reload=False)
+    # 端口可用 BBALL_PORT 环境变量覆盖（start.sh / start.bat 同源读取）
+    ui.run(host="127.0.0.1", port=int(os.environ.get("BBALL_PORT", "7871")),
+           title="进球集锦助手", dark=True, reload=False)

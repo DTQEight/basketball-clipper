@@ -17,6 +17,13 @@
 
 import cv2
 import numpy as np
+from collections import deque
+
+# 自适应阈值预热时长（秒）：前 N 秒逐帧收集 diff P95 统计量
+WARMUP_TARGET_SEC = 30.0
+# 条件跳过 YOLO 的运动判定：运动像素占搜索区域总像素的最小比例
+# （球经过时通常 2000+ 像素，噪声/光线微变通常 <200 像素）
+MOTION_PIXEL_RATIO = 0.01
 
 
 class GoalDetector:
@@ -86,7 +93,7 @@ class GoalDetector:
         # 自适应阈值：预热期收集 P95，结束时自动计算 diff_threshold
         self.auto_threshold = bool(auto_threshold)
         self._warmup_p95s = []                # 预热期每帧 P95（0-255）
-        self._warmup_target_sec = 30.0        # 预热时长（秒）
+        self._warmup_target_sec = WARMUP_TARGET_SEC  # 预热时长（秒）
         self._warmup_done = not self.auto_threshold  # 关闭自适应时视为已完成
         self._warmup_start_frame = -1         # 预热起始帧（首次 feed 时设置）
         self._user_diff_threshold = int(diff_threshold)  # 保存用户设定值
@@ -122,7 +129,7 @@ class GoalDetector:
         self.blob_in_hoop = False      # 斑块是否在篮筐框内
         self.blob_in_hoop_frames = 0   # 斑块在框内的连续帧数
         self.blob_persistent_frames = 0  # 斑块持续帧数（有运动物体的连续帧）
-        self.blob_history = []         # 斑块 y 坐标历史
+        self.blob_history = deque(maxlen=30)  # 斑块 y 坐标历史（maxlen 自动淘汰旧值）
         self.last_blob_box = None      # 上一帧斑块位置
         self.last_above_frame = -999   # 上次斑块在篮筐上方的帧号
         self.last_in_hoop_frame = -999 # 上次斑块在篮筐框内的帧号
@@ -135,7 +142,8 @@ class GoalDetector:
 
         # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
         # 格式: [(frame_idx, cx, cy), ...]，保留最近 yolo_window_frames 帧
-        self.ball_pos_history = []
+        # deque：旧实现 list.pop(0) 为 O(n)，popleft 为 O(1)
+        self.ball_pos_history = deque()
         self.yolo_window_frames = 10   # 时间窗口大小（±10帧 ≈ 0.33秒 @30fps）
 
         # 诊断计数器
@@ -171,7 +179,7 @@ class GoalDetector:
             roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         return cv2.GaussianBlur(roi, (5, 5), 0)
 
-    def set_baseline(self, frame):
+    def set_baseline(self, frame) -> None:
         """设置基准帧（整帧 BGR 输入，内部只保留搜索区域 ROI 的灰度模糊图）。"""
         if frame is None:
             return
@@ -183,7 +191,7 @@ class GoalDetector:
             return
         self.baseline_gray = roi.copy()
 
-    def has_motion_near_hoop(self, frame, threshold=None):
+    def has_motion_near_hoop(self, frame, threshold: int | None = None) -> bool:
         """快速检查篮筐搜索区域是否有运动像素（用于条件跳过 YOLO）。
 
         只做裁剪 + absdiff + countNonZero，不做形态学/连通域，~1ms。
@@ -197,10 +205,9 @@ class GoalDetector:
         diff = cv2.absdiff(frame_roi, self.baseline_gray)
         thr = threshold if threshold is not None else (self._auto_threshold_value or self.diff_threshold)
         _, diff_bin = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
-        # 运动像素超过搜索区域总像素的 1% 才算有运动
-        # 球经过时通常 2000+ 像素，噪声/光线微变通常 <200 像素
+        # 运动像素超过搜索区域总像素的 MOTION_PIXEL_RATIO 才算有运动
         _motion_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
-        return _motion_ratio > 0.01
+        return _motion_ratio > MOTION_PIXEL_RATIO
 
     def _find_moving_blob(self, frame_roi_gray):
         """在篮筐周边搜索区域 ROI 内找最大运动连通域。
@@ -291,7 +298,7 @@ class GoalDetector:
 
         return best_blob
 
-    def feed(self, ball_pos, frame_idx, fps, frame=None):
+    def feed(self, ball_pos, frame_idx: int, fps: float, frame=None):
         """喂入一帧数据。
 
         ball_pos: YOLO 球位置 (cx, cy, x1, y1, x2, y2, conf) 或 None
@@ -340,7 +347,7 @@ class GoalDetector:
         # 保留最近 yolo_window_frames 帧
         cutoff = frame_idx - self.yolo_window_frames
         while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
-            self.ball_pos_history.pop(0)
+            self.ball_pos_history.popleft()
 
         # 在篮筐周边找运动斑块
         blob = self._find_moving_blob(frame_roi)
@@ -407,7 +414,7 @@ class GoalDetector:
             # 没检测到运动物体，保持状态但衰减历史
             self.diag["reject_no_blob"] += 1
             if len(self.blob_history) > 5:
-                self.blob_history.pop(0)
+                self.blob_history.popleft()
             self.blob_in_hoop_frames = 0
             self.blob_persistent_frames = 0  # 无斑块，重置持续计数
             self.last_blob_box = None
@@ -418,10 +425,8 @@ class GoalDetector:
         cx, cy, bx1, by1, bx2, by2, area = blob
         self.last_blob_box = (bx1, by1, bx2, by2)
 
-        # 记录斑块 y 历史
+        # 记录斑块 y 历史（deque(maxlen=30) 自动淘汰最旧记录）
         self.blob_history.append((frame_idx, cy))
-        if len(self.blob_history) > 30:
-            self.blob_history.pop(0)
 
         # 判断斑块相对篮筐的位置
         in_x = (self.hoop_x1 - int(self.hoop_w * 0.3) <= cx
@@ -540,7 +545,7 @@ class GoalDetector:
 
         self.goals.append(ts)
         self.last_goal_frame = frame_idx
-        self.blob_history = []
+        self.blob_history.clear()
         if source == "loose":
             self.diag["side_goal"] += 1  # 复用 side_goal 计数器
         return True
@@ -551,7 +556,7 @@ class GoalDetector:
             n = len(self.blob_history)
             if n < 2:
                 return True
-        recent = self.blob_history[-n:]
+        recent = list(self.blob_history)[-n:]  # deque 不支持切片，转 list 取尾部
         ys = [r[1] for r in recent]
         # y 整体增加（向下）且至少下降 5 像素（放宽，适配斜向运动）
         return (ys[-1] - ys[0]) > 5

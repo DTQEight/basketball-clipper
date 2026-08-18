@@ -4,12 +4,15 @@ OpenCV 5.0 自带 FFmpeg 后端不完整，无法解码 HEVC，
 且对 moov atom 在文件末尾的 mp4 会失败。
 本模块用 PyAV 统一解决这些问题。
 """
+import logging
 import os
 import av
 import numpy as np
 
+_log = logging.getLogger("video_io")
 
-def av_open(path):
+
+def av_open(path: str):
     """打开视频容器，兼容 moov atom 在末尾的 mp4（非 faststart）。
 
     PyAV 默认探测对 moov 后置的大文件会报 InvalidData，指定 format 即可。
@@ -29,7 +32,7 @@ def av_open(path):
     return av.open(path)
 
 
-def get_video_info(path):
+def get_video_info(path: str) -> dict:
     """获取视频基本信息。
 
     返回 dict: {total, fps, width, height, codec, duration}
@@ -60,7 +63,7 @@ def get_video_info(path):
     }
 
 
-def read_frame(path, idx, total=0, fps=30.0):
+def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
     """读取指定帧（按帧号 seek），返回 BGR ndarray 或 None。
 
     path:  视频文件路径
@@ -93,7 +96,9 @@ def read_frame(path, idx, total=0, fps=30.0):
             if cur_idx >= idx:
                 return f.to_ndarray(format="bgr24")
         return None
-    except Exception:
+    except Exception as e:
+        # 旧实现静默返回 None，解码问题（容器损坏/编码不支持）无从排查
+        _log.warning(f"[WARN] read_frame 失败: {path} @帧 {idx}: {e}")
         return None
     finally:
         if container is not None:

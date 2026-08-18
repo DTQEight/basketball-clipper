@@ -3,6 +3,7 @@
 从原 demo_nicegui.py 抽离，通过 services.state 模块访问/修改运行时状态，
 UI 层只需调用本模块的函数并传入参数。
 """
+import logging
 import math
 import os
 import time
@@ -19,9 +20,14 @@ import sys
 sys.path.insert(0, str(_ROOT))
 
 from video_io import get_video_info, read_frame, VideoReader
-from app import get_ball_model, get_device
+from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector
-from cutter.ffmpeg_cutter import cut_clips, _build_encode_args
+from cutter.ffmpeg_cutter import cut_clips, build_encode_args
+
+log = logging.getLogger("detection")
+
+# 预览片段为进球时刻 ±N 秒（demo_nicegui 卡片时间戳显示与此保持同一来源）
+PREVIEW_CLIP_HALF_SEC = 3.0
 
 
 # ============ 单视频操作 ============
@@ -95,6 +101,10 @@ def click_calibrate(x, y):
     if state.video_state["path"] is None:
         return None, "请先加载视频"
     frame_idx = state.video_state["current_frame"]
+    # 整个函数只读一次目标帧：基准帧与叠加显示复用同一份
+    # （旧实现读两次 read_frame，各自 open+seek，大视频标定手感明显变慢）
+    frame = read_frame(state.video_state["path"], int(frame_idx),
+                       total=state.video_state["total"], fps=state.video_state["fps"])
     state.calib["clicks"].append((x, y))
     status = f"点击 ({x},{y})，已收集 {len(state.calib['clicks'])}/2 个点"
     if len(state.calib["clicks"]) >= 2:
@@ -102,15 +112,11 @@ def click_calibrate(x, y):
         x1, y1 = min(p1[0], p2[0]), min(p1[1], p2[1])
         x2, y2 = max(p1[0], p2[0]), max(p1[1], p2[1])
         state.calib["hoop"] = (x1, y1, x2, y2)
-        base_frame = read_frame(state.video_state["path"], int(frame_idx),
-                               total=state.video_state["total"], fps=state.video_state["fps"])
-        if base_frame is not None:
-            state.calib["baseline_frame"] = base_frame.copy()
+        if frame is not None:
+            state.calib["baseline_frame"] = frame.copy()
             state.calib["baseline_idx"] = int(frame_idx)
         status = f"篮筐已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
         state.calib["clicks"] = []
-    frame = read_frame(state.video_state["path"], int(frame_idx),
-                       total=state.video_state["total"], fps=state.video_state["fps"])
     if frame is None:
         return None, status
     out = _draw_calib_overlay(frame, state.calib["hoop"], state.calib["clicks"])
@@ -150,10 +156,10 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     out_dir.mkdir(parents=True, exist_ok=True)
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     # 编码参数只检测一次（NVENC 探测是子进程，循环内重复调用会显著拖慢）
-    _enc = _build_encode_args(ff, quality="preview")
+    _enc = build_encode_args(ff, quality="preview")
     # GeForce 消费卡驱动限制同时 2-5 路 NVENC 会话，保守用 2；软编受 CPU 核数约束用 3
     _workers = 2 if "h264_nvenc" in _enc else 3
-    clip_half = int(fps * 3)
+    clip_half = int(fps * PREVIEW_CLIP_HALF_SEC)
 
     def _cut_one(gi, gts):
         """切单个片段，成功返回 clip dict，失败/取消返回 None（异常不外抛）。"""
@@ -177,7 +183,7 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
                 return {"ts": gts, "path": clip_path, "idx": gi}
         except Exception as e:
-            print(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}", flush=True)
+            log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
         return None
 
     clips = []
@@ -269,6 +275,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 for _wfidx, _wframe in _warmup_reader.iter_frames(start=start, end=_warmup_end, batch=1):
                     # 预热期只跑 diff 收集 P95，ball_pos=None 跳过 YOLO（省显存/耗时）
                     _warmup_detector.feed(None, _wfidx, fps, frame=_wframe)
+                    # 预热进度反馈（旧实现停在 6% 无增量，长视频像卡死）
+                    if (_wfidx - start) % 150 == 0:
+                        _report(6 + 3 * (_wfidx - start) / max(_warmup_n, 1),
+                                f'预热采样 {(_wfidx - start)}/{_warmup_n} 帧...')
                     if _warmup_detector._warmup_done:
                         break
             finally:
@@ -276,9 +286,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             if _warmup_detector._warmup_done and _warmup_detector._auto_threshold_value is not None:
                 _effective_diff_threshold = int(_warmup_detector._auto_threshold_value)
                 _we = time.time()
-                print(f"[WARMUP DONE] 预热 {_we-_ws:.1f}s | "
-                      f"阈值 = median(P95)={_warmup_detector._warmup_p95_median:.1f} + 8 = {_effective_diff_threshold} "
-                      f"| 采样 {_warmup_detector._warmup_sample_count} 帧", flush=True)
+                log.info(f"[WARMUP DONE] 预热 {_we-_ws:.1f}s | "
+                         f"阈值 = median(P95)={_warmup_detector._warmup_p95_median:.1f} + 8 = {_effective_diff_threshold} "
+                         f"| 采样 {_warmup_detector._warmup_sample_count} 帧")
                 _warmup_info = {
                     "auto_threshold_value": _warmup_detector._auto_threshold_value,
                     "warmup_p95_median": _warmup_detector._warmup_p95_median,
@@ -287,7 +297,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             else:
                 # 视频短于30s或预热失败，回退到用户传入的 diff_threshold
                 _we = time.time()
-                print(f"[WARMUP ABORT] 视频过短或未完成预热，回退固定阈值 {diff_threshold}", flush=True)
+                log.info(f"[WARMUP ABORT] 视频过短或未完成预热，回退固定阈值 {diff_threshold}")
                 _warmup_info = {
                     "auto_threshold_value": None,
                     "warmup_p95_median": (
@@ -320,7 +330,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             detector.auto_threshold = bool(auto_threshold)   # 保留用户原始意图用于诊断显示/历史写入
 
         _report(10, '加载 YOLO 模型...')
-        model, _ = get_ball_model()
+        model, _weights_path = get_ball_model()
+        # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
+        # 回退 COCO 权重（yolov8n.pt）时类 0 是 person，硬编码会误把球员当球确认
+        _ball_classes = get_ball_class_ids(model, _weights_path)
 
         t0 = time.time()
         t0_str = time.strftime('%H:%M:%S', time.localtime(t0))
@@ -329,27 +342,27 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         video_dur_min = n_frames / max(fps, 1) / 60.0
 
         # ============ DEBUG: 开始信息 ============
-        print("\n" + "=" * 68)
-        print(f"[DETECT START] {t0_str}")
-        print(f"  Video       : {state.video_state['path']}")
-        print(f"  Resolution  : {state.video_state.get('width', '?')}x{state.video_state.get('height', '?')}  @ {fps:.1f} fps")
-        print(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
+        log.info("\n" + "=" * 68)
+        log.info(f"[DETECT START] {t0_str}")
+        log.info(f"  Video       : {state.video_state['path']}")
+        log.info(f"  Resolution  : {state.video_state.get('width', '?')}x{state.video_state.get('height', '?')}  @ {fps:.1f} fps")
+        log.info(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
         if bool(auto_threshold):
             # 如实区分预热成功 / 预热失败回退，避免 ABORT 后仍显示"已预热"误导排查
             _warmup_ok = (_warmup_info is not None
                           and _warmup_info.get("auto_threshold_value") is not None)
             if _warmup_ok:
-                print(f"  Auto-thresh : ON (已预热, 阈值={_effective_diff_threshold}, P95 中位={_warmup_info.get('warmup_p95_median')})")
+                log.info(f"  Auto-thresh : ON (已预热, 阈值={_effective_diff_threshold}, P95 中位={_warmup_info.get('warmup_p95_median')})")
             else:
-                print(f"  Auto-thresh : ON (预热未完成, 回退固定阈值 {_effective_diff_threshold})")
+                log.info(f"  Auto-thresh : ON (预热未完成, 回退固定阈值 {_effective_diff_threshold})")
         else:
-            print(f"  Auto-thresh : OFF (固定阈值 {diff_threshold})")
-        print(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
+            log.info(f"  Auto-thresh : OFF (固定阈值 {diff_threshold})")
+        log.info(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
         if skip_yolo_no_motion:
-            print(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
-        print(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
-        print(f"  min_circ    : {min_circularity}  in_hoop_f : {min_in_hoop_frames}")
-        print("=" * 68, flush=True)
+            log.info(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
+        log.info(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
+        log.info(f"  min_circ    : {min_circularity}  in_hoop_f : {min_in_hoop_frames}")
+        log.info("=" * 68)
         _debug_last_print_time = t0
         _debug_last_processed = 0
 
@@ -364,7 +377,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _stat_yolo_failed = 0   # YOLO 推理异常次数（如驱动升级后 CUDA 上下文失效）
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
-                if state.cancel_requested:
+                if state.cancel_event.is_set():
                     break
                 ball_pos = None
                 need_yolo = False
@@ -383,13 +396,14 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 if need_yolo:
                     _stat_yolo_called += 1
                     try:
-                        # classes=[0]：ultralytics 在 NMS 后直接过滤，只保留 basketball 类
-                        # 省去 CPU 侧全量 .cpu().numpy() 拷贝 + 遍历查找
-                        # 注：basketball_custom.pt 的 names={0:'basketball'}，id 固定为 0
+                        # classes 过滤：ultralytics 在 NMS 后直接过滤，只保留球类
+                        # 省去 CPU 侧全量 .cpu().numpy() 拷贝 + 遍历查找。
+                        # _ball_classes 按 model.names 反查（自定义权重=[0]，
+                        # COCO 回退权重=[32] sports ball），不再硬编码 [0]
                         # device 用循环外缓存的 _device：运行中设备不会变化，
                         # 每次推理重新 import torch + is_available 属纯冗余（全程 ~2 万次）
                         res = model.predict(frame, conf=float(ball_conf), imgsz=960,
-                                            classes=[0],
+                                            classes=_ball_classes,
                                             device=_device, verbose=False)[0]
                         if res.boxes is not None and len(res.boxes) > 0:
                             xyxy = res.boxes.xyxy.cpu().numpy()
@@ -406,8 +420,14 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         _stat_yolo_failed += 1
                         if _stat_yolo_failed == 1:
                             import traceback
-                            print(f"[YOLO ERROR] 首次推理失败: {e}\n{traceback.format_exc()}",
-                                  flush=True)
+                            log.error(f"[YOLO ERROR] 首次推理失败: {e}\n{traceback.format_exc()}")
+                        # 失败率过高时立即中止（旧实现跑完全程才检查，
+                        # CUDA 失效时仍会空跑几十分钟才报错）
+                        if (_stat_yolo_called >= 10
+                                and _stat_yolo_failed >= _stat_yolo_called * 0.5):
+                            log.error(f"[YOLO FAIL] 推理失败率过高，提前中止: "
+                                      f"{_stat_yolo_failed}/{_stat_yolo_called}")
+                            break
                 else:
                     # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效）
                     ball_pos = _last_ball_pos
@@ -441,9 +461,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                     _pct = processed / max(n_frames, 1)
                     _eta = (n_frames - processed) / max(_overall_fps, 0.1)
                     _phase_label = '检测'
-                    print(f"[{time.strftime('%H:%M:%S')}] {_phase_label} {processed:>6d}/{n_frames:<6d} "
-                          f"({_pct*100:5.1f}%) | 瞬时 {_instant_fps:>5.0f} f/s  平均 {_overall_fps:>5.1f} f/s | "
-                          f"ETA {_eta/60:>4.1f} min | 进球累计 {len(detector.goals):>3d}", flush=True)
+                    log.info(f"[{time.strftime('%H:%M:%S')}] {_phase_label} {processed:>6d}/{n_frames:<6d} "
+                             f"({_pct*100:5.1f}%) | 瞬时 {_instant_fps:>5.0f} f/s  平均 {_overall_fps:>5.1f} f/s | "
+                             f"ETA {_eta/60:>4.1f} min | 进球累计 {len(detector.goals):>3d}")
                     _debug_last_print_time = _now
                     _debug_last_processed = processed
         finally:
@@ -451,10 +471,11 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         # YOLO 失败率报警：推理环境损坏（如驱动升级后旧进程 CUDA 上下文失效）时，
         # 结果不可信（所有候选进球都会被 YOLO 确认拒绝），直接报错让用户重启服务
+        # （循环内已提前中止，这里统一返回错误；两个条件保持一致）
         if _stat_yolo_called >= 10 and _stat_yolo_failed >= _stat_yolo_called * 0.5:
             _fail_pct = _stat_yolo_failed / _stat_yolo_called * 100
-            print(f"[YOLO FAIL] 推理失败率过高: {_stat_yolo_failed}/{_stat_yolo_called} "
-                  f"({_fail_pct:.0f}%)，本次结果不可信，已中止", flush=True)
+            log.error(f"[YOLO FAIL] 推理失败率过高: {_stat_yolo_failed}/{_stat_yolo_called} "
+                      f"({_fail_pct:.0f}%)，本次结果不可信，已中止")
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
@@ -474,10 +495,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.last_goal_clips.extend(
             _generate_preview_clips(state.video_state["path"], goals, start, end,
                                     fps, total, _stamp, progress_callback=_report,
-                                    cancel_check=lambda: state.cancel_requested)
+                                    cancel_check=state.cancel_event.is_set)
         )
 
-        if state.cancel_requested:
+        if state.cancel_event.is_set():
             # 用户取消：删除本次已生成的片段文件，清空内存列表，不写入历史
             _t2 = time.time()
             for _c in list(state.last_goal_clips):
@@ -488,16 +509,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
-            print(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出", flush=True)
+            log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出")
             return f"已取消 | 已处理 {processed} 帧", False
 
-        # 检测成功后写入片段缓存并持久化
+        # 检测成功后写入片段缓存并持久化（key 统一走 clip_cache_key，排序+round）
         if state.last_goal_clips:
-            ckey = (state.video_state["path"], tuple(round(g, 3) for g in goals))
-            state.clip_cache[ckey] = list(state.last_goal_clips)
-            if len(state.clip_cache) > 20:
-                state.clip_cache.pop(next(iter(state.clip_cache)))
-            state.save_clip_cache()
+            state.put_clip_cache(state.clip_cache_key(state.video_state["path"], goals),
+                                 state.last_goal_clips)
 
         _report(100, '完成！')
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
@@ -515,34 +533,34 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _end_str = time.strftime('%H:%M:%S', time.localtime(_t2))
 
         # ============ DEBUG: 结束统计 ============
-        print("")
-        print("=" * 68)
-        print(f"[DETECT  END] {_end_str}")
-        print(f"  Timing      : detect {_detect_elapsed/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
-        print(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_elapsed/60:.1f} min = {video_dur_min/max(_detect_elapsed/60,0.001):.2f}x vs realtime)")
-        print(f"  Goals       : {len(goals)} detected")
+        log.info("")
+        log.info("=" * 68)
+        log.info(f"[DETECT  END] {_end_str}")
+        log.info(f"  Timing      : detect {_detect_elapsed/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
+        log.info(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_elapsed/60:.1f} min = {video_dur_min/max(_detect_elapsed/60,0.001):.2f}x vs realtime)")
+        log.info(f"  Goals       : {len(goals)} detected")
         if goals:
             _timestamps_str = ", ".join(f"{g:.1f}s" for g in goals[:8]) + ("..." if len(goals) > 8 else "")
-            print(f"                {_timestamps_str}")
+            log.info(f"                {_timestamps_str}")
         if skip_yolo_no_motion:
             _yolo_total_scheduled = _stat_yolo_called + _stat_yolo_skipped
             _skip_rate = _stat_yolo_skipped / max(_yolo_total_scheduled, 1) * 100
-            print(f"  YOLO 调用   : 实际推理 {_stat_yolo_called} 次  |  条件跳过 {_stat_yolo_skipped} 次  ({_skip_rate:.0f}% 跳过率)")
+            log.info(f"  YOLO 调用   : 实际推理 {_stat_yolo_called} 次  |  条件跳过 {_stat_yolo_skipped} 次  ({_skip_rate:.0f}% 跳过率)")
         if _stat_yolo_failed > 0:
-            print(f"  YOLO 异常   : {_stat_yolo_failed}/{_stat_yolo_called} 次推理失败（详见 [YOLO ERROR] 日志）")
-        print(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
-              f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
+            log.info(f"  YOLO 异常   : {_stat_yolo_failed}/{_stat_yolo_called} 次推理失败（详见 [YOLO ERROR] 日志）")
+        log.info(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
+                 f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
         if detector.auto_threshold:
             if detector._auto_threshold_value is not None:
                 if detector._warmup_p95_median is not None:
-                    print(f"  AutoThresh  : value={detector._auto_threshold_value}  |  median(P95)={detector._warmup_p95_median:.1f}  +8  clamp[8,50]  |  samples={detector._warmup_sample_count}")
+                    log.info(f"  AutoThresh  : value={detector._auto_threshold_value}  |  median(P95)={detector._warmup_p95_median:.1f}  +8  clamp[8,50]  |  samples={detector._warmup_sample_count}")
                 else:
-                    print(f"  AutoThresh  : value={detector._auto_threshold_value}  |  (P95 数据未保存)")
+                    log.info(f"  AutoThresh  : value={detector._auto_threshold_value}  |  (P95 数据未保存)")
             else:
-                print(f"  AutoThresh  : 预热未完成，实际使用固定阈值 {detector.diff_threshold}")
+                log.info(f"  AutoThresh  : 预热未完成，实际使用固定阈值 {detector.diff_threshold}")
         else:
-            print(f"  DiffThresh  : 固定 {diff_threshold}")
-        print("=" * 68 + "\n", flush=True)
+            log.info(f"  DiffThresh  : 固定 {diff_threshold}")
+        log.info("=" * 68 + "\n")
 
         status = (f"检测完成 | 处理 {processed} 帧 | 耗时 {_total_elapsed:.0f}s\n"
                   f"进球: {len(detector.goals)} 个 | "
@@ -777,7 +795,7 @@ def on_load_history(idx_choice, progress_callback=None):
     state.kept_goal_indices.clear()
 
     _report(30, f'生成 {len(all_goals)} 个预览片段...')
-    cache_key = (video_path, tuple(round(t, 3) for t in all_goals))
+    cache_key = state.clip_cache_key(video_path, all_goals)
     cached = state.clip_cache.get(cache_key)
     if cached and all(os.path.exists(c["path"]) for c in cached):
         # 命中缓存：直接复用已生成的片段，跳过 ffmpeg
@@ -790,10 +808,7 @@ def on_load_history(idx_choice, progress_callback=None):
         )
         # 写入缓存并持久化
         if state.last_goal_clips:
-            state.clip_cache[cache_key] = list(state.last_goal_clips)
-            if len(state.clip_cache) > 20:
-                state.clip_cache.pop(next(iter(state.clip_cache)))
-            state.save_clip_cache()
+            state.put_clip_cache(cache_key, state.last_goal_clips)
 
     # 加载后全部进球默认保留（筛选结果不持久化，删除操作仅影响当前会话的集锦导出）
     state.kept_goal_indices = set(range(len(state.last_goal_clips)))
@@ -894,7 +909,7 @@ def on_batch_load_video(selected, progress_callback=None):
         _stamp = int(time.time())
 
         _report(30, f'生成 {len(all_goals)} 个预览片段...')
-        cache_key = (video_path, tuple(round(t, 3) for t in all_goals))
+        cache_key = state.clip_cache_key(video_path, all_goals)
         cached = state.clip_cache.get(cache_key)
         if cached and all(os.path.exists(c["path"]) for c in cached):
             state.last_goal_clips.extend(list(cached))
@@ -905,10 +920,7 @@ def on_batch_load_video(selected, progress_callback=None):
                                         fps, total, _stamp, progress_callback=_report)
             )
             if state.last_goal_clips:
-                state.clip_cache[cache_key] = list(state.last_goal_clips)
-                if len(state.clip_cache) > 20:
-                    state.clip_cache.pop(next(iter(state.clip_cache)))
-                state.save_clip_cache()
+                state.put_clip_cache(cache_key, state.last_goal_clips)
 
         # 加载后全部进球默认保留（筛选结果不持久化）
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
@@ -976,31 +988,31 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     cancelled = False
     _batch_t0 = time.time()
     # ============ DEBUG: BATCH 开始 ============
-    print("\n" + "#" * 68)
-    print(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos")
-    print(f"  Auto-thresh : {bool(auto_threshold)}")
-    print(f"  YOLO step   : every {yolo_step} frames")
+    log.info("\n" + "#" * 68)
+    log.info(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos")
+    log.info(f"  Auto-thresh : {bool(auto_threshold)}")
+    log.info(f"  YOLO step   : every {yolo_step} frames")
     if skip_yolo_no_motion:
-        print(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
-    print(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
-    print("#" * 68, flush=True)
+        log.info(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
+    log.info(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
+    log.info("#" * 68)
     for i, video_path in enumerate(state.batch_files):
-        if state.cancel_requested:
+        if state.cancel_event.is_set():
             cancelled = True
             break
         name = os.path.basename(video_path)
-        print(f"\n>>> [{i+1}/{n_total}] {name} <<<", flush=True)
+        log.info(f"\n>>> [{i+1}/{n_total}] {name} <<<")
         state.batch_current_video = video_path  # 同步当前视频，供 run_detect 内写历史时查 batch_idx
         if video_path not in state.batch_calibs:
             lines.append(f"✗ {name}: 未标定，跳过")
-            print(f"    ↳ SKIP (未标定)", flush=True)
+            log.info(f"    ↳ SKIP (未标定)")
             continue
         cal = state.batch_calibs[video_path]
         try:
             info = get_video_info(video_path)
         except Exception as e:
             lines.append(f"✗ {name}: 读取失败 ({e})")
-            print(f"    ↳ READ FAIL: {e}", flush=True)
+            log.info(f"    ↳ READ FAIL: {e}")
             continue
         state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
                                   codec=info["codec"], current_frame=0,
@@ -1027,17 +1039,17 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                      skip_yolo_no_motion=skip_yolo_no_motion)
         except Exception as e:
             _status, ok = f"异常: {e}", False
-        if state.cancel_requested:
+        if state.cancel_event.is_set():
             cancelled = True
             reason = _status.splitlines()[0] if _status else "已取消"
             lines.append(f"⏹ {name}: {reason}")
-            print(f"    ↳ CANCELLED: {reason}", flush=True)
+            log.info(f"    ↳ CANCELLED: {reason}")
             break
         if ok:
             n_ok += 1
             total_goals += len(state.last_goals)
             lines.append(f"✓ {name}: 成功，{len(state.last_goals)} 个进球")
-            print(f"    ↳ OK: {len(state.last_goals)} goals", flush=True)
+            log.info(f"    ↳ OK: {len(state.last_goals)} goals")
             # ===== 流水线快照：深拷贝当前视频结果，前台可立即查看/确认 =====
             # 检测线程只写这个 key，之后永不触碰；前台删卡片只改快照，互不干扰
             state.batch_results[video_path] = {
@@ -1054,17 +1066,17 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         else:
             reason = _status.splitlines()[0] if _status else "失败"
             lines.append(f"✗ {name}: {reason}")
-            print(f"    ↳ FAIL: {reason}", flush=True)
+            log.info(f"    ↳ FAIL: {reason}")
     # ============ DEBUG: BATCH 结束 ============
     _batch_elapsed = time.time() - _batch_t0
     _end_time = time.strftime('%H:%M:%S')
-    print("")
-    print("#" * 68)
-    print(f"[BATCH  END ] {_end_time}  |  total {_batch_elapsed/60:.1f} min")
-    print(f"  Result: {n_ok}/{n_total} success  |  {total_goals} goals total")
+    log.info("")
+    log.info("#" * 68)
+    log.info(f"[BATCH  END ] {_end_time}  |  total {_batch_elapsed/60:.1f} min")
+    log.info(f"  Result: {n_ok}/{n_total} success  |  {total_goals} goals total")
     if cancelled:
-        print(f"  Status: CANCELLED")
-    print("#" * 68 + "\n", flush=True)
+        log.info(f"  Status: CANCELLED")
+    log.info("#" * 68 + "\n")
     if cancelled:
         msg = f"已取消 | 已完成 {n_ok}/{n_total} 个视频 | 共 {total_goals} 个进球"
     else:

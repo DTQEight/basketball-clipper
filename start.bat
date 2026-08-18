@@ -17,6 +17,9 @@ set "PYTHON=%PROJECT_ROOT%\env\python.exe"
 if not exist "%PYTHON%" set "PYTHON=%PROJECT_ROOT%\env\Scripts\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"
 
+REM --- Service port (override with BBALL_PORT env var; demo_nicegui.py reads the same)
+if not defined BBALL_PORT set "BBALL_PORT=7871"
+
 REM --- Log dir + today's log filename (YYYYMMDD)
 set "LOG_DIR=%PROJECT_ROOT%\cache\logs"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
@@ -33,7 +36,7 @@ echo  Basketball Goal Detection Service
 echo ============================================
 echo  Script : %SCRIPT_DIR%
 echo  Python : %PYTHON%
-echo  URL    : http://127.0.0.1:7871/
+echo  URL    : http://127.0.0.1:%BBALL_PORT%/
 echo  Log    : %LOG_FILE%
 echo  Ctrl+C to stop
 echo ============================================
@@ -47,10 +50,10 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 chcp 65001 >nul
 
-REM --- Kill old process if port 7871 occupied
+REM --- Kill old process if service port occupied
 set "_KILLED=0"
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENING"') do (
-    echo [Port 7871] Killing old PID=%%a
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%BBALL_PORT% " ^| findstr "LISTENING"') do (
+    echo [Port %BBALL_PORT%] Killing old PID=%%a
     taskkill /F /PID %%a >nul 2>&1
     set "_KILLED=1"
 )

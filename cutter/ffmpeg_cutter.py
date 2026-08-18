@@ -6,8 +6,11 @@
   流拷贝失败时回退整体 re-encode 兜底
 - GPU 硬编：优先使用 h264_nvenc（NVIDIA GPU 加速），不可用则回退 libx264
 """
+import logging
 import os
+import shutil
 import subprocess
+import tempfile
 
 # 优先用 imageio-ffmpeg 自带版本（含 libx264 + nvenc），conda 版无 libx264
 try:
@@ -28,6 +31,9 @@ else:
     _CACHE_ROOT = str(_ROOT / "cache")
 
 
+_log = logging.getLogger("cutter")
+
+
 def _detect_nvenc(ffmpeg):
     """检测 ffmpeg 是否支持 h264_nvenc 编码器。"""
     try:
@@ -38,12 +44,13 @@ def _detect_nvenc(ffmpeg):
         return False
 
 
-def _build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
+def build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
     """构建视频编码参数，优先用 NVENC 硬编，回退 libx264 软编。
 
     quality: "hq" 高质量（集锦，cq=20）/ "preview" 预览（cq=26）
     use_nvenc: True/False 直接指定编码器，None 则内部探测（只应在单处调用时用）
     返回: (codec, preset_or_preset, crf_or_cq) 参数列表
+    （公开 API：services/detection.py 生成预览片段也用同一套参数）
     """
     if use_nvenc is None:
         use_nvenc = _detect_nvenc(ffmpeg)
@@ -59,8 +66,8 @@ def _build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
         return ["-c:v", "libx264", "-preset", "fast", "-crf", crf]
 
 
-def _cleanup_tmp(clip_files, list_path):
-    """清理临时切片文件和拼接列表。"""
+def _cleanup_tmp(clip_files, list_path, tmp_dir=None):
+    """清理临时切片文件、拼接列表和本次运行的独立临时目录。"""
     for p in clip_files:
         try:
             os.remove(p)
@@ -70,10 +77,13 @@ def _cleanup_tmp(clip_files, list_path):
         os.remove(list_path)
     except OSError:
         pass
+    if tmp_dir is not None:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
-              output_path=None, ffmpeg_path="", progress_callback=None):
+def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
+              min_gap: int = 8, output_path=None, ffmpeg_path: str = "",
+              progress_callback=None):
     """根据进球时间戳剪辑集锦（GPU 硬编加速）。
 
     timestamps: 进球时刻列表（秒，浮点）
@@ -92,7 +102,7 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
                 pass
 
     if not timestamps:
-        print("没有进球时间戳，跳过剪辑")
+        _log.info("没有进球时间戳，跳过剪辑")
         return None
 
     ffmpeg = ffmpeg_path or _DEFAULT_FFMPEG
@@ -108,9 +118,11 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         else:
             segments.append([start, end])
 
-    # 临时目录改到 E 盘缓存
-    tmp_dir = os.path.join(_CACHE_ROOT, "clips")
-    os.makedirs(tmp_dir, exist_ok=True)
+    # 临时目录：cache/clips 下每次运行独立子目录（tempfile.mkdtemp），
+    # 旧实现固定命名 clip_000.mp4，第二个实例/流水线集锦并发时会互相覆盖、误删对方文件
+    _clips_root = os.path.join(_CACHE_ROOT, "clips")
+    os.makedirs(_clips_root, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="hl-", dir=_clips_root)
     clip_files = []
 
     # 输出路径默认到 cache/demo_output/，文件名带源视频名避免覆盖
@@ -123,14 +135,14 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
     # 检测编码器一次，避免每个片段重复检测
     use_nvenc = _detect_nvenc(ffmpeg)
     encode_tag = "NVENC 硬编" if use_nvenc else "libx264 软编"
-    print(f"[剪辑] 使用 {encode_tag} | 共 {len(segments)} 段", flush=True)
+    _log.info(f"[剪辑] 使用 {encode_tag} | 共 {len(segments)} 段")
     _report(10, f'初始化编码器（{len(segments)} 段，{encode_tag}）...')
 
     # 切片：用 -ss 在输入前做快速 seek，-t 控制时长
     # 集锦保持原画质：NVENC cq=20 / libx264 crf=18，不缩放
     # 容错：单个片段失败不中断整体，跳过该片段继续其余切片
-    # ⚠️ use_nvenc 复用已探测结果，避免 _build_encode_args 内部再开子进程
-    encode_args = _build_encode_args(ffmpeg, quality="hq", use_nvenc=use_nvenc)
+    # ⚠️ use_nvenc 复用已探测结果，避免 build_encode_args 内部再开子进程
+    encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=use_nvenc)
     failed_segments = 0
     for i, (start, end) in enumerate(segments):
         _report(15 + 70 * i / len(segments), f'剪切片段 {i+1}/{len(segments)}...')
@@ -152,19 +164,20 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
                 clip_files.append(clip_path)
             else:
                 failed_segments += 1
-                print(f"[WARN] 片段 {i+1}/{len(segments)} 生成空文件，跳过 (start={start:.1f}s)", flush=True)
+                _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 生成空文件，跳过 (start={start:.1f}s)")
         except subprocess.CalledProcessError as e:
             failed_segments += 1
-            print(f"[WARN] 片段 {i+1}/{len(segments)} 切片失败，跳过 (start={start:.1f}s): {e}", flush=True)
+            _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 切片失败，跳过 (start={start:.1f}s): {e}")
             continue
         except subprocess.TimeoutExpired:
             failed_segments += 1
-            print(f"[WARN] 片段 {i+1}/{len(segments)} 切片超时（>300s），跳过 (start={start:.1f}s)", flush=True)
+            _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 切片超时（>300s），跳过 (start={start:.1f}s)")
             continue
 
     # 全部失败才返回 None，避免拼接空列表
     if not clip_files:
-        print(f"[剪辑] 全部 {len(segments)} 段切片失败，未生成集锦", flush=True)
+        _log.warning(f"[剪辑] 全部 {len(segments)} 段切片失败，未生成集锦")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
     # 拼接列表文件
@@ -199,28 +212,28 @@ def cut_clips(video_path, timestamps, pre_roll=5, post_roll=5, min_gap=8,
         # 流拷贝不做编解码，600s 超时已非常宽裕
         subprocess.run(concat_copy_cmd, check=True, creationflags=_SBOX, timeout=600)
     except subprocess.TimeoutExpired:
-        print("[剪辑] 流拷贝拼接超时（>600s），回退重编码拼接...", flush=True)
+        _log.warning("[剪辑] 流拷贝拼接超时（>600s），回退重编码拼接...")
         try:
             subprocess.run(concat_encode_cmd, check=True, creationflags=_SBOX, timeout=1800)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            print(f"[剪辑] 拼接失败: {e}", flush=True)
-            _cleanup_tmp(clip_files, list_path)
+            _log.warning(f"[剪辑] 拼接失败: {e}")
+            _cleanup_tmp(clip_files, list_path, tmp_dir)
             return None
     except subprocess.CalledProcessError:
         # 流拷贝失败（个别片段参数异常，如源视频中途变分辨率）→ 回退重编码
-        print("[剪辑] 流拷贝拼接失败，回退重编码拼接...", flush=True)
+        _log.warning("[剪辑] 流拷贝拼接失败，回退重编码拼接...")
         try:
             subprocess.run(concat_encode_cmd, check=True, creationflags=_SBOX, timeout=1800)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            print(f"[剪辑] 拼接失败: {e}", flush=True)
-            _cleanup_tmp(clip_files, list_path)
+            _log.warning(f"[剪辑] 拼接失败: {e}")
+            _cleanup_tmp(clip_files, list_path, tmp_dir)
             return None
     _report(98, '清理临时文件...')
 
-    # 清理临时文件
-    _cleanup_tmp(clip_files, list_path)
+    # 清理临时文件（含本次运行的独立子目录）
+    _cleanup_tmp(clip_files, list_path, tmp_dir)
 
     total_dur = sum(e - s for s, e in segments)
     skip_info = f" | 跳过 {failed_segments} 段失败" if failed_segments > 0 else ""
-    print(f"集锦已生成: {output_path}（{encode_tag} | 共 {len(clip_files)}/{len(segments)} 段{skip_info} | 时长 {total_dur:.0f}s）", flush=True)
+    _log.info(f"集锦已生成: {output_path}（{encode_tag} | 共 {len(clip_files)}/{len(segments)} 段{skip_info} | 时长 {total_dur:.0f}s）")
     return output_path

@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -25,7 +26,7 @@ for _d in [os.environ[k] for k in ["MPLCONFIGDIR",
 # 公共模块（当前仅暴露给其他模块的函数在此）
 
 
-def get_device():
+def get_device() -> str:
     """检测可用推理设备，优先 CUDA，回退 CPU。"""
     try:
         import torch
@@ -38,24 +39,49 @@ def get_device():
 
 # ============ 全局状态 ============
 _model_cache = {}
+_model_lock = threading.Lock()  # 懒加载锁：双线程同时未命中会重复加载模型
 
 
-def get_model(weights):
+def get_model(weights: str):
     from ultralytics import YOLO
-    if weights not in _model_cache:
-        m = YOLO(weights)
-        # 加载后立即搬到推理设备（与 get_device() 对齐），避免首次推理在 CPU 上跑
-        try:
-            dev = get_device()
-            if dev != "cpu":
-                m.to(dev)
-        except Exception:
-            pass
-        _model_cache[weights] = m
-    return _model_cache[weights]
+    with _model_lock:
+        if weights not in _model_cache:
+            m = YOLO(weights)
+            # 加载后立即搬到推理设备（与 get_device() 对齐），避免首次推理在 CPU 上跑
+            try:
+                dev = get_device()
+                if dev != "cpu":
+                    m.to(dev)
+            except Exception:
+                pass
+            _model_cache[weights] = m
+        return _model_cache[weights]
 
 
-def get_ball_model():
+# 球类候选关键词：自定义权重通常为 'basketball'，COCO 预训练为 'sports ball'
+_BALL_CLASS_KEYS = ("basketball", "sports ball", "ball")
+
+
+def get_ball_class_ids(model, weights_path: str = "") -> list:
+    """按 model.names 反查球类别索引列表。
+
+    classes=[0] 只对 names={0:'basketball'} 的自定义微调权重成立；
+    回退 COCO 权重（yolov8n.pt）时类 0 是 person（sports ball 是 32），
+    硬编码 [0] 会把"YOLO 硬否决"变成"篮筐附近有人就确认"，误检暴增。
+    解析失败时保守回退 [0]（兼容单类自定义权重布局）。
+    """
+    try:
+        names = model.names or {}
+        ids = sorted(i for i, n in names.items()
+                     if any(k in str(n).lower() for k in _BALL_CLASS_KEYS))
+        if ids:
+            return ids
+    except Exception:
+        pass
+    return [0]
+
+
+def get_ball_model() -> tuple:
     """懒加载球检测 YOLO 模型。
 
     优先用 weights/ 下的篮球专用微调权重；否则用 yolov8n.pt（COCO 预训练，自动下载）。

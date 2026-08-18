@@ -6,6 +6,9 @@
 import os
 import json
 import time
+import threading
+import logging
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 # ============ 路径常量 ============
@@ -39,8 +42,35 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 # 历史记录上限（防止 detection_history.json 无限增长）
 MAX_HISTORY_RECORDS = 50
 
+# 预览片段缓存最大条目数（超出按插入顺序驱逐最旧）
+CLIP_CACHE_MAX_ENTRIES = 20
+
 # 预览片段目录
 DEMO_OUTPUT_DIR = os.path.join(CACHE_ROOT, "demo_output")
+
+
+# ============ 日志 ============
+def setup_logging():
+    """初始化日志：控制台 + 按日轮转文件（cache/logs/app.log，保留 7 天）。
+
+    旧实现只靠 start 脚本 tee 落盘，直接 `python demo_nicegui.py` 启动时
+    没有任何日志文件；日志能力应回归程序自身。formatter 用裸消息，
+    控制台输出与旧 print 行为完全一致。
+    """
+    log_dir = os.path.join(CACHE_ROOT, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    root = logging.getLogger()
+    if root.handlers:          # 防重复初始化（reload/二次调用）
+        return
+    fmt = logging.Formatter("%(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    fh = TimedRotatingFileHandler(os.path.join(log_dir, "app.log"),
+                                  when="midnight", backupCount=7, encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(sh)
+    root.addHandler(fh)
+    root.setLevel(logging.INFO)
 
 
 def _purge_old_clips(max_days=7):
@@ -73,8 +103,9 @@ last_goals = []
 last_goal_clips = []
 kept_goal_indices = set()
 
-# 检测取消标志（UI 点击「取消」时置 True，检测循环轮询后中断）
-cancel_requested = False
+# 检测取消标志（UI 点击「取消」时 set，检测循环轮询后中断）
+# 用 threading.Event 替代裸 bool：跨线程标志的 set/clear/is_set 天然原子且语义明确
+cancel_event = threading.Event()
 
 # 预览片段缓存：key=(视频路径, 进球时间戳元组) -> [片段dict, ...]
 clip_cache = {}
@@ -91,15 +122,28 @@ batch_results = {}
 
 
 # ============ 历史记录 ============
-def load_history():
-    """加载历史记录列表。"""
+def load_history() -> list:
+    """加载历史记录列表。
+
+    文件损坏（JSON 解析失败）时先改名备份为 .corrupt-<时间戳>.bak 再返回空列表：
+    旧实现静默返回 [] 后，下一次 add_history 会用空列表覆盖写整个文件，
+    一次写盘中断/损坏 = 全部历史丢失。
+    """
+    if not os.path.exists(HISTORY_FILE):
+        return []
     try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return []
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+        try:
+            os.replace(HISTORY_FILE, bak)
+            logging.getLogger("state").warning(
+                f"[WARN] 历史记录解析失败（{e}），原文件已备份到 {bak}，将以空记录重新开始")
+        except OSError:
+            logging.getLogger("state").warning(
+                f"[WARN] 历史记录解析失败（{e}），且备份失败: {bak}")
+        return []
 
 
 def save_history(records):
@@ -109,30 +153,68 @@ def save_history(records):
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] 保存历史记录失败: {e}", flush=True)
+        logging.getLogger("state").warning(f"[WARN] 保存历史记录失败: {e}")
+
+
+# add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
+# 新增字段只需在此表加一行（旧实现要同时改签名/赋值块/调用方三处）。
+# diff_threshold 例外：可能为 int 或 str 'auto'，原样保存，不入表。
+_HISTORY_FIELD_CASTS = {
+    # 核心检测参数
+    "ball_conf": (float, None),
+    "min_gap_sec": (float, None),
+    "auto_threshold": (bool, None),
+    "yolo_step": (int, None),
+    "skip_yolo_no_motion": (bool, None),
+    "min_circularity": (float, None),
+    "min_in_hoop_frames": (int, None),
+    "min_blob_area": (int, None),
+    "search_margin": (int, None),
+    # 时间/批量
+    "elapsed_sec": (float, 1),
+    "batch_idx": (int, None),
+    "batch_total": (int, None),
+    "detect_start_time": (str, None),
+    "detect_end_time": (str, None),
+    # 视频元信息
+    "video_fps": (float, 2),
+    "video_width": (int, None),
+    "video_height": (int, None),
+    "video_total_frames": (int, None),
+    "video_duration_sec": (float, 1),
+    # 处理速度指标
+    "processed_frames": (int, None),
+    "proc_fps": (float, 1),
+    "speed_vs_realtime": (float, 2),
+    # YOLO 跳过统计
+    "yolo_called": (int, None),
+    "yolo_cond_skipped": (int, None),
+    "yolo_skip_rate_pct": (float, 1),
+    # YOLO 确认/否决统计
+    "yolo_confirmed": (int, None),
+    "yolo_rejected": (int, None),
+    "yolo_confirm_rate_pct": (float, 1),
+    # 进球路径细分
+    "cross_above": (int, None),
+    "cross_below": (int, None),
+    "in_hoop": (int, None),
+    "reject_cooldown": (int, None),
+    # 自适应阈值详情
+    "auto_threshold_value": (int, None),
+    "warmup_p95_median": (float, 1),
+    "warmup_sample_count": (int, None),
+}
 
 
 def add_history(video_path, hoop, goals, baseline_idx=-1,
-                ball_conf=None, min_gap_sec=None, diff_threshold=None,
-                auto_threshold=None, yolo_step=None, skip_yolo_no_motion=None,
-                min_circularity=None, min_in_hoop_frames=None,
-                min_blob_area=None, search_margin=None,
-                elapsed_sec=None, batch_idx=None, batch_total=None,
-                detect_start_time=None, detect_end_time=None,
-                # ===== 视频元信息 =====
-                video_fps=None, video_width=None, video_height=None,
-                video_total_frames=None, video_duration_sec=None,
-                # ===== 处理速度指标 =====
-                processed_frames=None, proc_fps=None, speed_vs_realtime=None,
-                # ===== YOLO 跳过/条件跳过 =====
-                yolo_called=None, yolo_cond_skipped=None, yolo_skip_rate_pct=None,
-                # ===== YOLO 路径确认/否决 =====
-                yolo_confirmed=None, yolo_rejected=None, yolo_confirm_rate_pct=None,
-                # ===== 进球路径细分 =====
-                cross_above=None, cross_below=None, in_hoop=None, reject_cooldown=None,
-                # ===== 自适应阈值详情 =====
-                auto_threshold_value=None, warmup_p95_median=None, warmup_sample_count=None):
-    """添加一条历史记录（同视频会覆盖旧记录）。"""
+                diff_threshold=None, **fields):
+    """添加一条历史记录（同视频会覆盖旧记录）。
+
+    可选字段见 _HISTORY_FIELD_CASTS；未知字段抛 TypeError（防调用方拼错字段名静默丢数据）。
+    """
+    unknown = set(fields) - set(_HISTORY_FIELD_CASTS)
+    if unknown:
+        raise TypeError(f"add_history 收到未知字段: {sorted(unknown)}")
     records = load_history()
     records = [r for r in records if r.get("video") != video_path]
     rec = {
@@ -144,92 +226,39 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         "total": len(goals),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    # 核心检测参数
-    if ball_conf is not None:
-        rec["ball_conf"] = float(ball_conf)
-    if min_gap_sec is not None:
-        rec["min_gap_sec"] = float(min_gap_sec)
     if diff_threshold is not None:
         rec["diff_threshold"] = diff_threshold  # 可能为 int 或 str 'auto'
-    if auto_threshold is not None:
-        rec["auto_threshold"] = bool(auto_threshold)
-    if yolo_step is not None:
-        rec["yolo_step"] = int(yolo_step)
-    if skip_yolo_no_motion is not None:
-        rec["skip_yolo_no_motion"] = bool(skip_yolo_no_motion)
-    if min_circularity is not None:
-        rec["min_circularity"] = float(min_circularity)
-    if min_in_hoop_frames is not None:
-        rec["min_in_hoop_frames"] = int(min_in_hoop_frames)
-    if min_blob_area is not None:
-        rec["min_blob_area"] = int(min_blob_area)
-    if search_margin is not None:
-        rec["search_margin"] = int(search_margin)
-    # 时间/批量
-    if elapsed_sec is not None:
-        rec["elapsed_sec"] = round(float(elapsed_sec), 1)
-    if batch_idx is not None:
-        rec["batch_idx"] = int(batch_idx)
-    if batch_total is not None:
-        rec["batch_total"] = int(batch_total)
-    if detect_start_time is not None:
-        rec["detect_start_time"] = str(detect_start_time)
-    if detect_end_time is not None:
-        rec["detect_end_time"] = str(detect_end_time)
-    # 视频元信息
-    if video_fps is not None:
-        rec["video_fps"] = round(float(video_fps), 2)
-    if video_width is not None:
-        rec["video_width"] = int(video_width)
-    if video_height is not None:
-        rec["video_height"] = int(video_height)
-    if video_total_frames is not None:
-        rec["video_total_frames"] = int(video_total_frames)
-    if video_duration_sec is not None:
-        rec["video_duration_sec"] = round(float(video_duration_sec), 1)
-    # 处理速度指标
-    if processed_frames is not None:
-        rec["processed_frames"] = int(processed_frames)
-    if proc_fps is not None:
-        rec["proc_fps"] = round(float(proc_fps), 1)
-    if speed_vs_realtime is not None:
-        rec["speed_vs_realtime"] = round(float(speed_vs_realtime), 2)
-    # YOLO 跳过统计
-    if yolo_called is not None:
-        rec["yolo_called"] = int(yolo_called)
-    if yolo_cond_skipped is not None:
-        rec["yolo_cond_skipped"] = int(yolo_cond_skipped)
-    if yolo_skip_rate_pct is not None:
-        rec["yolo_skip_rate_pct"] = round(float(yolo_skip_rate_pct), 1)
-    # YOLO 确认/否决统计
-    if yolo_confirmed is not None:
-        rec["yolo_confirmed"] = int(yolo_confirmed)
-    if yolo_rejected is not None:
-        rec["yolo_rejected"] = int(yolo_rejected)
-    if yolo_confirm_rate_pct is not None:
-        rec["yolo_confirm_rate_pct"] = round(float(yolo_confirm_rate_pct), 1)
-    # 进球路径细分
-    if cross_above is not None:
-        rec["cross_above"] = int(cross_above)
-    if cross_below is not None:
-        rec["cross_below"] = int(cross_below)
-    if in_hoop is not None:
-        rec["in_hoop"] = int(in_hoop)
-    if reject_cooldown is not None:
-        rec["reject_cooldown"] = int(reject_cooldown)
-    # 自适应阈值详情
-    if auto_threshold_value is not None:
-        rec["auto_threshold_value"] = int(auto_threshold_value)
-    if warmup_p95_median is not None:
-        rec["warmup_p95_median"] = round(float(warmup_p95_median), 1)
-    if warmup_sample_count is not None:
-        rec["warmup_sample_count"] = int(warmup_sample_count)
+    for name, value in fields.items():
+        if value is None:
+            continue
+        cast, ndigits = _HISTORY_FIELD_CASTS[name]
+        value = cast(value)
+        if ndigits is not None:
+            value = round(value, ndigits)
+        rec[name] = value
     records.insert(0, rec)
     records = records[:MAX_HISTORY_RECORDS]
     save_history(records)
 
 
 # ============ 片段缓存 ============
+def clip_cache_key(video_path: str, goals) -> tuple:
+    """构造片段缓存 key：进球时间戳排序 + 保留 3 位小数。
+
+    写入方（检测完成，goals 已 sorted）与读取方（历史回读，原序）必须
+    用同一规则生成 key，否则顺序不同会导致缓存永不命中。
+    """
+    return (video_path, tuple(sorted(round(float(t), 3) for t in goals)))
+
+
+def put_clip_cache(key, clips):
+    """写入片段缓存条目 + 超限驱逐最旧 + 落盘（三个调用点共用的完整流程）。"""
+    clip_cache[key] = list(clips)
+    if len(clip_cache) > CLIP_CACHE_MAX_ENTRIES:
+        clip_cache.pop(next(iter(clip_cache)))
+    save_clip_cache()
+
+
 def load_clip_cache():
     """从磁盘加载片段缓存索引，仅保留片段文件仍存在的条目。"""
     cache = {}
@@ -258,7 +287,7 @@ def save_clip_cache():
         with open(CLIP_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception as e:
-        print(f"[WARN] 保存片段缓存失败: {e}", flush=True)
+        logging.getLogger("state").warning(f"[WARN] 保存片段缓存失败: {e}")
 
 
 def init_clip_cache():

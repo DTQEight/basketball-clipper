@@ -78,7 +78,7 @@
 | YOLO 确认率 | 1.7%（底噪大，硬否决过滤 ~2000 假候选） |
 | 自适应阈值 | 11（P95 中位数 11 → +8 偏移 clamp 到下限 8 以上） |
 
-> **开场进球修复说明**：旧版前 30s 预热期只做统计不触发进球注册，导致 4th.mp4 开场 3.2s 的进球被漏掉。新版预热阶段同步启用保守候选注册（基准帧差阈值 + YOLO 硬否决同时通过才计数），实测 2026.07.27 4th.mp4 开场 3.2s 进球、2026.08.10-1st.mp4 开场 0.2s 进球均成功识别。
+> **开场进球修复说明**：旧版前 30s 预热期只做统计不触发进球注册，导致 4th.mp4 开场 3.2s 的进球被漏掉。新版改为**两遍式方案**：先跑前 30s 纯预热 pass（只收集 P95 统计量、不跑 YOLO、不判定进球），算出阈值后从帧 0 用固定阈值**完整检测**——开场进球在正式阶段被完整处理（含 YOLO 确认），实测 2026.07.27 4th.mp4 开场 3.2s 进球、2026.08.10-1st.mp4 开场 0.2s 进球均成功识别。代价是前 30s 解码两遍（约 2-3% 额外耗时）。
 
 ### 2026.08.15-3rd.mp4 新旧版本识别数据对比（2026.08.18，ad 分支 vs 旧 main）
 
@@ -514,9 +514,58 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 多信号融合参考：ClarkWang1214/basketball-highlights
 - 视频读取：PyAV（替代 OpenCV，兼容 HEVC 和 moov 后置 mp4）
 - 视频编码：优先 NVENC 硬编（`h264_nvenc -preset p4 -rc vbr -cq 20`，NVIDIA GPU 加速），回退 libx264 软编
-- 推理：YOLOv8 / 自定义篮球权重，imgsz=960，`classes=[0]` 后处理预过滤
+- 推理：YOLOv8 / 自定义篮球权重，imgsz=960，按 `model.names` 反查球类索引做 `classes` 预过滤（自定义权重=[0]，COCO 回退=[32] sports ball）
 
 ## 更新日志
+
+### 2026.08.18 全面修复版本（ad 分支）
+
+代码审核报告剩余项一次性修复（正确性 #1-#5 / 性能 #7 #12 #13 / 健壮性 #3 #4 #14-#17 / 质量 P3），并补齐单元测试。
+
+#### 🔴 正确性修复
+
+| 项 | 模块 | 修复 |
+|----|------|------|
+| #1 | `app.py` + `services/detection.py` | **YOLO 类别反查**：新增 `get_ball_class_ids()` 按 `model.names` 反查球类索引。旧代码硬编码 `classes=[0]`，仅在自定义权重（`names={0:'basketball'}`）下成立；回退 COCO 权重 `yolov8n.pt` 时类 0 是 **person**，"YOLO 硬否决"会退化为"篮筐附近有人就确认" |
+| #2 | `services/state.py` | **历史损坏防丢失**：`load_history` 解析失败时先把坏文件改名 `.corrupt-<时间戳>.bak` 并打 WARN，再返回空列表。旧实现静默返回 `[]`，下一次 `add_history` 会用空列表**覆盖写**整个文件，一次损坏 = 全部历史丢失 |
+| #3 | `cutter/ffmpeg_cutter.py` | **集锦临时目录独立化**：`tempfile.mkdtemp(prefix="hl-")` 每次运行独立子目录，替代固定 `clip_000.mp4` 命名，消除第二实例/流水线集锦并发时互相覆盖与误删 |
+| #4 | `services/state.py` | **取消标志改 `threading.Event`**：`cancel_event.set()/clear()/is_set()` 替代裸 bool，跨线程语义原子且明确 |
+| #5 | `README.md` | 预热机制描述修正为实际的两遍式方案（见上方"开场进球修复说明"） |
+
+#### 🟡 性能与体验
+
+- **#7 YOLO 失败率循环内提前中止**：旧实现跑完全程才检查（CUDA 失效空跑几十分钟）；现在推理失败率 ≥50%（且调用 ≥10 次）立即 break 并报错
+- **#12 标定点击只读一次帧**：`click_calibrate` 基准帧与显示帧复用同一次 `read_frame`（旧实现 open+seek 两次，大视频标定卡顿）
+- **#13 deque 化 + 预热进度**：`blob_history`/`ball_pos_history` 改 `collections.deque`（`pop(0)` O(n) → `popleft` O(1)）；预热 pass 期间每 150 帧回调一次进度（旧实现停在 6% 像卡死）
+
+#### 🟠 健壮性
+
+- **#14** `read_frame` 失败输出 WARN 日志（旧实现静默返回 None 无从排查）
+- **#15** 片段缓存 key 统一 `state.clip_cache_key()`（排序 + round 3）：写入方与历史回读方同规则，消除"顺序不同缓存永不命中"的隐性耦合
+- **#16** 端口收敛为 `BBALL_PORT` 环境变量（`demo_nicegui.py` / `start.sh` / `start.bat` 三处同源）
+- **#17** `get_model` 懒加载加 `threading.Lock`，防双线程重复加载模型
+
+#### 🟢 代码质量
+
+- **单元测试（从 0 到 1）**：新增 `tests/`，**21 个用例全过**——覆盖 tracker 三条进球路径 / YOLO 否决 / 冷却期 / 自适应阈值预热 / 圆形度过滤 / 条件跳过 / deque 语义、state 历史读写与损坏备份、clip_cache key 与驱逐、YOLO 类别反查（自定义/COCO/多类/空 names）、自然排序
+- **`add_history` 表驱动**：40+ kwargs 收敛为 `_HISTORY_FIELD_CASTS` 表 + `**fields`，新增字段只改一处；未知字段抛 `TypeError` 防拼写错误静默丢数据
+- **clip_cache 写入去重**：`put_clip_cache()` 统一"写入 + 驱逐 >20 + 落盘"三处重复逻辑
+- **`_build_encode_args` 转公开 API**：更名 `build_encode_args`（跨模块不再导入私有符号）
+- **logging 落盘**：`setup_logging()` 控制台 + `cache/logs/app.log` 按日轮转（保留 7 天）；直接 `python demo_nicegui.py` 启动也有日志文件，不再依赖 start 脚本 tee
+- **魔法数收敛**：`PREVIEW_CLIP_HALF_SEC`（detection 与 UI 卡片同源）、`WARMUP_TARGET_SEC`、`MOTION_PIXEL_RATIO`、`CLIP_CACHE_MAX_ENTRIES`
+- **依赖清理**：删除全仓库未使用的 `pyyaml`
+- **类型注解**：公共函数补齐（`feed`/`set_baseline`/`read_frame`/`cut_clips`/`get_device` 等）
+
+#### ✅ 验证
+
+- `py_compile` 全部 8 个模块通过；`services.detection` / `video_io` / `cutter.ffmpeg_cutter` 真实导入通过
+- `pytest tests/`：**21 passed**（0.4s）
+- `cut_clips` 端到端冒烟：合成视频 → 切片 + 流拷贝拼接成功，`hl-*` 临时目录清理干净
+- 未动检测算法判定逻辑（ROI 化之外的路径行为不变）；**main 分支未做任何改动**
+
+#### ⏸ 暂缓（需要交互式会话配合）
+
+- `main_page` 单函数 ~950 行拆分：函数体内大量闭包共享 UI 元素引用，机械拆分回归风险高，且 UI 层无法在无界面环境验证，建议单独一次会话 + 真机验证后进行
 
 ### 2026.08.17 性能优化版本（ad 分支，提交 `d51d4cd`）
 

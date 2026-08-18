@@ -33,6 +33,9 @@ LOG_FILE="$LOG_DIR/server-${DATE_TAG}.log"
 echo "[Log] Purging logs older than 7 days ..."
 find "$LOG_DIR" -name "server-*.log" -type f -mtime +7 -delete 2>/dev/null || true
 
+# 服务端口（可用环境变量 BBALL_PORT 覆盖，demo_nicegui.py 同源读取）
+PORT="${BBALL_PORT:-7871}"
+
 echo ""
 echo "============================================"
 echo "  Basketball Goal Detection Service"
@@ -40,7 +43,7 @@ echo "============================================"
 echo "  Script : $SCRIPT_DIR"
 echo "  Project: $PROJECT_ROOT"
 echo "  Python : $PYTHON"
-echo "  Browser: http://127.0.0.1:7871/"
+echo "  Browser: http://127.0.0.1:${PORT}/"
 echo "  Log    : $LOG_FILE"
 echo "  Press Ctrl+C to stop"
 echo "============================================"
@@ -48,9 +51,9 @@ echo ""
 
 # 杀旧进程（端口占用时）
 KILLED=0
-PID=$(lsof -ti:7871 2>/dev/null || true)
+PID=$(lsof -ti:$PORT 2>/dev/null || true)
 if [ -n "$PID" ]; then
-    echo "[Port 7871] Killing old PID=$PID"
+    echo "[Port $PORT] Killing old PID=$PID"
     kill -9 $PID 2>/dev/null || true
     KILLED=1
 fi
@@ -60,6 +63,7 @@ fi
 # export BBALL_CACHE_ROOT="$PROJECT_ROOT/cache"
 
 cd "$SCRIPT_DIR"
+export BBALL_PORT="$PORT"
 echo "Starting service..."
 # tee: 控制台 + 日志双写，-a 表示同日追加
 "$PYTHON" -u demo_nicegui.py 2>&1 | tee -a "$LOG_FILE"
