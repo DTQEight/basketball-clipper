@@ -39,6 +39,14 @@ echo  Ctrl+C to stop
 echo ============================================
 echo.
 
+REM --- Force UTF-8 end-to-end (fix Chinese mojibake in console + log):
+REM uv-managed Python defaults to UTF-8 output, but PowerShell decodes native
+REM command output with the console codepage (GBK on zh-CN) -> garbled text.
+REM Pin both sides to UTF-8 regardless of Python distribution.
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+chcp 65001 >nul
+
 REM --- Kill old process if port 7871 occupied
 set "_KILLED=0"
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENING"') do (
@@ -49,9 +57,10 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":7871 " ^| findstr "LISTENIN
 if "!_KILLED!"=="1" timeout /t 2 /nobreak >nul
 
 REM --- Start service (stdout/stderr -> console + log file, PowerShell built-in Tee)
+REM [Console]::OutputEncoding=UTF8 makes PowerShell decode python's UTF-8 output correctly
 cd /d "%SCRIPT_DIR%"
 echo Starting service...
-powershell -NoProfile -Command "& '%PYTHON%' -u demo_nicegui.py 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
+powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '%PYTHON%' -u demo_nicegui.py 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
 
 echo.
 echo Service stopped. Press any key to exit.

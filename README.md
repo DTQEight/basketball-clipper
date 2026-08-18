@@ -390,6 +390,7 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 #### 🔧 附带修复
 
 - `tracker.py` `__init__` 初始化顺序：搜索区域坐标必须先于 `set_baseline` 定义（ROI 化后 `set_baseline` 依赖这些坐标，旧顺序会 `AttributeError`）
+- `start.bat` 中文乱码：uv 管理的 Python 默认 UTF-8 输出，而 PowerShell 按控制台代码页（GBK）解码导致终端与日志乱码；现在双侧强制 UTF-8（`PYTHONUTF8`/`PYTHONIOENCODING`/`chcp 65001` + `[Console]::OutputEncoding`）
 
 #### ✅ 验证
 
