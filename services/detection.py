@@ -230,6 +230,7 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 
     clips = []
     _done = 0
+    _clips_t0 = time.time()
     # 进度回调统一在提交线程（本线程）内触发，保持单线程调用语义，与旧串行版一致
     with ThreadPoolExecutor(max_workers=_workers) as pool:
         futs = [pool.submit(_cut_one, gi, gts) for gi, gts in enumerate(goals)]
@@ -239,8 +240,11 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                 clips.append(clip)
             _done += 1
             if progress_callback:
+                # 预计剩余时间：按片段完成速率线性外推
+                _eta_sec = ((len(goals) - _done) / max(_done, 1)
+                            * max(time.time() - _clips_t0, 0.001))
                 progress_callback(80 + 18 * _done / len(goals),
-                                  f'生成片段 {_done}/{len(goals)}')
+                                  f'生成片段 {_done}/{len(goals)} | 预计剩余 {_eta_sec:.0f}s')
     # as_completed 完成顺序乱，按进球序恢复，保证卡片时间戳顺序稳定
     clips.sort(key=lambda c: c["idx"])
     return clips
@@ -534,7 +538,11 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         phase = '跳过'
                     else:
                         phase = '跳帧'
-                    _report(pct, f'{phase}帧 {processed}/{n_frames} ({processed*100//n_frames}%)')
+                    # 预计剩余时间：按当前处理速率线性外推（跳过/跳帧比例稳定时准确）
+                    _eta_min = ((n_frames - processed) / max(processed, 1)
+                                * max(time.time() - t0, 0.001)) / 60.0
+                    _report(pct, f'{phase}帧 {processed}/{n_frames} '
+                                 f'({processed*100//n_frames}%) | 预计剩余 {_eta_min:.1f} 分钟')
                 # 定期释放 CUDA 缓存：每 500 帧一次（100 帧太频繁，empty_cache 本身会同步阻塞）
                 if processed % 500 == 0:
                     try:
@@ -1186,6 +1194,12 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
                 try:
                     # 归一化：每个视频占 1/n_total 份，pct 为当前视频的 0-100
                     overall = (idx + max(0, min(100, pct)) / 100.0) / n_total * 100.0
+                    # 整批预计剩余时间：按已耗时与整体进度线性外推
+                    # （前几个视频偏慢时估算偏保守，随进度收敛）
+                    _elapsed = time.time() - _batch_t0
+                    if overall > 1.0:
+                        _eta_min = _elapsed * (100.0 - overall) / overall / 60.0
+                        msg = f'{msg} | 整批预计剩余 {_eta_min:.0f} 分钟'
                     progress_callback(overall, f'[{idx+1}/{n_total}] {vname} · {msg}')
                 except Exception:
                     pass
