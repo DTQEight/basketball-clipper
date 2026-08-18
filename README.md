@@ -526,6 +526,18 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 展示位置：右侧进度面板（`progress_detail`）；批量模式另在左下迷你进度条同步整体百分比
 - 终审结论：**GO**——ETA 三处数学正确、除零保护完备、锁契约未触碰；52 测试全过且无断言被破坏；P0/P1 阻塞项为空
 
+### 2026.08.18（晚）第三轮审查修复（P1/P2/P3，提交 `6942998`）
+
+ETA 定版后的增量审查，按优先级修复 P1×4 / P2×3 / P3×3，测试 52 → **55 用例全过**：
+
+| 优先级 | 关键修复 |
+|--------|----------|
+| P1 并发/锁归属 | 单视频「加载」路径补占任务锁（双击并发跑两个 `load_video` 同写 state 的窗口）；`load_video`/`on_load_history`/`on_batch_load_video` 锁下沉任务本体（`task_token`+finally，与 detect/batch/highlights 对齐）；新增 `hl_cancel_event`——批量检测「取消」不再连带杀死流水线集锦生成，`hl_busy` 生命周期归 `generate_highlights`（防页面刷新后双线程写同一输出文件）；Windows 重启按钮弃用 `os.execv`（旧进程 socket 不保证释放，新进程绑定同端口可致服务下线），改分离进程+1s 延迟接管+`os._exit(0)` |
+| P2 健壮性 | `tracker.feed` fps 0/None 归一化（防冷却 `/fps` 除零、`self.fps*5` TypeError、无效值写回实例状态）；`video_io` 三连——`read_frame` 容忍 `total/fps=None`（与 0 同语义，旧契约钉 None 必抛 TypeError 改宽容）、`iter_frames` batch<1 视为 1（防取模除零）、`VideoReader.__del__` 兜底释放容器（Windows 句柄锁文件）；`get_video_info` 无视频流报明确错误（非裸 IndexError）；`app.get_ball_model` 只选篮球专用权重，无匹配回退 COCO（旧实现盲选第一个 .pt，类别表无球类时拒绝检测） |
+| P3 清理/体验 | 运动断档即清空 `blob_history`（旧实现每帧仅淘汰 1 条，断档重出现的斑块把上段轨迹 y 值混进下行趋势检查）；删除死代码（`_user_diff_threshold`/`baseline_update_count`）；集锦拼接回退重编码纳入 NVENC 信号量（消费卡 2 路配额，防并发第 3 路 OpenEncodeSession 失败）；`_refresh_history` 异步化走 io_bound；进度条主行短状态+详情行完整消息（两行不再重复同一内容） |
+
+**遗留项**（按决策不修，等人工确认后再定）：`auto_thr` 计算从 `median_p95 + 8` 调到 `+11`（对齐旧 main 的 warmup 阈值，潜在影响 4th 开场 2 漏检）
+
 ### 2026.08.18（下午）2026.08.15 四节完整批量对比（修复版，14:15-14:34）
 
 两轮审查修复后的完整批量识别测试（6 视频批量，含 08.15 四节），对比旧 main 各节单测数据：
