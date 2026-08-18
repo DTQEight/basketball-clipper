@@ -6,18 +6,20 @@ UI 层只需调用本模块的函数并传入参数。
 import logging
 import math
 import os
+import sys
+import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from . import state
-
-# 项目根目录（basketball-clipper/）
+# 项目根目录（basketball-clipper/）—— 必须在扁平模块导入之前注入 sys.path
 _ROOT = Path(__file__).parent.parent.resolve()
-import sys
-sys.path.insert(0, str(_ROOT))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from . import state
 
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
@@ -157,12 +159,42 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     # 编码参数只检测一次（NVENC 探测是子进程，循环内重复调用会显著拖慢）
     _enc = build_encode_args(ff, quality="preview")
+    _is_nvenc = "h264_nvenc" in _enc
     # GeForce 消费卡驱动限制同时 2-5 路 NVENC 会话，保守用 2；软编受 CPU 核数约束用 3
-    _workers = 2 if "h264_nvenc" in _enc else 3
+    _workers = 2 if _is_nvenc else 3
     clip_half = int(fps * PREVIEW_CLIP_HALF_SEC)
+    # 软编回退参数：NVENC 运行时失败（驱动/会话配额）时单段重切用
+    _enc_x264 = None if not _is_nvenc else build_encode_args(ff, quality="preview", use_nvenc=False)
+
+    def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
+        return [ff, "-y", "-loglevel", "error",
+                "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
+                "-t", f"{seg_dur_sec:.3f}",
+                "-vf", "scale=-2:480"] + enc_args + \
+               ["-movflags", "+faststart", clip_path]
+
+    def _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args):
+        """跑一次 ffmpeg 切片。失败抛异常（含 stderr 尾部）。"""
+        # NVENC 会话配额（消费卡限 2 路）：与集锦 cut_clips 共用信号量排队
+        if "h264_nvenc" in enc_args:
+            with state.nvenc_semaphore:
+                _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
+                             creationflags=state.SBOX, capture_output=True,
+                             text=True, timeout=60)
+        else:
+            _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
+                         creationflags=state.SBOX, capture_output=True,
+                         text=True, timeout=60)
+        if _r.returncode != 0:
+            tail = (_r.stderr or "")[-1500:].strip()
+            raise RuntimeError(f"ffmpeg exit {_r.returncode}: {tail}")
 
     def _cut_one(gi, gts):
-        """切单个片段，成功返回 clip dict，失败/取消返回 None（异常不外抛）。"""
+        """切单个片段，成功返回 clip dict，失败/取消返回 None（异常不外抛）。
+
+        NVENC 失败时自动回退软编重切一次，降低 clips < goals（预览失败的
+        真实进球从集锦中二次丢失）的概率。
+        """
         if cancel_check and cancel_check():
             return None
         gframe = int(gts * fps)
@@ -173,17 +205,27 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
         clip_path = str(out_dir / f"goal_{gi}_{int(gts)}s_{stamp}.mp4")
         seg_start_sec = seg_start / fps
         seg_dur_sec = (seg_end - seg_start) / fps
-        try:
-            _sp.run([ff, "-y", "-loglevel", "error",
-                     "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
-                     "-t", f"{seg_dur_sec:.3f}",
-                     "-vf", "scale=-2:480"] + _enc +
-                    ["-movflags", "+faststart", clip_path],
-                    creationflags=state.SBOX, capture_output=True, timeout=60)
-            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                return {"ts": gts, "path": clip_path, "idx": gi}
-        except Exception as e:
-            log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
+        enc_args = _enc
+        for _attempt in range(2):  # 第 2 次 = NVENC 失败后软编重试
+            try:
+                _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args)
+                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                    return {"ts": gts, "path": clip_path, "idx": gi}
+                log.warning(f"[WARN] 预览片段生成空文件 ({gts:.1f}s)，跳过")
+                return None
+            except Exception as e:
+                if _attempt == 0 and _enc_x264 is not None:
+                    log.warning(f"[WARN] 预览片段 NVENC 失败 ({gts:.1f}s)，回退软编重切: {e}")
+                    enc_args = _enc_x264
+                    continue
+                log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
+                # 清理失败残留的半截文件（旧实现留着 0 字节文件占目录）
+                try:
+                    if os.path.exists(clip_path):
+                        os.remove(clip_path)
+                except OSError:
+                    pass
+                return None
         return None
 
     clips = []
@@ -239,6 +281,16 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     if end <= start:
         return "❌ 结束帧必须大于起始帧", False
 
+    # ===== 入口一次性快照本次检测的全部输入（P1） =====
+    # 旧实现生命周期内 4 次读取 state.video_state["path"]（预热 reader / 正式 reader /
+    # 预览片段 / 写历史），批量检测运行数十分钟，期间 UI 切换视频会改写全局 path，
+    # 导致同一 run_detect 的不同阶段取到不同视频 → 历史记录与实际检测视频错位。
+    video_path = state.video_state["path"]
+    baseline_frame = state.calib["baseline_frame"]
+    baseline_idx = state.calib["baseline_idx"]
+    video_width = state.video_state.get("width")
+    video_height = state.video_state.get("height")
+
     _report(5, '初始化检测器...')
     try:
         # ============================================================
@@ -252,7 +304,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if bool(auto_threshold):
             _report(6, '预热：收集前30s帧噪声水平...')
             _warmup_detector = GoalDetector(
-                hoop, baseline_frame=state.calib["baseline_frame"],
+                hoop, baseline_frame=baseline_frame,
                 min_gap_sec=float(min_gap_sec),
                 diff_threshold=int(diff_threshold),
                 min_blob_area=int(min_blob_area),
@@ -261,7 +313,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 yolo_confirm=True, rolling_baseline_sec=60.0,
                 min_circularity=float(min_circularity),
                 min_in_hoop_frames=int(min_in_hoop_frames),
-                auto_threshold=True)
+                auto_threshold=True,
+                fps=fps)
             # ceil 修正：iter_frames 是半开区间 [start, end)，需要保证区间内存在
             # 满足 (fidx-start)/fps >= 30s 的帧，预热完成判定才能触发。
             # fps=30.0 时 int(900)+1=901 即可（900/30=30.0s 但取不到）；
@@ -270,7 +323,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             _warmup_end = min(end, start + int(math.ceil(30.0 * max(fps, 1.0))) + 1)
             _warmup_n = max(0, _warmup_end - start)
             _ws = time.time()
-            _warmup_reader = VideoReader(state.video_state["path"])
+            _warmup_reader = VideoReader(video_path)
             try:
                 for _wfidx, _wframe in _warmup_reader.iter_frames(start=start, end=_warmup_end, batch=1):
                     # 预热期只跑 diff 收集 P95，ball_pos=None 跳过 YOLO（省显存/耗时）
@@ -280,6 +333,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         _report(6 + 3 * (_wfidx - start) / max(_warmup_n, 1),
                                 f'预热采样 {(_wfidx - start)}/{_warmup_n} 帧...')
                     if _warmup_detector._warmup_done:
+                        break
+                    # 预热循环也响应取消（旧实现不检查，点取消后还要无响应跑完约 900 帧）
+                    if state.cancel_event.is_set():
                         break
             finally:
                 _warmup_reader.close()
@@ -312,7 +368,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # - auto_threshold=False：使用预热得到的 _effective_diff_threshold 作为固定阈值
         # - 从 start 帧完整检测，前30s不会再跳过进球
         _use_auto_for_detector = False   # 正式检测阶段永远关闭内部预热
-        detector = GoalDetector(hoop, baseline_frame=state.calib["baseline_frame"],
+        detector = GoalDetector(hoop, baseline_frame=baseline_frame,
                                 min_gap_sec=float(min_gap_sec),
                                 diff_threshold=_effective_diff_threshold,
                                 min_blob_area=int(min_blob_area),
@@ -321,7 +377,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                 yolo_confirm=True, rolling_baseline_sec=60.0,
                                 min_circularity=float(min_circularity),
                                 min_in_hoop_frames=int(min_in_hoop_frames),
-                                auto_threshold=_use_auto_for_detector)
+                                auto_threshold=_use_auto_for_detector,
+                                fps=fps)
         # 把步骤A计算出的自适应阈值信息挂到正式 detector 上，保持旧代码读取逻辑兼容
         if _warmup_info is not None:
             detector._auto_threshold_value = _warmup_info["auto_threshold_value"]
@@ -334,6 +391,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
         # 回退 COCO 权重（yolov8n.pt）时类 0 是 person，硬编码会误把球员当球确认
         _ball_classes = get_ball_class_ids(model, _weights_path)
+        if not _ball_classes:
+            # names 解析不出球类别 = 权重不可信：拒绝检测而不是把 person 当球确认
+            return "❌ 无法从模型类别表识别球类别（model.names 异常），请检查权重文件", False
 
         t0 = time.time()
         t0_str = time.strftime('%H:%M:%S', time.localtime(t0))
@@ -344,8 +404,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # ============ DEBUG: 开始信息 ============
         log.info("\n" + "=" * 68)
         log.info(f"[DETECT START] {t0_str}")
-        log.info(f"  Video       : {state.video_state['path']}")
-        log.info(f"  Resolution  : {state.video_state.get('width', '?')}x{state.video_state.get('height', '?')}  @ {fps:.1f} fps")
+        log.info(f"  Video       : {video_path}")
+        log.info(f"  Resolution  : {video_width}x{video_height}  @ {fps:.1f} fps")
         log.info(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
         if bool(auto_threshold):
             # 如实区分预热成功 / 预热失败回退，避免 ABORT 后仍显示"已预热"误导排查
@@ -367,11 +427,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _debug_last_processed = 0
 
         _report(15, f'开始检测 {n_frames} 帧...')
-        reader = VideoReader(state.video_state["path"])
+        reader = VideoReader(video_path)
         # 跳帧检测：每 N 帧跑一次 YOLO，跳过的帧复用上一帧 ball_pos（只跑 diff）
         # 篮球下落速度 ~8m/s，30fps 下每帧位移 <0.3m，连续 2 帧丢失不会漏检
         _yolo_step = max(1, int(yolo_step))
-        _last_ball_pos = None
+        # (检测帧号, ball_pos)：复用跳帧结果时保留原始检测帧号，
+        # 保持 tracker 时间窗口（±N 帧内球在筐边）的语义准确
+        _last_ball = None
         _stat_yolo_called = 0
         _stat_yolo_skipped = 0
         _stat_yolo_failed = 0   # YOLO 推理异常次数（如驱动升级后 CUDA 上下文失效）
@@ -380,17 +442,21 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 if state.cancel_event.is_set():
                     break
                 ball_pos = None
+                ball_frame = None    # ball_pos 对应的真实检测帧号
                 need_yolo = False
                 _yolo_skipped = False  # 条件跳过标记（用于进度显示）
                 # 预热已在前置 pass 完成，正式阶段从帧 0 直接跑检测（不再跳过前30s YOLO/进球）
                 # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果
                 need_yolo = ((processed % _yolo_step) == 0)
+                # ROI 每帧至多算一次：条件跳过判定与 feed 共用
+                # （旧实现 has_motion_near_hoop 与 feed 内部各算一次，~1-2ms/帧纯浪费）
+                _pending_roi = detector.compute_roi(frame) if (need_yolo and skip_yolo_no_motion) else None
                 if need_yolo and skip_yolo_no_motion:
                     # 条件跳过：篮筐区域无运动像素时跳过 YOLO（省 ~60ms）
-                    if not detector.has_motion_near_hoop(frame):
+                    if not detector.has_motion_near_hoop(frame, frame_roi=_pending_roi):
                         need_yolo = False
                         ball_pos = None
-                        _last_ball_pos = None
+                        _last_ball = None
                         _yolo_skipped = True
                         _stat_yolo_skipped += 1
                 if need_yolo:
@@ -413,7 +479,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                             ball_pos = (float(cx), float(cy), float(x1), float(y1),
                                         float(x2), float(y2), float(confs[best]))
-                        _last_ball_pos = ball_pos
+                        _last_ball = (fidx, ball_pos)
                     except Exception as e:
                         # 不能静默吞掉：CUDA 失效（如升级显卡驱动后未重启服务）会
                         # 持续抛异常 → 球位置永远为空 → 所有进球被"YOLO确认"拒绝 → 0 进球空跑全程
@@ -429,9 +495,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                       f"{_stat_yolo_failed}/{_stat_yolo_called}")
                             break
                 else:
-                    # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效）
-                    ball_pos = _last_ball_pos
-                detector.feed(ball_pos, fidx, fps, frame=frame)
+                    # 跳帧：复用最近一次 YOLO 结果（只在篮筐附近有效），
+                    # 帧号用原始检测帧号（位置是 1-2 帧前的，不能用当前帧号）
+                    if _last_ball is not None:
+                        ball_frame, ball_pos = _last_ball
+                detector.feed(ball_pos, fidx, fps, frame=frame,
+                              ball_frame=ball_frame, frame_roi=_pending_roi)
                 processed += 1
                 # 每 10 帧更新一次进度
                 if processed % 10 == 0:
@@ -493,7 +562,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         _stamp = int(time.time())
         state.last_goal_clips.extend(
-            _generate_preview_clips(state.video_state["path"], goals, start, end,
+            _generate_preview_clips(video_path, goals, start, end,
                                     fps, total, _stamp, progress_callback=_report,
                                     cancel_check=state.cancel_event.is_set)
         )
@@ -514,8 +583,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         # 检测成功后写入片段缓存并持久化（key 统一走 clip_cache_key，排序+round）
         if state.last_goal_clips:
-            state.put_clip_cache(state.clip_cache_key(state.video_state["path"], goals),
+            state.put_clip_cache(state.clip_cache_key(video_path, goals),
                                  state.last_goal_clips)
+
+        # clips < goals 时显式提示：预览失败的进球是真实的，
+        # 用户应知晓集锦将缺少这些球（旧实现静默缩水）
+        _missing_previews = len(goals) - len(state.last_goal_clips)
 
         _report(100, '完成！')
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
@@ -565,6 +638,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         status = (f"检测完成 | 处理 {processed} 帧 | 耗时 {_total_elapsed:.0f}s\n"
                   f"进球: {len(detector.goals)} 个 | "
                   f"YOLO确认: {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)")
+        if _missing_previews > 0:
+            status += f"\n⚠ {_missing_previews} 个进球的预览片段生成失败（集锦将缺少这些球）"
         if detector.auto_threshold and detector._auto_threshold_value is not None:
             status += f"\n自适应阈值: {detector._auto_threshold_value} (P95+8)"
         # ===== 准备历史记录写入数据 =====
@@ -610,8 +685,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 速度 vs 实时倍数
         _speed_vs_realtime = video_dur_min / max(_detect_elapsed / 60.0, 0.001)
 
-        state.add_history(state.video_state["path"], hoop, detector.goals,
-                          baseline_idx=state.calib["baseline_idx"],
+        _saved_record = state.add_history(video_path, hoop, detector.goals,
+                          baseline_idx=baseline_idx,
                           ball_conf=ball_conf,
                           min_gap_sec=min_gap_sec,
                           diff_threshold=_diff_for_history,
@@ -629,8 +704,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           detect_end_time=_end_abs,
                           # ===== 视频元信息 =====
                           video_fps=fps,
-                          video_width=state.video_state.get("width"),
-                          video_height=state.video_state.get("height"),
+                          video_width=video_width,
+                          video_height=video_height,
                           video_total_frames=total,
                           video_duration_sec=video_dur_min * 60.0,
                           # ===== 处理速度指标 =====
@@ -654,9 +729,17 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           auto_threshold_value=_auto_thr_for_history,
                           warmup_p95_median=_warmup_p95_for_history,
                           warmup_sample_count=_warmup_count_for_history)
+        if _saved_record is None:
+            # 磁盘/权限问题导致未落盘：显式告知（旧实现静默，用户下次启动才发现历史缺失）
+            status += "\n⚠ 历史记录写入失败（磁盘/权限问题），本次结果未持久化"
         return status, True
     except Exception as e:
         import traceback
+        # 异常路径清理旧结果：同一视频重跑失败时，UI 卡片不应残留上一次成功的
+        # 进球/片段，避免用户把旧结果误当本次结果（与 YOLO 熔断路径对齐）
+        state.last_goal_clips.clear()
+        state.kept_goal_indices.clear()
+        state.last_goals.clear()
         return f"❌ 检测失败: {e}\n{traceback.format_exc()}", False
 
 
@@ -733,9 +816,12 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
         out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
-                             progress_callback=progress_callback)
+                             progress_callback=progress_callback,
+                             cancel_check=state.cancel_event.is_set)
         if out_path and os.path.exists(out_path):
             return out_path, f"集锦已生成（{len(goals)} 个进球片段）\n输出: {out_path}"
+        if state.cancel_event.is_set():
+            return None, "已取消集锦生成"
         return None, "❌ 集锦生成失败"
     except Exception as e:
         import traceback
@@ -754,13 +840,22 @@ def on_load_history(idx_choice, progress_callback=None):
     _report(5, '读取历史记录...')
     if idx_choice is None:
         return None, "请先选择一条历史记录", ""
-    records = state.load_history()
+    try:
+        records = state.load_history()
+    except OSError as e:
+        return None, f"历史记录暂时无法读取（{e}），请稍后重试", ""
     if idx_choice < 0 or idx_choice >= len(records):
         return None, "历史记录不存在", ""
     r = records[idx_choice]
     video_path = r.get("video", "")
     if not os.path.exists(video_path):
         return None, f"视频文件不存在: {video_path}", ""
+    # 加载历史 = 回到单视频模式：清空批量状态，
+    # 否则残留的 batch_files/batch_current_video 会让后续单视频检测的历史
+    # 被误标 batch_idx/batch_total（UI 侧同步隐藏批量面板）
+    state.batch_files = []
+    state.batch_calibs = {}
+    state.batch_current_video = None
 
     _report(15, '读取视频信息...')
     try:
@@ -779,7 +874,7 @@ def on_load_history(idx_choice, progress_callback=None):
         base_frame = read_frame(video_path, saved_baseline_idx,
                                 total=info["total"], fps=info["fps"])
         if base_frame is not None:
-            state.calib["baseline_frame"] = base_frame.copy()
+            state.calib["baseline_frame"] = base_frame  # read_frame 返回全新数组，无需 copy
             state.calib["baseline_idx"] = saved_baseline_idx
         else:
             state.calib["baseline_frame"] = None
@@ -851,8 +946,13 @@ def on_batch_load_video(selected, progress_callback=None):
     if video_path in state.batch_calibs:
         cal = state.batch_calibs[video_path]
         state.calib["hoop"] = cal["hoop"]
-        state.calib["baseline_frame"] = cal["baseline_frame"]
-        state.calib["baseline_idx"] = cal["baseline_idx"]
+        # 基准帧按保存的帧号现读（~百 ms，已在 io_bound 线程）：
+        # 旧实现 batch_calibs 常驻整帧 BGR（1080p ~6MB/个），
+        # 50 个视频批量 ≈300MB 常驻至程序结束，而帧只在检测瞬间用一次
+        base_frame = read_frame(video_path, cal["baseline_idx"],
+                                total=None, fps=0)
+        state.calib["baseline_frame"] = base_frame
+        state.calib["baseline_idx"] = cal["baseline_idx"] if base_frame is not None else -1
         state.calib["clicks"] = []
     else:
         state.calib["hoop"] = None
@@ -937,14 +1037,17 @@ def on_batch_load_video(selected, progress_callback=None):
 
 
 def on_batch_save_calib():
-    """保存当前标定到当前批量视频。"""
+    """保存当前标定到当前批量视频。
+
+    只存 hoop + baseline_idx（不存整帧 BGR）：50 个视频的整帧常驻 ~300MB，
+    而基准帧只在检测启动瞬间用到，检测/加载时按帧号现读。
+    """
     if state.batch_current_video is None:
         return "请先从列表选择视频"
     if state.calib["hoop"] is None or state.calib["baseline_frame"] is None:
         return "请先标定篮筐"
     state.batch_calibs[state.batch_current_video] = {
         "hoop": state.calib["hoop"],
-        "baseline_frame": state.calib["baseline_frame"].copy(),
         "baseline_idx": state.calib["baseline_idx"],
     }
     n_calib = len(state.batch_calibs)
@@ -978,7 +1081,6 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             and state.calib["hoop"] is not None and state.calib["baseline_frame"] is not None):
         state.batch_calibs[cur] = {
             "hoop": state.calib["hoop"],
-            "baseline_frame": state.calib["baseline_frame"].copy(),
             "baseline_idx": state.calib["baseline_idx"],
         }
     lines = []
@@ -1017,8 +1119,14 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
                                   codec=info["codec"], current_frame=0,
                                   width=info["width"], height=info["height"])
+        # 基准帧按标定保存的帧号现读（batch_calibs 不再常驻整帧，~6MB/视频）
+        base_frame = read_frame(video_path, cal["baseline_idx"], total=info["total"], fps=info["fps"])
+        if base_frame is None:
+            lines.append(f"✗ {name}: 基准帧读取失败（帧 {cal['baseline_idx']}），跳过")
+            log.info(f"    ↳ BASELINE READ FAIL @ frame {cal['baseline_idx']}")
+            continue
         state.calib["hoop"] = cal["hoop"]
-        state.calib["baseline_frame"] = cal["baseline_frame"]
+        state.calib["baseline_frame"] = base_frame
         state.calib["baseline_idx"] = cal["baseline_idx"]
         state.calib["clicks"] = []
 
@@ -1068,6 +1176,9 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             lines.append(f"✗ {name}: {reason}")
             log.info(f"    ↳ FAIL: {reason}")
     # ============ DEBUG: BATCH 结束 ============
+    # 批量结束（含取消路径）重置当前视频标记：防止之后切单视频检测时
+    # 残留的 batch_current_video 让历史记录误带 batch_idx/batch_total
+    state.batch_current_video = None
     _batch_elapsed = time.time() - _batch_t0
     _end_time = time.strftime('%H:%M:%S')
     log.info("")

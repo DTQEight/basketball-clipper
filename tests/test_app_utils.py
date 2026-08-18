@@ -22,9 +22,15 @@ class TestBallClassIds:
         names = {5: "soccer ball", 2: "basketball", 9: "car"}
         assert get_ball_class_ids(_FakeModel(names)) == [2, 5]
 
-    def test_empty_names_fallback_zero(self):
-        assert get_ball_class_ids(_FakeModel({})) == [0]
-        assert get_ball_class_ids(_FakeModel(None)) == [0]
+    def test_empty_names_fallback_empty(self):
+        """names 异常 → 返回 []（调用方应拒绝检测，而不是把 person 当球确认）。"""
+        assert get_ball_class_ids(_FakeModel({})) == []
+        assert get_ball_class_ids(_FakeModel(None)) == []
+
+    def test_baseball_bat_not_matched(self):
+        """精确匹配：'baseball bat'/'baseball glove' 含子串 ball 但不是球类。"""
+        names = {0: "person", 39: "baseball bat", 38: "baseball glove", 32: "sports ball"}
+        assert get_ball_class_ids(_FakeModel(names)) == [32]
 
 
 class TestNaturalSort:

@@ -2,6 +2,7 @@
 
 被 demo_nicegui.py 等前端导入使用。
 """
+import logging
 import os
 import sys
 import threading
@@ -11,17 +12,16 @@ ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # ============ 缓存目录（跨平台）============
-if os.environ.get("BBALL_CACHE_ROOT"):
-    _CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
-else:
-    # 与 services/state.py 保持一致：项目内 cache 目录
-    _CACHE_ROOT = str(ROOT / "cache")
+# 复用 services/state.py 的单一实现：各自维护一份环境变量回退逻辑会漂移
+from services.state import CACHE_ROOT as _CACHE_ROOT
 os.environ["MPLCONFIGDIR"] = os.path.join(_CACHE_ROOT, "matplotlib")
 os.environ["ULTRALYTICS_CONFIG_DIR"] = os.path.join(_CACHE_ROOT, "ultralytics")
 os.environ["TORCH_HOME"] = os.path.join(_CACHE_ROOT, "torch")
 for _d in [os.environ[k] for k in ["MPLCONFIGDIR",
           "ULTRALYTICS_CONFIG_DIR", "TORCH_HOME"]]:
     os.makedirs(_d, exist_ok=True)
+
+_log = logging.getLogger("app")
 
 # 公共模块（当前仅暴露给其他模块的函数在此）
 
@@ -52,14 +52,18 @@ def get_model(weights: str):
                 dev = get_device()
                 if dev != "cpu":
                     m.to(dev)
-            except Exception:
-                pass
+            except Exception as e:
+                # 静默 pass 会让 get_device() 结论与模型真实驻地不一致，至少留痕
+                _log.warning(f"[WARN] 模型搬运到 {get_device()} 失败，将由推理端自愈: {e}")
             _model_cache[weights] = m
         return _model_cache[weights]
 
 
-# 球类候选关键词：自定义权重通常为 'basketball'，COCO 预训练为 'sports ball'
-_BALL_CLASS_KEYS = ("basketball", "sports ball", "ball")
+# 球类精确名集合：自定义权重通常为 'basketball'，COCO 预训练为 'sports ball'。
+# 必须精确匹配：旧实现用子串 'ball' 匹配，会把 COCO 的 'baseball bat'(39)/
+# 'baseball glove'(38) 也当球 → "YOLO 硬否决"退化为"筐边有球棒也确认"。
+_BALL_CLASS_NAMES = {"basketball", "sports ball", "ball", "soccer ball",
+                     "football", "volleyball", "tennis ball"}
 
 
 def get_ball_class_ids(model, weights_path: str = "") -> list:
@@ -68,17 +72,18 @@ def get_ball_class_ids(model, weights_path: str = "") -> list:
     classes=[0] 只对 names={0:'basketball'} 的自定义微调权重成立；
     回退 COCO 权重（yolov8n.pt）时类 0 是 person（sports ball 是 32），
     硬编码 [0] 会把"YOLO 硬否决"变成"篮筐附近有人就确认"，误检暴增。
-    解析失败时保守回退 [0]（兼容单类自定义权重布局）。
+    解析失败返回 []（而非回退 [0]）：names 异常说明权重不可信，
+    调用方应拒绝检测而不是把 person 当球确认错误结果。
     """
     try:
         names = model.names or {}
         ids = sorted(i for i, n in names.items()
-                     if any(k in str(n).lower() for k in _BALL_CLASS_KEYS))
+                     if str(n).strip().lower() in _BALL_CLASS_NAMES)
         if ids:
             return ids
     except Exception:
         pass
-    return [0]
+    return []
 
 
 def get_ball_model() -> tuple:

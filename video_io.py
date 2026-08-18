@@ -32,27 +32,51 @@ def av_open(path: str):
     return av.open(path)
 
 
+def _stream_start_pts(stream, fps: float) -> int:
+    """视频流起始 pts（帧号换算基准）。
+
+    .ts/.flv 等容器的首帧 pts 常从非零开始（录制起点偏移），
+    不减去起始偏移会导致所有帧号/进球时间戳整体平移。
+    小于 0.5s 的偏移忽略：mp4 常带微小头部偏移（如半帧），
+    换算会引入帧级抖动，得不偿失。
+    """
+    try:
+        if stream.start_time is not None and stream.time_base:
+            tb = float(stream.time_base)
+            if tb > 0:
+                start_sec = float(stream.start_time) * tb
+                if start_sec > 0.5:
+                    return int(start_sec / tb)
+    except Exception:
+        pass
+    return 0
+
+
 def get_video_info(path: str) -> dict:
     """获取视频基本信息。
 
     返回 dict: {total, fps, width, height, codec, duration}
     """
     c = av_open(path)
-    s = c.streams.video[0]
-    # s.frames 可能为 None/0（部分视频头信息不全），or 0 兜底；
-    # 不能写 int(s.frames)，None 会抛 TypeError
-    total = int(s.frames or 0)
-    fps = float(s.average_rate) if s.average_rate else 30.0
-    width = s.width or 0
-    height = s.height or 0
-    codec = s.codec_context.name or "unknown"
-    duration = 0.0
-    if s.duration and s.time_base:
-        duration = float(s.duration) * float(s.time_base)
-    # 某些视频 frames 为 0，按 duration*rate 估算
-    if total == 0 and duration > 0 and fps > 0:
-        total = int(duration * fps)
-    c.close()
+    try:
+        s = c.streams.video[0]
+        # s.frames 可能为 None/0（部分视频头信息不全），or 0 兜底；
+        # 不能写 int(s.frames)，None 会抛 TypeError
+        total = int(s.frames or 0)
+        fps = float(s.average_rate) if s.average_rate else 30.0
+        width = s.width or 0
+        height = s.height or 0
+        codec = s.codec_context.name or "unknown"
+        duration = 0.0
+        if s.duration and s.time_base:
+            duration = float(s.duration) * float(s.time_base)
+        # 某些视频 frames 为 0，按 duration*rate 估算
+        if total == 0 and duration > 0 and fps > 0:
+            total = int(duration * fps)
+    finally:
+        # 无视频流（streams.video[0] IndexError）时也要释放容器，
+        # Windows 下泄漏句柄会锁定文件妨碍后续删除/覆盖
+        c.close()
     return {
         "total": max(total, 1),
         "fps": fps,
@@ -85,14 +109,15 @@ def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
         if fps <= 0:
             fps = float(stream.average_rate) if stream.average_rate else 30.0
         tb = float(stream.time_base) if stream.time_base else 1.0 / fps
-        target_pts = int(idx / fps / tb) if tb > 0 else 0
+        start_pts = _stream_start_pts(stream, fps)
+        target_pts = start_pts + int(idx / fps / tb) if tb > 0 else 0
         # 提前约 2 帧 seek：关键帧对齐可能使 seek 落在目标帧之后，
         # 提前解码再跳到目标帧，保证返回的是目标帧而非更晚的帧
         pre_pts = int(2.0 / fps / tb) if tb > 0 else 0
         container.seek(max(0, target_pts - pre_pts), stream=stream)
         for f in container.decode(stream):
             cur_pts = f.pts if f.pts is not None else 0
-            cur_idx = int(round(cur_pts * tb * fps))
+            cur_idx = int(round((cur_pts - start_pts) * tb * fps))
             if cur_idx >= idx:
                 return f.to_ndarray(format="bgr24")
         return None
@@ -120,21 +145,28 @@ class VideoReader:
 
     def __init__(self, path):
         self.container = av_open(path)
-        self.stream = self.container.streams.video[0]
-        # 直接复用已打开的容器读取信息，避免再 open 一次（get_video_info 会重开）
-        s = self.stream
-        self.total = int(s.frames or 0) or 0
-        self.fps = float(s.average_rate) if s.average_rate else 30.0
-        if self.total == 0 and s.duration and s.time_base:
-            duration = float(s.duration) * float(s.time_base)
-            if duration > 0:
-                self.total = int(duration * self.fps)
-        self.total = max(self.total, 1)
-        self.tb = float(self.stream.time_base) if self.stream.time_base else 1.0 / self.fps
+        try:
+            self.stream = self.container.streams.video[0]
+            # 直接复用已打开的容器读取信息，避免再 open 一次（get_video_info 会重开）
+            s = self.stream
+            self.total = int(s.frames or 0) or 0
+            self.fps = float(s.average_rate) if s.average_rate else 30.0
+            if self.total == 0 and s.duration and s.time_base:
+                duration = float(s.duration) * float(s.time_base)
+                if duration > 0:
+                    self.total = int(duration * self.fps)
+            self.total = max(self.total, 1)
+            self.tb = float(self.stream.time_base) if self.stream.time_base else 1.0 / self.fps
+            # 起始 pts 偏移（.ts/.flv 非零起始），帧号换算需减去
+            self.start_pts = _stream_start_pts(self.stream, self.fps)
+        except Exception:
+            # 构造中途失败（无视频流等）也要释放容器，避免句柄泄漏锁文件
+            self.close()
+            raise
 
     def seek(self, frame_idx):
         """seek 到指定帧号（提前约 2 帧，确保 decode 覆盖目标帧）。"""
-        pts = int(frame_idx / self.fps / self.tb) if self.tb > 0 else 0
+        pts = self.start_pts + int(frame_idx / self.fps / self.tb) if self.tb > 0 else 0
         pre = int(2.0 / self.fps / self.tb) if self.tb > 0 else 0
         self.container.seek(max(0, pts - pre), stream=self.stream)
 
@@ -151,7 +183,7 @@ class VideoReader:
         self.seek(start)
         for f in self.container.decode(self.stream):
             cur_pts = f.pts if f.pts is not None else 0
-            fidx = int(round(cur_pts * self.tb * self.fps))
+            fidx = int(round((cur_pts - self.start_pts) * self.tb * self.fps))
             if fidx < start:
                 continue
             if fidx >= end:

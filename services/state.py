@@ -5,6 +5,7 @@
 """
 import os
 import json
+import shutil
 import time
 import threading
 import logging
@@ -74,12 +75,18 @@ def setup_logging():
 
 
 def _purge_old_clips(max_days=7):
-    """启动时自动清理 demo_output/ 下超过 max_days 天的旧预览片段。"""
+    """启动时自动清理 demo_output/ 下超过 max_days 天的旧预览片段。
+
+    `-highlights.mp4` 后缀的集锦是用户最终产物，豁免清理
+    （旧实现与预览片段同目录无差别删除，一周后集锦静默消失）。
+    """
     out = DEMO_OUTPUT_DIR
     if not os.path.isdir(out):
         return
     cutoff = time.time() - max_days * 86400
     for fname in os.listdir(out):
+        if fname.endswith("-highlights.mp4"):
+            continue  # 集锦成品不按临时文件清理
         fpath = os.path.join(out, fname)
         try:
             if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
@@ -88,7 +95,29 @@ def _purge_old_clips(max_days=7):
             pass
 
 
+def _purge_orphan_clip_dirs(max_days=1):
+    """启动时清理 clips/ 下进程残留的 hl-* 临时目录。
+
+    cut_clips 正常路径会清理自己的临时目录，但进程被 taskkill/崩溃时
+    finally 不执行，残留目录（每个可达数百 MB）会无限累积。
+    """
+    clips_root = os.path.join(CACHE_ROOT, "clips")
+    if not os.path.isdir(clips_root):
+        return
+    cutoff = time.time() - max_days * 86400
+    for dname in os.listdir(clips_root):
+        dpath = os.path.join(clips_root, dname)
+        if not dname.startswith("hl-") or not os.path.isdir(dpath):
+            continue
+        try:
+            if os.path.getmtime(dpath) < cutoff:
+                shutil.rmtree(dpath, ignore_errors=True)
+        except OSError:
+            pass
+
+
 _purge_old_clips()
+_purge_orphan_clip_dirs()
 
 # ============ 运行时状态 ============
 video_state = {"path": None, "total": 0, "fps": 30.0, "codec": "unknown",
@@ -120,40 +149,122 @@ batch_current_video = None
 # 与全局 last_goals/last_goal_clips 完全隔离，支持流水线：后台跑检测 + 前台确认已完成视频
 batch_results = {}
 
+# ============ 全局任务互斥（进程级，跨页面连接/刷新共享）============
+# 旧实现的 _busy 锁在 NiceGUI 页面函数局部：每个浏览器连接/刷新独立执行页面函数，
+# 刷新后旧检测线程仍在跑、新页面可再启动任务 → 两线程并发 clear/extend 同一列表、
+# 并发写历史文件、cancel_event 被误 clear。锁必须下沉到进程级模块。
+task_lock = threading.Lock()
+_busy_task = None
+
+
+def try_acquire_task(task: str) -> bool:
+    """尝试占用全局任务锁（原子 test-and-set）；已被占用返回 False。
+
+    task: 'detect' / 'batch' / 'highlights' / 'load' 等任务名
+    """
+    global _busy_task
+    with task_lock:
+        if _busy_task is not None:
+            return False
+        _busy_task = task
+        return True
+
+
+def release_task() -> None:
+    """释放全局任务锁。"""
+    global _busy_task
+    with task_lock:
+        _busy_task = None
+
+
+def current_task():
+    """返回当前占用锁的任务名（无任务返回 None）。"""
+    with task_lock:
+        return _busy_task
+
+
+# 流水线集锦小锁（批量运行中对快照视频生成集锦，不占全局任务锁）。
+# 同理下沉到模块级：页面局部 dict 刷新后失效会导致两连接同时跑集锦。
+hl_busy = {"on": False}
+
+# NVENC 编码会话信号量：GeForce 消费卡驱动限制同时 2 路编码会话。
+# 预览片段线程池（services/detection）与集锦（cutter/ffmpeg_cutter）跨模块
+# 共用同一配额：超限时第 3 路在 acquire 上排队等待，而不是 OpenEncodeSession 失败。
+nvenc_semaphore = threading.Semaphore(2)
+
 
 # ============ 历史记录 ============
+def _atomic_write_json(path, data, indent=None):
+    """原子写 JSON：先写临时文件再 os.replace，失败清理残留临时文件。
+
+    直接 open("w") 覆盖写时，进程中途退出/断电会留下半截 JSON；
+    temp + replace 保证磁盘上要么是完整旧文件、要么是完整新文件。
+    Windows 下目标文件恰好被其他线程读取时 replace 抛 PermissionError，
+    做 3 次短重试（读写窗口只有几十 ms）。
+    """
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def load_history() -> list:
     """加载历史记录列表。
 
-    文件损坏（JSON 解析失败）时先改名备份为 .corrupt-<时间戳>.bak 再返回空列表：
-    旧实现静默返回 [] 后，下一次 add_history 会用空列表覆盖写整个文件，
-    一次写盘中断/损坏 = 全部历史丢失。
+    - JSON 解析失败（真实损坏）：先改名备份为 .corrupt-<时间戳>.bak 再返回空列表，
+      避免下一次 add_history 用空列表覆盖写丢失全部历史。
+    - IO 异常（如 Windows 共享冲突，文件恰好被写入方替换中）：短重试后抛出 OSError，
+      **不动原文件** —— 旧实现把这类瞬态错误也当损坏改名，完好的历史会被误"清空"。
+      调用方需捕获 OSError（add_history 内部已处理：读取失败时放弃写入，不覆盖）。
     """
     if not os.path.exists(HISTORY_FILE):
         return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+    last_err = None
+    for attempt in range(3):
         try:
-            os.replace(HISTORY_FILE, bak)
-            logging.getLogger("state").warning(
-                f"[WARN] 历史记录解析失败（{e}），原文件已备份到 {bak}，将以空记录重新开始")
-        except OSError:
-            logging.getLogger("state").warning(
-                f"[WARN] 历史记录解析失败（{e}），且备份失败: {bak}")
-        return []
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+            try:
+                os.replace(HISTORY_FILE, bak)
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录解析失败（{e}），原文件已备份到 {bak}，将以空记录重新开始")
+            except OSError:
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录解析失败（{e}），且备份失败: {bak}")
+            return []
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    raise last_err
 
 
-def save_history(records):
-    """保存历史记录到磁盘。"""
+def save_history(records) -> bool:
+    """保存历史记录到磁盘（原子写）。返回是否成功。"""
     try:
         os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(HISTORY_FILE, records, indent=2)
+        return True
     except Exception as e:
         logging.getLogger("state").warning(f"[WARN] 保存历史记录失败: {e}")
+        return False
 
 
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
@@ -211,11 +322,17 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
     """添加一条历史记录（同视频会覆盖旧记录）。
 
     可选字段见 _HISTORY_FIELD_CASTS；未知字段抛 TypeError（防调用方拼错字段名静默丢数据）。
+    返回: 新记录 dict；读取/写入失败（IO 错误）时返回 None 且**不覆盖**磁盘旧数据。
     """
     unknown = set(fields) - set(_HISTORY_FIELD_CASTS)
     if unknown:
         raise TypeError(f"add_history 收到未知字段: {sorted(unknown)}")
-    records = load_history()
+    try:
+        records = load_history()
+    except OSError as e:
+        logging.getLogger("state").warning(
+            f"[WARN] 历史记录读取失败，本次结果未写入（避免空列表覆盖旧数据）: {e}")
+        return None
     records = [r for r in records if r.get("video") != video_path]
     rec = {
         "video": video_path,
@@ -238,7 +355,9 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         rec[name] = value
     records.insert(0, rec)
     records = records[:MAX_HISTORY_RECORDS]
-    save_history(records)
+    if not save_history(records):
+        return None
+    return rec
 
 
 # ============ 片段缓存 ============
@@ -252,10 +371,19 @@ def clip_cache_key(video_path: str, goals) -> tuple:
 
 
 def put_clip_cache(key, clips):
-    """写入片段缓存条目 + 超限驱逐最旧 + 落盘（三个调用点共用的完整流程）。"""
+    """写入片段缓存条目 + 超限驱逐最旧（同步删除其磁盘片段）+ 落盘。"""
     clip_cache[key] = list(clips)
     if len(clip_cache) > CLIP_CACHE_MAX_ENTRIES:
-        clip_cache.pop(next(iter(clip_cache)))
+        evicted = clip_cache.pop(next(iter(clip_cache)))
+        # 驱逐时同步删除磁盘片段文件：旧实现只弹内存条目，
+        # mp4 靠 7 天兜底清理，重度使用短期可堆积数 GB
+        for c in evicted:
+            try:
+                p = c.get("path", "")
+                if p and os.path.exists(p) and "-highlights" not in os.path.basename(p):
+                    os.remove(p)
+            except OSError:
+                pass
     save_clip_cache()
 
 
@@ -272,20 +400,24 @@ def load_clip_cache():
                          for c in item.get("clips", [])]
                 if clips and all(os.path.exists(c["path"]) for c in clips):
                     cache[key] = clips
-    except Exception:
-        pass
+    except json.JSONDecodeError as e:
+        # 损坏至少留一条日志（旧实现静默 pass，缓存消失无从归因）
+        logging.getLogger("state").warning(f"[WARN] 片段缓存解析失败，已忽略: {e}")
+    except OSError as e:
+        logging.getLogger("state").warning(f"[WARN] 片段缓存读取失败，已忽略: {e}")
+    except (KeyError, TypeError, ValueError) as e:
+        logging.getLogger("state").warning(f"[WARN] 片段缓存结构异常，已忽略: {e}")
     return cache
 
 
 def save_clip_cache():
-    """把内存片段缓存索引写入磁盘。"""
+    """把内存片段缓存索引写入磁盘（原子写）。"""
     try:
         data = [{"video": v, "goals": list(g),
                  "clips": [{"ts": c["ts"], "path": c["path"], "idx": c["idx"]} for c in clips]}
                 for (v, g), clips in clip_cache.items()]
         os.makedirs(os.path.dirname(CLIP_CACHE_FILE), exist_ok=True)
-        with open(CLIP_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        _atomic_write_json(CLIP_CACHE_FILE, data)
     except Exception as e:
         logging.getLogger("state").warning(f"[WARN] 保存片段缓存失败: {e}")
 

@@ -38,7 +38,8 @@ class GoalDetector:
                  rolling_baseline_sec=60.0,
                  min_circularity=0.35,
                  min_in_hoop_frames=2,
-                 auto_threshold=True):
+                 auto_threshold=True,
+                 fps=30.0):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
@@ -69,6 +70,9 @@ class GoalDetector:
                     阈值 = median(P95s) + 8，clamp 到 [8, 50]
                     预热期内只采样不判定进球
             False - 使用 diff_threshold 固定值
+        fps: 视频帧率（默认 30）。内部所有"按秒定义"的时间窗口
+             （上方状态保持 1.5s / YOLO 时间窗 ±0.34s）按 fps 换算成帧数，
+             避免硬编码帧数在 60fps 视频上窗口减半、15fps 上翻倍。
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -133,18 +137,21 @@ class GoalDetector:
         self.last_blob_box = None      # 上一帧斑块位置
         self.last_above_frame = -999   # 上次斑块在篮筐上方的帧号
         self.last_in_hoop_frame = -999 # 上次斑块在篮筐框内的帧号
-        self.above_timeout_frames = 45 # 上方状态保持时长（约 1.5 秒 @30fps）
+        # 上方状态保持时长按秒定义（1.5 秒），按 fps 换算帧数：
+        # 旧实现硬编码 45 帧，60fps 视频窗口缩到 0.75s（漏检）、15fps 拉长到 3s（误配）
+        self.fps = float(fps)
+        self.above_timeout_frames = max(10, int(1.5 * self.fps))
 
         self.goals = []                # 进球时间戳
         self.last_goal_frame = -1
-        self.fps = 30.0
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
 
         # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
         # 格式: [(frame_idx, cx, cy), ...]，保留最近 yolo_window_frames 帧
         # deque：旧实现 list.pop(0) 为 O(n)，popleft 为 O(1)
+        # 窗口按秒定义（±0.34 秒 ≈ 10 帧 @30fps），同样按 fps 换算
         self.ball_pos_history = deque()
-        self.yolo_window_frames = 10   # 时间窗口大小（±10帧 ≈ 0.33秒 @30fps）
+        self.yolo_window_frames = max(5, int(0.34 * self.fps))
 
         # 诊断计数器
         self.diag = {
@@ -159,6 +166,7 @@ class GoalDetector:
             "reject_trend": 0,     # 趋势检查失败
             "reject_no_blob": 0,   # 没检测到运动斑块
             "side_goal": 0,        # 侧向进筐判定成功
+            "loose_goal": 0,       # 宽松模式进框判定成功（独立于 side_goal，便于排查漏检来源）
             "timeout_goal": 0,     # 超时匹配成功
             "yolo_confirmed": 0,   # YOLO 双确认成功
             "yolo_rejected": 0,    # YOLO 双确认失败（diff 触发但 YOLO 没球）
@@ -191,15 +199,21 @@ class GoalDetector:
             return
         self.baseline_gray = roi.copy()
 
-    def has_motion_near_hoop(self, frame, threshold: int | None = None) -> bool:
+    def compute_roi(self, frame):
+        """公开包装：预计算当前帧的搜索区 ROI（供检测循环复用，省一次重复处理）。"""
+        return self._roi_gray(frame)
+
+    def has_motion_near_hoop(self, frame, threshold: int | None = None,
+                             frame_roi=None) -> bool:
         """快速检查篮筐搜索区域是否有运动像素（用于条件跳过 YOLO）。
 
         只做裁剪 + absdiff + countNonZero，不做形态学/连通域，~1ms。
+        frame_roi: 调用方已用 compute_roi 算好的 ROI，传入可省一次重复计算。
         返回: True=有运动（需要 YOLO），False=无运动（可跳过 YOLO）
         """
         if self.baseline_gray is None:
             return True  # 基准帧还没设，不跳过
-        frame_roi = self._roi_gray(frame)
+        frame_roi = frame_roi if frame_roi is not None else self._roi_gray(frame)
         if frame_roi.size == 0 or frame_roi.shape != self.baseline_gray.shape:
             return True
         diff = cv2.absdiff(frame_roi, self.baseline_gray)
@@ -298,7 +312,8 @@ class GoalDetector:
 
         return best_blob
 
-    def feed(self, ball_pos, frame_idx: int, fps: float, frame=None):
+    def feed(self, ball_pos, frame_idx: int, fps: float, frame=None,
+             ball_frame=None, frame_roi=None):
         """喂入一帧数据。
 
         ball_pos: YOLO 球位置 (cx, cy, x1, y1, x2, y2, conf) 或 None
@@ -307,6 +322,10 @@ class GoalDetector:
         frame_idx: 当前帧号
         fps: 帧率
         frame: 当前帧 BGR 图像（必须提供）
+        ball_frame: ball_pos 实际对应的检测帧号（默认与 frame_idx 相同）。
+                    跳帧复用上一帧 YOLO 结果时，位置是 1-2 帧前的，
+                    传入原始帧号保持时间窗口语义（±N 帧内球在筐边）准确。
+        frame_roi: 预计算的搜索区 ROI（compute_roi 产出），传入可省一次重复处理。
         返回: 进球时间戳（秒）或 None
         """
         self.fps = fps
@@ -330,7 +349,9 @@ class GoalDetector:
 
         # 搜索区域 ROI：灰度 + 模糊（只处理篮筐周边 ~5% 画面，不碰整帧，
         # 旧实现对整幅 1080p 做 cvtColor+GaussianBlur 后又丢弃 ~95% 结果）
-        frame_roi = self._roi_gray(frame)
+        # 支持外部传入预计算结果：检测循环里 has_motion_near_hoop 与 feed
+        # 各算一次 ROI 属纯浪费（~1-2ms/帧，~2-4% 吞吐）
+        frame_roi = frame_roi if frame_roi is not None else self._roi_gray(frame)
 
         # 冷却期检查
         if self.last_goal_frame >= 0:
@@ -338,12 +359,18 @@ class GoalDetector:
             if gap_sec < self.min_gap_sec:
                 self.diag["reject_cooldown"] += 1
                 self.last_blob_box = None
+                # 冷却早退不走下方"无斑块"分支，in_hoop 计数若不重置会残留：
+                # 冷却结束后第一帧（如抢篮板球员持球进框）残留计数立即满足
+                # "连续 min_in_hoop_frames 帧"，跳过防噪约束直接触发 loose 误报
+                self.blob_in_hoop_frames = 0
                 return None
 
         # 缓存 YOLO 球位置到历史（用于双确认的时间窗口检查）
         # 进球是一个过程（~0.3秒），即使触发瞬间 YOLO 漏检，前后帧检测到也能确认
         if ball_pos is not None:
-            self.ball_pos_history.append((frame_idx, ball_pos[0], ball_pos[1]))
+            self.ball_pos_history.append(
+                (ball_frame if ball_frame is not None else frame_idx,
+                 ball_pos[0], ball_pos[1]))
         # 保留最近 yolo_window_frames 帧
         cutoff = frame_idx - self.yolo_window_frames
         while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
@@ -547,7 +574,7 @@ class GoalDetector:
         self.last_goal_frame = frame_idx
         self.blob_history.clear()
         if source == "loose":
-            self.diag["side_goal"] += 1  # 复用 side_goal 计数器
+            self.diag["loose_goal"] += 1  # 独立计数器（旧实现复用 side_goal，两条路径混在一起无法排查）
         return True
 
     def _check_downward_trend(self, n=4):

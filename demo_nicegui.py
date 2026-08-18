@@ -219,7 +219,11 @@ def main_page():
         if not YOLO_SELFCHECK["ok"]:
             def _do_restart_service():
                 """os.execv 原地替换进程：旧进程终止自动释放端口，新进程重新自检。"""
-                os.execv(sys.executable, [sys.executable, '-u'] + sys.argv)
+                try:
+                    os.execv(sys.executable, [sys.executable, '-u'] + sys.argv)
+                except Exception as e:
+                    # timer 回调线程内失败不应静默（否则点击无响应无从排查）
+                    ui.notify(f'重启失败: {e}，请手动重启服务', type='negative', position='top')
 
             def _on_confirm_restart():
                 restart_dialog.close()
@@ -460,25 +464,25 @@ def main_page():
             else:
                 el.classes(add='hidden')
 
-    # ====== 全局任务互斥（B1）：检测/批量/集锦/加载运行期间，禁止其他改 state 的操作 ======
-    _busy = {"task": None}
-
+    # ====== 全局任务互斥：锁在 services.state（进程级，跨页面连接/刷新共享）======
+    # 旧实现 _busy 是页面函数局部变量：NiceGUI 每个连接/刷新独立执行页面函数，
+    # 刷新后旧检测线程还在跑、新页面锁为空可再启动任务 → 并发写全局 state。
     def _task_label(task):
         return {'detect': '开始识别', 'batch': '批量识别',
                 'highlights': '生成集锦', 'load': '加载视频'}.get(task, '后台任务')
 
     def _try_acquire(task):
         """尝试占用任务锁；已有任务运行则提示并返回 False。"""
-        if _busy["task"] is not None:
-            _set_status(f'「{_task_label(_busy["task"])}」正在进行，请等待完成或取消', 'err')
+        if not state.try_acquire_task(task):
+            _set_status(f'「{_task_label(state.current_task())}」正在进行，请等待完成或取消', 'err')
             return False
-        _busy["task"] = task
         return True
 
     def _refuse_if_busy():
         """轻量操作守卫：有任务运行时提示并返回 True（调用方直接 return）。"""
-        if _busy["task"] is not None:
-            _set_status(f'「{_task_label(_busy["task"])}」正在进行，请稍后再试', 'err')
+        cur = state.current_task()
+        if cur is not None:
+            _set_status(f'「{_task_label(cur)}」正在进行，请稍后再试', 'err')
             return True
         return False
 
@@ -502,6 +506,7 @@ def main_page():
             state.batch_files = files
             state.batch_calibs = {}
             state.batch_current_video = None
+            state.batch_results.clear()  # 清掉上一轮快照，防止新文件夹同名视频显示旧结果
             batch_panel.classes(remove='hidden')
             _refresh_batch_list()
             # 自动加载第一个视频（同时同步下拉框）
@@ -513,11 +518,15 @@ def main_page():
         state.batch_files = []
         state.batch_calibs = {}
         state.batch_current_video = None
+        state.batch_results.clear()
         _cards_video["path"] = None  # 离开快照查看模式
         # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
         #       已下沉到 detection.load_video 业务层（切视频即清空），UI 层不再重复
         #       以避免 frame is None 分支漏清空导致旧数据残留
-        frame, info = detection.load_video(path)
+        # 开容器 + seek + 解码第 0 帧在大视频上可达数百 ms~秒级，
+        # 走 io_bound 避免阻塞 UI 事件循环（与批量加载路径一致）
+        from nicegui import run
+        frame, info = await run.io_bound(detection.load_video, path)
         if frame is not None:
             # 切换视频：仅清 UI 卡片容器缓存（state 已由 load_video 清空）
             _refresh_result_cards()
@@ -554,8 +563,7 @@ def main_page():
     # 当前结果卡片显示的视频：None=全局模式（单视频/批量最后结果）
     # 非空=批量快照模式（流水线：后台检测继续跑，前台确认该视频的快照结果）
     _cards_video = {"path": None}
-    # 流水线集锦小锁：批量运行中对快照视频生成集锦，不占全局任务锁
-    _hl_busy = {"on": False}
+    # 流水线集锦小锁在 services.state（跨页面连接共享），此处不再用页面局部 dict
 
     async def _on_batch_load_video(path=None):
         """加载批量视频（从下拉或列表点击）。
@@ -573,7 +581,7 @@ def main_page():
             path = batch_select.value
         # ===== 流水线模式：批量识别运行中 =====
         # 点已完成视频 → 只切换卡片到该视频快照（纯展示，不动全局 state/标定，不打断后台检测）
-        if _busy["task"] == 'batch':
+        if state.current_task() == 'batch':
             if path and path in state.batch_results:
                 batch_select.set_value(path)
                 _cards_video["path"] = path
@@ -602,12 +610,20 @@ def main_page():
             return
         try:
             batch_select.set_value(path)
-            # 若该视频已有检测结果，生成预览片段可能耗时，用 io_bound 避免阻塞 UI
+            # 若该视频已有检测结果，生成预览片段可能耗时（缓存未命中时 ~40s/50球），
+            # 用 io_bound 避免阻塞 UI；同时切到进度面板给出可见反馈（旧实现
+            # 进度写在隐藏容器里，界面静止像卡死）
             from nicegui import run
+            _show_right_pane('progress')
+            progress_bar.set_value(0.3)
+            progress_text.set_text(f'正在加载 {os.path.basename(path)}...')
+            progress_detail.set_text('')
 
             def _progress_callback(pct, msg):
                 try:
-                    progress_text.set_text(msg)
+                    progress_bar.set_value(max(0.3, pct / 100))
+                    progress_text.set_text(f'正在加载 {os.path.basename(path)}')
+                    progress_detail.set_text(msg)
                 except Exception:
                     pass
 
@@ -617,16 +633,16 @@ def main_page():
             except Exception as _e:
                 import traceback
                 frame, info, status = None, "", f"❌ 加载视频异常: {_e}\n{traceback.format_exc()}"
+            _show_right_pane('preview')
             if frame is not None:
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
-                _show_right_pane('preview')
             info_text.set_text(info)
             calib_status.set_text(status)
             # 刷新结果卡片（已检测过的视频会显示进球列表）
             _refresh_result_cards()
         finally:
-            _busy["task"] = None
+            state.release_task()
             _batch_loading = False
 
     def _on_batch_save_calib():
@@ -638,7 +654,7 @@ def main_page():
         _set_status(status, 'ok' if '已保存' in status else 'err')
 
     async def _on_batch_run():
-        if _busy["task"] == 'batch':
+        if state.current_task() == 'batch':
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
             state.cancel_event.set()
             batch_run_btn.set_text('正在取消...')
@@ -698,7 +714,7 @@ def main_page():
             status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"
             ok = False
         finally:
-            _busy["task"] = None
+            state.release_task()
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
         batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
@@ -710,13 +726,17 @@ def main_page():
         _refresh_result_cards()
         _refresh_batch_list()
 
-    def _on_image_click(e):
+    async def _on_image_click(e):
         """点击预览图标定篮筐。
 
         使用 ui.interactive_image 的 on_mouse 事件，e.image_x/e.image_y
         已由前端按 显示尺寸/原始尺寸 比例换算为原始帧坐标。
+        read_frame（开容器+seek+解码）走 io_bound：大视频上同步执行
+        会冻结 UI 0.5~2 秒，批量标定 2N 次点击体验极差。
         """
-        if _busy["task"] is not None:
+        if state.current_task() is not None:
+            # 进程级锁（含另一页面连接启动的批量任务）运行中禁止标定：
+            # 否则批量线程会清掉用户的 clicks / 覆盖 hoop
             calib_status.set_text('任务进行中，暂不能标定')
             return
         try:
@@ -728,7 +748,8 @@ def main_page():
                 x = max(0, min(x, nat_w - 1))
             if nat_h > 0:
                 y = max(0, min(y, nat_h - 1))
-            frame, status = detection.click_calibrate(x, y)
+            from nicegui import run
+            frame, status = await run.io_bound(detection.click_calibrate, x, y)
             if frame is not None:
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
@@ -744,19 +765,22 @@ def main_page():
         await _on_batch_load_video(e.value)
     batch_select.on_value_change(_on_batch_select_change)
 
-    def _on_reset():
+    async def _on_reset():
         if _refuse_if_busy():
             return
         status = detection.reset_hoop()
         calib_status.set_text(status)
-        # 刷新预览
+        # 刷新预览（read_frame 走 io_bound，避免大视频上同步解码卡 UI）
         if state.video_state["path"]:
-            frame, _ = detection.preview_frame(state.video_state["current_frame"])
-            if frame is not None:
-                preview_image.set_source(video_utils.frame_to_base64(frame))
+            from nicegui import run
+            result = await run.io_bound(detection.preview_frame, state.video_state["current_frame"])
+            if result is not None:
+                frame, _ = result
+                if frame is not None:
+                    preview_image.set_source(video_utils.frame_to_base64(frame))
 
     async def _on_detect():
-        if _busy["task"] == 'detect':
+        if state.current_task() == 'detect':
             # 检测中点击 → 请求取消，run_detect 轮询后中断
             state.cancel_event.set()
             detect_btn.set_text('正在取消...')
@@ -801,7 +825,7 @@ def main_page():
             status = f"❌ 检测异常: {_e}\n{traceback.format_exc()}"
             ok = False
         finally:
-            _busy["task"] = None
+            state.release_task()
         # 隐藏进度条，显示预览图（无论成功/失败/取消，都回到一致的 preview 态，避免视频重叠）
         _show_right_pane('preview')
         if state.cancel_event.is_set():
@@ -870,6 +894,10 @@ def main_page():
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--err); border: 1px solid rgba(239, 68, 68, 0.3)')
 
     def _on_preview_clip(idx):
+        # 全局模式下有任务运行时拒绝：检测线程可能正在 clear/extend clips，
+        # 与 clip_action 内 len 检查→取值之间竞态（快照模式只读快照，安全）
+        if _cards_video["path"] is None and _refuse_if_busy():
+            return
         path, status = detection.clip_action("preview", idx, video_path=_cards_video["path"])
         if path and os.path.exists(path):
             result_video_el.set_source(path)
@@ -879,6 +907,8 @@ def main_page():
         _set_status(status, 'info')
 
     def _on_export_clip(idx):
+        if _cards_video["path"] is None and _refuse_if_busy():
+            return
         path, status = detection.clip_action("export", idx, video_path=_cards_video["path"])
         if path and os.path.exists(path):
             ui.download(path)
@@ -897,11 +927,12 @@ def main_page():
     async def _on_highlights():
         vp = _cards_video["path"]
         # ===== 流水线分支：批量检测运行中，对快照视频生成集锦 =====
-        # 用独立小锁（不占全局任务锁），不切进度区（那里正显示批量进度），NVENC 与 CUDA 可并行
-        if vp is not None and _busy["task"] == 'batch':
-            if _hl_busy["on"]:
+        # 用独立小锁（不占全局任务锁，且在 state 模块级跨页面连接共享），
+        # 不切进度区（那里正显示批量进度），NVENC 与 CUDA 可并行
+        if vp is not None and state.current_task() == 'batch':
+            if state.hl_busy["on"]:
                 return
-            _hl_busy["on"] = True
+            state.hl_busy["on"] = True
             from nicegui import run
             # 显示集锦迷你进度条（不占右侧进度面板，那边正显示批量进度）
             hl_progress_strip.classes(remove='hidden')
@@ -924,7 +955,7 @@ def main_page():
                 import traceback
                 path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
             finally:
-                _hl_busy["on"] = False
+                state.hl_busy["on"] = False
                 hl_progress_strip.classes(add='hidden')
             if path and os.path.exists(path):
                 ui.download(path)
@@ -956,7 +987,7 @@ def main_page():
             import traceback
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
         finally:
-            _busy["task"] = None
+            state.release_task()
 
         if path and os.path.exists(path):
             ui.download(path)
@@ -966,12 +997,18 @@ def main_page():
             _show_right_pane('preview')
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
-    # 历史记录选中索引（用 dict 包一层，让闭包内外都能读写；普通变量需要 nonlocal 但跨多个函数不便）
-    _selected_history_idx = {"idx": None}
+    # 历史记录选中项（按视频路径记录，而非列表索引：
+    # 新检测会插入/覆盖记录使索引整体移动，旧索引会指向错误的行）
+    _selected_history = {"video": None}
 
     def _refresh_history():
         history_list.clear()
-        records = state.load_history()
+        try:
+            records = state.load_history()
+        except OSError as e:
+            with history_list:
+                ui.label(f'历史记录暂时无法读取（{e}）').classes('text-xs').style('color: var(--err)')
+            return
         if not records:
             with history_list:
                 ui.label('暂无历史记录').classes('text-gray-400 text-xs')
@@ -980,25 +1017,25 @@ def main_page():
             video = r.get("video", "")
             name = os.path.basename(video) if video else "未知"
             goals = len(r.get("goals", []))
-            selected = (_selected_history_idx["idx"] == i)
+            selected = (_selected_history["video"] is not None
+                        and video == _selected_history["video"])
             row_cls = 'history-row selected' if selected else 'history-row'
             with history_list:
-                def _make_click(idx):
+                def _make_click(rec_video, rec_idx):
                     async def _on_click():
-                        _selected_history_idx["idx"] = idx
+                        _selected_history["video"] = rec_video
                         _refresh_history()
-                        await _on_load_history()
+                        await _on_load_history(rec_idx)
                         exp_hist.set_value(False)  # 加载完成后自动收起历史面板
                     return _on_click
-                with ui.row().classes(f'w-full items-center gap-1 p-1 rounded cursor-pointer border {row_cls}').on('click', _make_click(i)):
+                with ui.row().classes(f'w-full items-center gap-1 p-1 rounded cursor-pointer border {row_cls}').on('click', _make_click(video, i)):
                     ui.label(f'{i+1}.').classes('text-xs font-bold font-mono').style('color: var(--accent)')
                     ui.label(name).classes('text-xs flex-1 truncate').style('color: var(--text-primary)')
                     ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
-    async def _on_load_history():
+    async def _on_load_history(idx=None):
         if _refuse_if_busy():
             return
-        idx = _selected_history_idx["idx"]
         if idx is None:
             _set_status('请先点击选择一条历史记录', 'err')
             return
@@ -1031,6 +1068,9 @@ def main_page():
         # 同步路径输入框，显示当前加载的视频
         if state.video_state["path"]:
             path_input.set_value(state.video_state["path"])
+            _selected_history["video"] = state.video_state["path"]
+        # 加载历史 = 单视频模式：隐藏批量面板（state 层已清 batch 三件套）
+        batch_panel.classes(add='hidden')
         info_text.set_text(info)
         _set_status(status, 'ok' if frame is not None else 'err')
         _refresh_result_cards()
@@ -1042,11 +1082,9 @@ def main_page():
 # ============ 启动 ============
 
 if __name__ == "__main__":
-    _out_dir = str(Path(state.CACHE_ROOT) / "demo_output")
-    os.makedirs(_out_dir, exist_ok=True)
-
     # 日志落盘（控制台 + cache/logs/app.log 按日轮转）：
     # 不再依赖 start 脚本 tee，直接 python demo_nicegui.py 启动也有日志文件
+    # （输出目录由 cutter/state 各自按需 makedirs，无需在此预创建）
     state.setup_logging()
 
     # YOLO/CUDA 自检已在模块加载时完成（见 _yolo_selfcheck），
