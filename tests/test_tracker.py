@@ -196,6 +196,26 @@ class TestFpsScaling:
                  frame=_frame_with_ball(100), ball_frame=8)
         assert det.ball_pos_history[-1][0] == 8
 
+    def test_windows_recalculated_when_fps_changes(self):
+        """构造后首次 feed 传入不同 fps → 时间窗口重算（API 陷阱回归防护）。"""
+        det = GoalDetector(HOOP, min_gap_sec=3.0, diff_threshold=25,
+                           rolling_baseline_sec=0, auto_threshold=False)  # 不传 fps → 默认 30
+        assert det.above_timeout_frames == 45
+        det.feed(None, 0, 60.0, frame=_base_frame())                     # 实际 60fps
+        assert det.above_timeout_frames == 90
+        assert det.yolo_window_frames == 20
+        det.feed(None, 1, 60.0, frame=_base_frame())                     # 同 fps 不重复重算（幂等）
+        assert det.above_timeout_frames == 90
+
+    def test_cooldown_records_ball_pos_samples(self):
+        """冷却期内 YOLO 检出的球位置仍入历史（补篮候选的 YOLO 确认依赖窗口内样本）。"""
+        det = _detector()
+        _feed_seq(det, [40, 40, 100, 100])          # 进球 @ idx 3
+        n_before = len(det.ball_pos_history)
+        det.feed(_ball_pos(100), 4, FPS, frame=_frame_with_ball(100))   # 冷却帧，有球
+        assert det.diag["reject_cooldown"] >= 1
+        assert len(det.ball_pos_history) == n_before + 1               # 样本被记录
+
 
 class TestWarmupExtended:
     def test_no_goal_registered_during_warmup(self):

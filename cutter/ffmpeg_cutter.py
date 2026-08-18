@@ -61,11 +61,15 @@ def _detect_nvenc(ffmpeg):
     except Exception:
         return False
     try:
-        r = subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error",
-             "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
-             "-frames:v", "3", "-c:v", "h264_nvenc", "-f", "null", "-"],
-            capture_output=True, text=True, creationflags=_SBOX, timeout=15)
+        # 真实编码探测也要持 NVENC 信号量：流水线模式下预览线程池可能已占满
+        # 2 路会话配额，无锁探测会 OpenEncodeSession 失败 → 误判"NVENC 不可用"
+        # → 整次集锦静默降级软编。探测会话仅 ~0.1s，等锁代价远小于误降级
+        with nvenc_semaphore:
+            r = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                 "-frames:v", "3", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, creationflags=_SBOX, timeout=15)
         return r.returncode == 0
     except Exception:
         return False
@@ -231,9 +235,27 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                                  f"(start={start:.1f}s): {_stderr_tail(e) or e}")
                     continue
             except subprocess.TimeoutExpired:
-                failed_segments += 1
-                _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 切片超时（>300s），跳过 (start={start:.1f}s)")
-                continue
+                if use_nvenc:
+                    # NVENC 挂起超时同样触发整体软编回退：
+                    # 只跳过当前段的话后续每段仍各等满 300s
+                    _log.warning(f"[剪辑] NVENC 切片超时，整体回退 libx264 软编"
+                                 f"(start={start:.1f}s)")
+                    use_nvenc = False
+                    encode_tag = "libx264 软编(NVENC 回退)"
+                    encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=False)
+                    try:
+                        subprocess.run(_build_cmd(encode_args), check=True,
+                                       capture_output=True, text=True,
+                                       creationflags=_SBOX, timeout=300)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
+                        failed_segments += 1
+                        _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 软编仍失败，跳过"
+                                     f"(start={start:.1f}s): {_stderr_tail(e2) or e2}")
+                        continue
+                else:
+                    failed_segments += 1
+                    _log.warning(f"[WARN] 片段 {i+1}/{len(segments)} 切片超时（>300s），跳过 (start={start:.1f}s)")
+                    continue
             except FileNotFoundError as e:
                 # PATH 无 ffmpeg（imageio_ffmpeg 导入失败时回退 "ffmpeg"）
                 _log.error(f"[剪辑] 找不到 ffmpeg 可执行文件: {ffmpeg}")

@@ -115,7 +115,7 @@ def click_calibrate(x, y):
         x2, y2 = max(p1[0], p2[0]), max(p1[1], p2[1])
         state.calib["hoop"] = (x1, y1, x2, y2)
         if frame is not None:
-            state.calib["baseline_frame"] = frame.copy()
+            state.calib["baseline_frame"] = frame  # read_frame 返回全新数组，无需 copy
             state.calib["baseline_idx"] = int(frame_idx)
         status = f"篮筐已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
         state.calib["clicks"] = []
@@ -251,18 +251,33 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                min_blob_area=30, search_margin=80, progress_callback=None,
-               auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False):
-    """运行进球检测。返回 (结果文本, 是否成功)。"""
+               auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False,
+               task_token=0):
+    """运行进球检测。返回 (结果文本, 是否成功)。
+
+    task_token: UI 侧 try_acquire_task 返回的 token。
+    传入时锁由本函数持有并在 finally 释放（锁归任务本体：UI 协程在页面
+    刷新/断开时被取消，io_bound 线程无法取消继续跑，若由 UI release
+    会出现"锁已释放、本线程还在写 state"的并发窗口）。
+    """
+    def _release_lock():
+        if task_token:
+            state.release_task(task_token)
+
     if state.video_state["path"] is None:
+        _release_lock()
         return "❌ 请先加载视频", False
     if state.calib["hoop"] is None:
+        _release_lock()
         return "❌ 请先点击画面标定篮筐", False
     if state.calib["baseline_frame"] is None:
+        _release_lock()
         return "❌ 基准帧差法需要基准帧，请重新标定", False
     # 不做 CPU 降级：无 CUDA 时直接拒绝检测（CPU 推理慢约 10 倍，
     # 静默降级会让用户误以为服务正常而空等数小时）
     _device = get_device()
     if _device == "cpu":
+        _release_lock()
         return "❌ 未检测到可用 CUDA，请检查显卡驱动/CUDA 环境后重启服务（不支持 CPU 推理）", False
 
     def _report(pct, msg):
@@ -279,6 +294,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     end = int(end_frame) if end_frame and int(end_frame) > 0 else total
     end = min(max(start + 1, end), total)
     if end <= start:
+        _release_lock()
         return "❌ 结束帧必须大于起始帧", False
 
     # ===== 入口一次性快照本次检测的全部输入（P1） =====
@@ -293,6 +309,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
     _report(5, '初始化检测器...')
     try:
+        # 取消短路：预热阶段已被取消时不再加载模型/构建检测器，
+        # 直接走取消返回（旧实现仍会跑完模型加载数秒~十几秒才退出）
+        if state.cancel_event.is_set():
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+            state.last_goals.clear()
+            return "已取消（预热阶段）", False
         # ============================================================
         # 步骤A（预热前置 pass）：auto_threshold=True 时先跑前 30s 帧算阈值
         # 预热阶段不跑 YOLO，不判定进球，只收集 P95，算出最终自适应阈值。
@@ -741,6 +764,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.kept_goal_indices.clear()
         state.last_goals.clear()
         return f"❌ 检测失败: {e}\n{traceback.format_exc()}", False
+    finally:
+        # 锁归任务本体：无论成功/失败/取消，线程真正结束时才释放。
+        # UI 侧不再 release（页面刷新取消 UI 协程时，本线程仍持有锁直到跑完）
+        _release_lock()
 
 
 def clip_action(action, idx, video_path=None):
@@ -792,27 +819,28 @@ def clip_action(action, idx, video_path=None):
 
 
 def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
-                        video_path=None):
+                        video_path=None, task_token=0):
     """生成集锦视频。
 
     video_path=None: 单视频模式，用全局 video_state + last_goals（原逻辑不变）。
     video_path 非空: 流水线快照模式，用 batch_results[video_path] 的 goals 生成，
                      批量检测运行中也可调用（NVENC 硬编与 CUDA 推理是 GPU 独立单元，可并行）。
+    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体）。
     """
-    if video_path is not None:
-        snap = state.batch_results.get(video_path)
-        if not snap:
-            return None, "❌ 该视频没有检测结果"
-        goals = list(snap["goals"])
-        src = video_path
-    else:
-        if state.video_state["path"] is None:
-            return None, "❌ 请先加载视频并检测进球"
-        goals = list(state.last_goals)
-        src = state.video_state["path"]
-    if not goals:
-        return None, "❌ 没有检测到进球"
     try:
+        if video_path is not None:
+            snap = state.batch_results.get(video_path)
+            if not snap:
+                return None, "❌ 该视频没有检测结果"
+            goals = list(snap["goals"])
+            src = video_path
+        else:
+            if state.video_state["path"] is None:
+                return None, "❌ 请先加载视频并检测进球"
+            goals = list(state.last_goals)
+            src = state.video_state["path"]
+        if not goals:
+            return None, "❌ 没有检测到进球"
         out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
@@ -826,6 +854,9 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
     except Exception as e:
         import traceback
         return None, f"❌ 剪辑失败: {e}\n{traceback.format_exc()}"
+    finally:
+        if task_token:
+            state.release_task(task_token)
 
 
 def on_load_history(idx_choice, progress_callback=None):
@@ -948,9 +979,11 @@ def on_batch_load_video(selected, progress_callback=None):
         state.calib["hoop"] = cal["hoop"]
         # 基准帧按保存的帧号现读（~百 ms，已在 io_bound 线程）：
         # 旧实现 batch_calibs 常驻整帧 BGR（1080p ~6MB/个），
-        # 50 个视频批量 ≈300MB 常驻至程序结束，而帧只在检测瞬间用一次
+        # 50 个视频批量 ≈300MB 常驻至程序结束，而帧只在检测瞬间用一次。
+        # total=0：read_frame 内部 `if total > 0` 才 clamp，传 None 会抛 TypeError；
+        # fps=0：read_frame 内部自动读流 fps。超界帧号由 decode 循环自然返回 None 兜底
         base_frame = read_frame(video_path, cal["baseline_idx"],
-                                total=None, fps=0)
+                                total=0, fps=0)
         state.calib["baseline_frame"] = base_frame
         state.calib["baseline_idx"] = cal["baseline_idx"] if base_frame is not None else -1
         state.calib["clicks"] = []
@@ -1062,7 +1095,7 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                      diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                      min_blob_area=30, search_margin=80, progress_callback=None,
                      auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False,
-                     per_video_callback=None):
+                     per_video_callback=None, task_token=0):
     """批量识别：遍历文件夹内全部视频逐个检测，每个视频独立写入历史。
 
     返回 (状态文本, 是否成功)。状态文本逐条列出每个视频的结果，
@@ -1070,7 +1103,25 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
     per_video_callback(video_path, goal_count): 每个视频检测成功后回调（UI 打完成标记）。
     结果同时存入 state.batch_results 快照，供流水线模式前台人工确认。
+    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体）。
     """
+    try:
+        return _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
+                                      diff_threshold, min_circularity, min_in_hoop_frames,
+                                      min_blob_area, search_margin, progress_callback,
+                                      auto_threshold, yolo_step, skip_yolo_no_motion,
+                                      per_video_callback)
+    finally:
+        if task_token:
+            state.release_task(task_token)
+
+
+def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
+                           diff_threshold, min_circularity, min_in_hoop_frames,
+                           min_blob_area, search_margin, progress_callback,
+                           auto_threshold, yolo_step, skip_yolo_no_motion,
+                           per_video_callback):
+    """run_batch_detect 的实际实现（锁由外层 wrapper 管理）。"""
     if not state.batch_files:
         return "请先加载文件夹", False
     # 流水线快照：重跑批量时覆盖旧结果

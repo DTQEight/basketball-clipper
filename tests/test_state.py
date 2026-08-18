@@ -147,6 +147,32 @@ class TestClipCache:
         assert hl_file.exists()
 
 
+class TestTaskLock:
+    def test_acquire_release_with_token(self, state_mod):
+        """token 机制：acquire 返回正整数；release 仅对匹配 token 生效。"""
+        t1 = state_mod.try_acquire_task('detect')
+        assert t1 > 0
+        assert state_mod.current_task() == 'detect'
+        assert state_mod.try_acquire_task('batch') == 0       # 互斥
+        state_mod.release_task(t1 + 999)                       # 错误 token 不释放
+        assert state_mod.current_task() == 'detect'
+        state_mod.release_task(t1)
+        assert state_mod.current_task() is None
+        t2 = state_mod.try_acquire_task('batch')
+        assert t2 > 0 and t2 != t1                             # token 单调递增
+        state_mod.release_task()                               # 无 token 兼容旧语义
+        assert state_mod.current_task() is None
+
+    def test_unicode_decode_error_backed_up(self, state_mod):
+        """GBK 编码的历史文件按损坏备份处理（不冒泡成检测失败）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0])
+        hist_file = state_mod.HISTORY_FILE
+        with open(hist_file, "wb") as f:
+            f.write('{"视频": "篮球"}'.encode('gbk'))          # 非 UTF-8 字节
+        assert state_mod.load_history() == []
+        assert glob.glob(hist_file + ".corrupt-*.bak")
+
+
 class TestCancelEvent:
     def test_event_semantics(self, state_mod):
         state_mod.cancel_event.clear()

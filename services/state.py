@@ -153,27 +153,42 @@ batch_results = {}
 # 旧实现的 _busy 锁在 NiceGUI 页面函数局部：每个浏览器连接/刷新独立执行页面函数，
 # 刷新后旧检测线程仍在跑、新页面可再启动任务 → 两线程并发 clear/extend 同一列表、
 # 并发写历史文件、cancel_event 被误 clear。锁必须下沉到进程级模块。
+#
+# 锁的所有权归**任务本体**（run_detect / run_batch_detect / generate_highlights
+# 在自己的 finally 里 release）：UI 协程在页面刷新/断开时会被取消，
+# io_bound 线程却无法取消继续跑，若由 UI finally release 会造成
+# "锁已释放、旧线程还在写 state"的并发窗口。
+# task_token 用于 UI 侧防御：release 只对持有当前 token 的任务生效。
 task_lock = threading.Lock()
 _busy_task = None
+_task_token = 0
 
 
-def try_acquire_task(task: str) -> bool:
-    """尝试占用全局任务锁（原子 test-and-set）；已被占用返回 False。
+def try_acquire_task(task: str) -> int:
+    """尝试占用全局任务锁（原子 test-and-set）；已被占用返回 0。
 
     task: 'detect' / 'batch' / 'highlights' / 'load' 等任务名
+    返回: token（正整数，释放时校验）；0 表示占用失败
+    """
+    global _busy_task, _task_token
+    with task_lock:
+        if _busy_task is not None:
+            return 0
+        _busy_task = task
+        _task_token += 1
+        return _task_token
+
+
+def release_task(token: int = 0) -> None:
+    """释放全局任务锁。
+
+    token 传入时仅当与当前持有 token 匹配才释放：
+    防止旧任务（已超时/被 UI 提前放弃）误释放新任务的锁。
     """
     global _busy_task
     with task_lock:
-        if _busy_task is not None:
-            return False
-        _busy_task = task
-        return True
-
-
-def release_task() -> None:
-    """释放全局任务锁。"""
-    global _busy_task
-    with task_lock:
+        if token and token != _task_token:
+            return
         _busy_task = None
 
 
@@ -249,6 +264,19 @@ def load_history() -> list:
             except OSError:
                 logging.getLogger("state").warning(
                     f"[WARN] 历史记录解析失败（{e}），且备份失败: {bak}")
+            return []
+        except UnicodeDecodeError as e:
+            # 文件被外部工具以 GBK/ANSI 保存等编码错误：同样按损坏备份处理
+            # （ValueError 子类，不并入 OSError 分支会被 add_history 漏接，
+            #  把检测成功的结果整体报成失败）
+            bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+            try:
+                os.replace(HISTORY_FILE, bak)
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录编码错误（{e}），原文件已备份到 {bak}，将以空记录重新开始")
+            except OSError:
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录编码错误（{e}），且备份失败: {bak}")
             return []
         except OSError as e:
             last_err = e

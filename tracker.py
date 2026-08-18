@@ -328,7 +328,16 @@ class GoalDetector:
         frame_roi: 预计算的搜索区 ROI（compute_roi 产出），传入可省一次重复处理。
         返回: 进球时间戳（秒）或 None
         """
-        self.fps = fps
+        # fps 变化时重算按秒定义的时间窗口：
+        # 构造时可能用默认 fps=30（调用方不传），实际视频帧率在首次 feed 才知道，
+        # 不重算的话 60fps 视频的窗口会按 30fps 算（减半），与 persistent_trigger
+        # 等按 self.fps 计算的窗口语义割裂
+        if fps and fps != self.fps:
+            self.fps = float(fps)
+            self.above_timeout_frames = max(10, int(1.5 * self.fps))
+            self.yolo_window_frames = max(5, int(0.34 * self.fps))
+        else:
+            self.fps = fps
 
         if frame is None:
             return None
@@ -353,6 +362,19 @@ class GoalDetector:
         # 各算一次 ROI 属纯浪费（~1-2ms/帧，~2-4% 吞吐）
         frame_roi = frame_roi if frame_roi is not None else self._roi_gray(frame)
 
+        # 缓存 YOLO 球位置到历史（用于双确认的时间窗口检查）
+        # 进球是一个过程（~0.3秒），即使触发瞬间 YOLO 漏检，前后帧检测到也能确认。
+        # 放在冷却检查之前：冷却 3s 内检出的球位置也是有效样本，
+        # 冷却刚结束触发的补篮候选需要窗口内有球才能通过 YOLO 确认
+        if ball_pos is not None:
+            self.ball_pos_history.append(
+                (ball_frame if ball_frame is not None else frame_idx,
+                 ball_pos[0], ball_pos[1]))
+        # 保留最近 yolo_window_frames 帧
+        cutoff = frame_idx - self.yolo_window_frames
+        while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
+            self.ball_pos_history.popleft()
+
         # 冷却期检查
         if self.last_goal_frame >= 0:
             gap_sec = (frame_idx - self.last_goal_frame) / fps
@@ -364,17 +386,6 @@ class GoalDetector:
                 # "连续 min_in_hoop_frames 帧"，跳过防噪约束直接触发 loose 误报
                 self.blob_in_hoop_frames = 0
                 return None
-
-        # 缓存 YOLO 球位置到历史（用于双确认的时间窗口检查）
-        # 进球是一个过程（~0.3秒），即使触发瞬间 YOLO 漏检，前后帧检测到也能确认
-        if ball_pos is not None:
-            self.ball_pos_history.append(
-                (ball_frame if ball_frame is not None else frame_idx,
-                 ball_pos[0], ball_pos[1]))
-        # 保留最近 yolo_window_frames 帧
-        cutoff = frame_idx - self.yolo_window_frames
-        while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
-            self.ball_pos_history.popleft()
 
         # 在篮筐周边找运动斑块
         blob = self._find_moving_blob(frame_roi)
