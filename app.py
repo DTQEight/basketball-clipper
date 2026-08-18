@@ -95,11 +95,12 @@ def get_ball_model() -> tuple:
     wdir = ROOT / "weights"
     weights = None
     if wdir.exists():
-        # 优先选名字含 basketball/ball/finetuned 的权重（篮球专用）
-        pts = sorted(wdir.glob("*.pt"),
-                     key=lambda p: 0 if any(k in p.name.lower()
-                                            for k in ("basketball", "finetuned", "ball"))
-                                   else 1)
+        # 只选名字含 basketball/finetuned/ball 的篮球专用权重。
+        # 旧实现无关键字时盲选第一个 .pt：类别表若不含球类，
+        # get_ball_class_ids 返回 [] 直接拒绝检测；回退 COCO 权重反而可用
+        pts = [p for p in sorted(wdir.glob("*.pt"))
+               if any(k in p.name.lower()
+                      for k in ("basketball", "finetuned", "ball"))]
         if pts:
             weights = str(pts[0])
     if weights is None:

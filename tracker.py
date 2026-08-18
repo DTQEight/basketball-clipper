@@ -100,7 +100,6 @@ class GoalDetector:
         self._warmup_target_sec = WARMUP_TARGET_SEC  # 预热时长（秒）
         self._warmup_done = not self.auto_threshold  # 关闭自适应时视为已完成
         self._warmup_start_frame = -1         # 预热起始帧（首次 feed 时设置）
-        self._user_diff_threshold = int(diff_threshold)  # 保存用户设定值
         self._auto_threshold_value = None     # 自适应计算出的阈值（诊断用）
         self._warmup_p95_median = None        # 预热结束时保存的 P95 中位数（诊断用，避免列表被清空）
         self._warmup_sample_count = 0         # 预热期实际采样的帧数（诊断用）
@@ -115,7 +114,6 @@ class GoalDetector:
         # 基准帧（只存搜索区域 ROI 的灰度模糊图，见 _roi_gray）
         self.baseline_gray = None
         self.last_baseline_frame_idx = -1  # 上次更新基准帧的帧号
-        self.baseline_update_count = 0     # 基准帧更新次数（诊断用）
         # 滚动基准帧候选：在更新间隔内持续寻找运动量最小的帧作为下一个基准帧
         # 避免把球/球员拍进基准帧导致 diff 失效
         # （只存 ROI 灰度图 ~90KB，不拷整帧 BGR ~6MB）
@@ -328,16 +326,18 @@ class GoalDetector:
         frame_roi: 预计算的搜索区 ROI（compute_roi 产出），传入可省一次重复处理。
         返回: 进球时间戳（秒）或 None
         """
+        # fps 归一化防御：0/None 视为无效值，回退实例值（构造时默认 30.0），
+        # 防止下游多处 /fps 除零、self.fps*5 TypeError，或把无效值写回实例状态
+        if not fps:
+            fps = self.fps if self.fps > 0 else 1.0
         # fps 变化时重算按秒定义的时间窗口：
         # 构造时可能用默认 fps=30（调用方不传），实际视频帧率在首次 feed 才知道，
         # 不重算的话 60fps 视频的窗口会按 30fps 算（减半），与 persistent_trigger
         # 等按 self.fps 计算的窗口语义割裂
-        if fps and fps != self.fps:
+        if fps != self.fps:
             self.fps = float(fps)
             self.above_timeout_frames = max(10, int(1.5 * self.fps))
             self.yolo_window_frames = max(5, int(0.34 * self.fps))
-        else:
-            self.fps = fps
 
         if frame is None:
             return None
@@ -439,7 +439,6 @@ class GoalDetector:
                 else:
                     self.set_baseline(frame)
                     self.last_baseline_frame_idx = frame_idx
-                self.baseline_update_count += 1
                 self.diag["baseline_updates"] += 1
                 # 重置候选
                 self._baseline_candidate_frame = None
@@ -449,10 +448,11 @@ class GoalDetector:
                 self.blob_persistent_frames = 0
 
         if blob is None:
-            # 没检测到运动物体，保持状态但衰减历史
+            # 没检测到运动物体：轨迹断档即清空历史
+            # （旧实现每帧只淘汰 1 条，断档后重出现的斑块会把上段轨迹的 y 值
+            #   混进 _check_downward_trend 的首尾位移检查，跨段位移可能误通过）
             self.diag["reject_no_blob"] += 1
-            if len(self.blob_history) > 5:
-                self.blob_history.popleft()
+            self.blob_history.clear()
             self.blob_in_hoop_frames = 0
             self.blob_persistent_frames = 0  # 无斑块，重置持续计数
             self.last_blob_box = None

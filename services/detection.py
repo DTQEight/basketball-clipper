@@ -34,38 +34,43 @@ PREVIEW_CLIP_HALF_SEC = 3.0
 
 # ============ 单视频操作 ============
 
-def load_video(video_path):
+def load_video(video_path, task_token=0):
     """加载视频，返回预览帧和信息字符串。
 
     作为单视频模式的入口，切换视频时**必须同步清空上一个视频的检测 state**
     （进球列表/预览片段/保留索引），避免 UI 层依赖某分支才清空导致旧数据残留。
+    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体）。
     """
-    if not video_path or not video_path.strip():
-        return None, "请输入视频文件路径"
-    video_path = video_path.strip().strip('"').strip("'")
-    if not os.path.exists(video_path):
-        return None, f"❌ 文件不存在: {video_path}"
     try:
-        info = get_video_info(video_path)
-    except Exception as e:
-        return None, f"读取失败: {e}"
-    # 切换新视频：先清空上一个视频的检测结果（无论当前视频是否能最终成功 read_frame，
-    # 只要路径合法 → state.video_state 会更新 → 旧进球列表就应清空）
-    state.last_goal_clips.clear()
-    state.last_goals.clear()
-    state.kept_goal_indices.clear()
-    state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
-                             codec=info["codec"], current_frame=0,
-                             width=info["width"], height=info["height"])
-    state.calib["clicks"] = []
-    state.calib["hoop"] = None
-    state.calib["baseline_frame"] = None
-    state.calib["baseline_idx"] = -1
-    frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
-    preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
-    info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
-                f"{info['width']}x{info['height']} | {info['codec']}")
-    return preview, info_str
+        if not video_path or not video_path.strip():
+            return None, "请输入视频文件路径"
+        video_path = video_path.strip().strip('"').strip("'")
+        if not os.path.exists(video_path):
+            return None, f"❌ 文件不存在: {video_path}"
+        try:
+            info = get_video_info(video_path)
+        except Exception as e:
+            return None, f"读取失败: {e}"
+        # 切换新视频：先清空上一个视频的检测结果（无论当前视频是否能最终成功 read_frame，
+        # 只要路径合法 → state.video_state 会更新 → 旧进球列表就应清空）
+        state.last_goal_clips.clear()
+        state.last_goals.clear()
+        state.kept_goal_indices.clear()
+        state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
+                                 codec=info["codec"], current_frame=0,
+                                 width=info["width"], height=info["height"])
+        state.calib["clicks"] = []
+        state.calib["hoop"] = None
+        state.calib["baseline_frame"] = None
+        state.calib["baseline_idx"] = -1
+        frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
+        preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
+        info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
+                    f"{info['width']}x{info['height']} | {info['codec']}")
+        return preview, info_str
+    finally:
+        if task_token:
+            state.release_task(task_token)
 
 
 def _draw_calib_overlay(frame, hoop, clicks):
@@ -833,9 +838,18 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
     video_path=None: 单视频模式，用全局 video_state + last_goals（原逻辑不变）。
     video_path 非空: 流水线快照模式，用 batch_results[video_path] 的 goals 生成，
                      批量检测运行中也可调用（NVENC 硬编与 CUDA 推理是 GPU 独立单元，可并行）。
-    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体）。
+                     - hl_busy 小锁由本函数持有并在 finally 释放（生命周期归任务本体：
+                       页面刷新取消 UI 协程时旧线程仍在跑，UI 侧提前重置会让新页面
+                       对同一视频再次启动集锦，两线程写同一输出文件）
+                     - 取消走独立的 hl_cancel_event：批量检测的「取消」不应连带杀死集锦
+    task_token: 非零时全局任务锁由本函数持有并在 finally 释放（锁归任务本体）。
     """
+    _pipeline = video_path is not None
     try:
+        if _pipeline:
+            if state.hl_busy["on"]:
+                return None, "❌ 该视频的集锦正在生成中，请稍候"
+            state.hl_busy["on"] = True
         if video_path is not None:
             snap = state.batch_results.get(video_path)
             if not snap:
@@ -849,26 +863,45 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
             src = state.video_state["path"]
         if not goals:
             return None, "❌ 没有检测到进球"
+        # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
+        _cancel = state.hl_cancel_event.is_set if _pipeline else state.cancel_event.is_set
         out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
                              progress_callback=progress_callback,
-                             cancel_check=state.cancel_event.is_set)
+                             cancel_check=_cancel)
         if out_path and os.path.exists(out_path):
             return out_path, f"集锦已生成（{len(goals)} 个进球片段）\n输出: {out_path}"
-        if state.cancel_event.is_set():
+        if _cancel():
             return None, "已取消集锦生成"
         return None, "❌ 集锦生成失败"
     except Exception as e:
         import traceback
         return None, f"❌ 剪辑失败: {e}\n{traceback.format_exc()}"
     finally:
+        if _pipeline:
+            state.hl_busy["on"] = False
         if task_token:
             state.release_task(task_token)
 
 
-def on_load_history(idx_choice, progress_callback=None):
-    """从历史记录加载。"""
+def on_load_history(idx_choice, progress_callback=None, task_token=0):
+    """从历史记录加载。
+
+    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体：
+    未命中片段缓存时本函数会跑 ffmpeg 生成预览（可达数十秒），
+    UI 协程在页面刷新/断开时被取消后线程仍会继续写 state，
+    锁必须等线程真正结束才释放）。
+    """
+    try:
+        return _on_load_history_impl(idx_choice, progress_callback)
+    finally:
+        if task_token:
+            state.release_task(task_token)
+
+
+def _on_load_history_impl(idx_choice, progress_callback):
+    """on_load_history 的实际实现（锁由外层 wrapper 管理）。"""
     def _report(pct, msg):
         if progress_callback:
             try:
@@ -959,12 +992,24 @@ def on_load_history(idx_choice, progress_callback=None):
 
 # ============ 文件夹批量模式 ============
 
-def on_batch_load_video(selected, progress_callback=None):
+def on_batch_load_video(selected, progress_callback=None, task_token=0):
     """批量模式：加载选中的视频，应用该视频已保存的标定。
 
     若该视频已有历史检测记录（批量识别完成后再点击下拉框），
     自动加载检测结果和预览片段，无需再去历史记录里找。
+    task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体：
+    未命中片段缓存时本函数会跑 ffmpeg 生成预览（可达数十秒），
+    UI 协程被取消后线程仍会继续写 state，锁必须等线程结束才释放）。
     """
+    try:
+        return _on_batch_load_video_impl(selected, progress_callback)
+    finally:
+        if task_token:
+            state.release_task(task_token)
+
+
+def _on_batch_load_video_impl(selected, progress_callback):
+    """on_batch_load_video 的实际实现（锁由外层 wrapper 管理）。"""
     def _report(pct, msg):
         if progress_callback:
             try:

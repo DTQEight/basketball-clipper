@@ -218,12 +218,25 @@ def main_page():
         # ====== YOLO 自检横幅（失败时醒目提示 + 确认重启） ======
         if not YOLO_SELFCHECK["ok"]:
             def _do_restart_service():
-                """os.execv 原地替换进程：旧进程终止自动释放端口，新进程重新自检。"""
+                """重启服务：分离启动新进程（延迟 1s 等旧进程退出释放端口）后硬退出旧进程。
+
+                旧实现 os.execv 在 Windows 上不保证旧进程 socket 立即释放，
+                新进程绑定同一端口可能失败导致服务下线（semantics 与 Unix 不同）。
+                """
                 try:
-                    os.execv(sys.executable, [sys.executable, '-u'] + sys.argv)
+                    import subprocess
+                    _inner = [sys.executable, '-u', str(ROOT / 'demo_nicegui.py')]
+                    subprocess.Popen(
+                        [sys.executable, '-u', '-c',
+                         'import subprocess,sys,time;time.sleep(1.0);'
+                         'sys.exit(subprocess.call(%r))' % (_inner,)],
+                        creationflags=state.SBOX)
                 except Exception as e:
                     # timer 回调线程内失败不应静默（否则点击无响应无从排查）
                     ui.notify(f'重启失败: {e}，请手动重启服务', type='negative', position='top')
+                    return
+                # 硬退出：跳过清理钩子立即释放端口/句柄，新进程 1s 后接管
+                os._exit(0)
 
             def _on_confirm_restart():
                 restart_dialog.close()
@@ -371,7 +384,10 @@ def main_page():
                     for _e in _exp_list:
                         _e.on_value_change(lambda evt: _sync_expand())
                     # 展开「历史」时自动加载记录，无需手动点刷新
-                    exp_hist.on_value_change(lambda e: _refresh_history() if e.value else None)
+                    async def _on_hist_expand(e):
+                        if e.value:
+                            await _refresh_history()
+                    exp_hist.on_value_change(_on_hist_expand)
                     _sync_expand()
 
                 # 后台批量识别进度条（流水线模式常驻：预览快照片段顶掉右侧进度面板后，
@@ -514,6 +530,12 @@ def main_page():
             _set_status(f'批量模式 | 扫描到 {len(files)} 个视频，逐个标定后批量识别', 'info')
             return
         # 单视频文件路径 → 原有流程（清空批量状态，避免写历史误带 batch_idx）
+        # 必须占任务锁：io_bound 期间事件循环会让出，双击「加载」会并发跑两个
+        # load_video 线程并发改 video_state/calib（批量路径 _on_batch_load_video
+        # 同样持锁，旧实现唯独此路径只检查不占锁）
+        token = _try_acquire('load')
+        if not token:
+            return
         batch_panel.classes(add='hidden')
         state.batch_files = []
         state.batch_calibs = {}
@@ -526,7 +548,14 @@ def main_page():
         # 开容器 + seek + 解码第 0 帧在大视频上可达数百 ms~秒级，
         # 走 io_bound 避免阻塞 UI 事件循环（与批量加载路径一致）
         from nicegui import run
-        frame, info = await run.io_bound(detection.load_video, path)
+        try:
+            frame, info = await run.io_bound(detection.load_video, path,
+                                             task_token=token)
+        except Exception as _e:
+            import traceback
+            frame, info = None, f"❌ 加载视频异常: {_e}\n{traceback.format_exc()}"
+            state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
+        # 正常路径锁由 load_video 内部 finally 释放（锁归任务本体）
         if frame is not None:
             # 切换视频：仅清 UI 卡片容器缓存（state 已由 load_video 清空）
             _refresh_result_cards()
@@ -630,10 +659,12 @@ def main_page():
 
             try:
                 frame, info, status = await run.io_bound(
-                    detection.on_batch_load_video, path, _progress_callback)
+                    detection.on_batch_load_video, path, _progress_callback,
+                    task_token=token)
             except Exception as _e:
                 import traceback
                 frame, info, status = None, "", f"❌ 加载视频异常: {_e}\n{traceback.format_exc()}"
+                state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
             _show_right_pane('preview')
             if frame is not None:
                 b64 = video_utils.frame_to_base64(frame)
@@ -643,8 +674,9 @@ def main_page():
             # 刷新结果卡片（已检测过的视频会显示进球列表）
             _refresh_result_cards()
         finally:
-            # 加载属短任务（单次 io_bound）：UI 侧 release 即可
-            state.release_task(token)
+            # 锁已下沉到 on_batch_load_video 内部 finally（锁归任务本体）：
+            # 未命中片段缓存时后台会跑 ffmpeg 数十秒，页面刷新取消 UI 协程后
+            # 线程仍持锁跑到结束，UI 侧不再提前释放（与 detect/batch/highlights 对齐）
             _batch_loading = False
 
     def _on_batch_save_calib():
@@ -683,7 +715,9 @@ def main_page():
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
-                progress_text.set_text('批量识别中...')
+                # 主行直接显示完整消息（含当前视频进度 + 整批 ETA），
+                # 右侧面板被预览顶掉时迷你条仍有百分比兜底
+                progress_text.set_text(msg)
                 progress_detail.set_text(msg)
                 # 迷你进度条同步（右侧面板被预览顶掉时，用户仍能看到后台进度）
                 batch_mini_bar.set_value(pct / 100)
@@ -808,7 +842,8 @@ def main_page():
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
-                progress_text.set_text(msg)
+                # 主行短状态 + 详情行完整消息（含帧数/ETA），避免两行重复显示同一内容
+                progress_text.set_text('检测中...' if pct < 80 else '生成预览片段...')
                 progress_detail.set_text(msg)
             except Exception:
                 pass
@@ -934,13 +969,16 @@ def main_page():
     async def _on_highlights():
         vp = _cards_video["path"]
         # ===== 流水线分支：批量检测运行中，对快照视频生成集锦 =====
-        # 用独立小锁（不占全局任务锁，且在 state 模块级跨页面连接共享），
-        # 不切进度区（那里正显示批量进度），NVENC 与 CUDA 可并行
+        # hl_busy 小锁与取消事件都归 detection.generate_highlights 管理
+        # （不占全局任务锁，state 模块级跨页面连接共享，NVENC 与 CUDA 可并行）
         if vp is not None and state.current_task() == 'batch':
             if state.hl_busy["on"]:
+                # 生成中再次点击 → 请求取消（与检测/批量按钮的交互一致）
+                state.hl_cancel_event.set()
+                hl_mini_text.set_text('正在取消集锦...')
                 return
-            state.hl_busy["on"] = True
             from nicegui import run
+            state.hl_cancel_event.clear()
             # 显示集锦迷你进度条（不占右侧进度面板，那边正显示批量进度）
             hl_progress_strip.classes(remove='hidden')
             hl_mini_bar.set_value(0)
@@ -962,7 +1000,9 @@ def main_page():
                 import traceback
                 path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
             finally:
-                state.hl_busy["on"] = False
+                # hl_busy 由 generate_highlights 内部 finally 释放（锁归任务本体：
+                # 页面刷新取消 UI 协程时后台线程仍在跑，UI 提前重置会让新页面
+                # 对同一视频再次启动集锦，两线程写同一输出文件）；UI 只收迷你条
                 hl_progress_strip.classes(add='hidden')
             if path and os.path.exists(path):
                 ui.download(path)
@@ -981,7 +1021,8 @@ def main_page():
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
-                progress_text.set_text(msg)
+                # 主行短状态 + 详情行完整消息，避免两行重复
+                progress_text.set_text('正在生成集锦...')
                 progress_detail.set_text(msg)
             except Exception:
                 pass
@@ -1009,10 +1050,11 @@ def main_page():
     # 新检测会插入/覆盖记录使索引整体移动，旧索引会指向错误的行）
     _selected_history = {"video": None}
 
-    def _refresh_history():
+    async def _refresh_history():
         history_list.clear()
         try:
-            records = state.load_history()
+            from nicegui import run
+            records = await run.io_bound(state.load_history)
         except OSError as e:
             with history_list:
                 ui.label(f'历史记录暂时无法读取（{e}）').classes('text-xs').style('color: var(--err)')
@@ -1032,7 +1074,7 @@ def main_page():
                 def _make_click(rec_video):
                     async def _on_click():
                         _selected_history["video"] = rec_video
-                        _refresh_history()
+                        await _refresh_history()
                         await _on_load_history(rec_video)
                         exp_hist.set_value(False)  # 加载完成后自动收起历史面板
                     return _on_click
@@ -1047,54 +1089,57 @@ def main_page():
         if not token:
             return
         try:
+            records = state.load_history()
+        except OSError as e:
+            state.release_task(token)  # 后台未启动，UI 侧释放
+            _set_status(f'历史记录暂时无法读取（{e}），请稍后重试', 'err')
+            return
+        rec = next((r for r in records if r.get("video") == rec_video), None)
+        if rec is None:
+            state.release_task(token)  # 后台未启动，UI 侧释放
+            _set_status('历史记录不存在（可能已被覆盖），请刷新列表', 'err')
+            await _refresh_history()
+            return
+
+        # 显示进度
+        _show_right_pane('progress')
+        progress_bar.set_value(0)
+        progress_text.set_text('正在加载历史记录...')
+        progress_detail.set_text('')
+
+        def _progress_callback(pct, msg):
             try:
-                records = state.load_history()
-            except OSError as e:
-                _set_status(f'历史记录暂时无法读取（{e}），请稍后重试', 'err')
-                return
-            rec = next((r for r in records if r.get("video") == rec_video), None)
-            if rec is None:
-                _set_status('历史记录不存在（可能已被覆盖），请刷新列表', 'err')
-                _refresh_history()
-                return
+                progress_bar.set_value(pct / 100)
+                # 主行短状态 + 详情行完整消息，避免两行重复
+                progress_text.set_text('正在加载历史记录...')
+                progress_detail.set_text(msg)
+            except Exception:
+                pass
 
-            # 显示进度
-            _show_right_pane('progress')
-            progress_bar.set_value(0)
-            progress_text.set_text('正在加载历史记录...')
-            progress_detail.set_text('')
+        from nicegui import run
+        try:
+            result = await run.io_bound(detection.on_load_history,
+                                         records.index(rec), _progress_callback,
+                                         task_token=token)
+            frame, info, status = result
+        except Exception as _e:
+            import traceback
+            frame, info, status = None, "", f"❌ 加载历史异常: {_e}\n{traceback.format_exc()}"
+            state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
+        # 正常路径锁由 on_load_history 内部 finally 释放（锁归任务本体）
 
-            def _progress_callback(pct, msg):
-                try:
-                    progress_bar.set_value(pct / 100)
-                    progress_text.set_text(msg)
-                    progress_detail.set_text(msg)
-                except Exception:
-                    pass
-
-            from nicegui import run
-            try:
-                result = await run.io_bound(detection.on_load_history,
-                                             records.index(rec), _progress_callback)
-                frame, info, status = result
-            except Exception as _e:
-                import traceback
-                frame, info, status = None, "", f"❌ 加载历史异常: {_e}\n{traceback.format_exc()}"
-
-            _show_right_pane('preview')
-            if frame is not None:
-                preview_image.set_source(video_utils.frame_to_base64(frame))
-            # 同步路径输入框，显示当前加载的视频
-            if state.video_state["path"]:
-                path_input.set_value(state.video_state["path"])
-                _selected_history["video"] = state.video_state["path"]
-            # 加载历史 = 单视频模式：隐藏批量面板（state 层已清 batch 三件套）
-            batch_panel.classes(add='hidden')
-            info_text.set_text(info)
-            _set_status(status, 'ok' if frame is not None else 'err')
-            _refresh_result_cards()
-        finally:
-            state.release_task(token)
+        _show_right_pane('preview')
+        if frame is not None:
+            preview_image.set_source(video_utils.frame_to_base64(frame))
+        # 同步路径输入框，显示当前加载的视频
+        if state.video_state["path"]:
+            path_input.set_value(state.video_state["path"])
+            _selected_history["video"] = state.video_state["path"]
+        # 加载历史 = 单视频模式：隐藏批量面板（state 层已清 batch 三件套）
+        batch_panel.classes(add='hidden')
+        info_text.set_text(info)
+        _set_status(status, 'ok' if frame is not None else 'err')
+        _refresh_result_cards()
 
     # 页面初始化：不自动加载历史列表（空白初始状态），点「刷新」才加载
     _refresh_result_cards()

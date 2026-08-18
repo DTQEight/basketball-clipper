@@ -24,13 +24,14 @@ def sample_video(tmp_path_factory):
 
 
 class TestReadFrameContract:
-    def test_total_must_be_int_not_none(self, sample_video):
-        """total=None 是类型违规（on_batch_load_video 曾因此崩溃）：
-        合法边界是 total=0（不 clamp）与正整数。此测试钉住契约。"""
-        frame = read_frame(sample_video, 0, total=0, fps=0)
+    def test_total_and_fps_none_tolerated(self, sample_video):
+        """total=None 与 0 同语义（不 clamp），fps=None 与 0 同语义（自动读流）：
+        显式传 None 不抛 TypeError（旧契约钉住 None 必抛 TypeError，
+        P2 防御修复后改为宽容语义——调用方从 JSON/配置读取未校验值不崩溃）。"""
+        frame = read_frame(sample_video, 0, total=None, fps=0)
         assert frame is not None
-        with pytest.raises(TypeError):
-            read_frame(sample_video, 0, total=None, fps=0)
+        frame2 = read_frame(sample_video, 0, total=0, fps=None)
+        assert frame2 is not None
 
     def test_out_of_range_frame_returns_none(self, sample_video):
         """超界帧号由 decode 循环自然返回 None（不抛异常）。"""
@@ -43,3 +44,17 @@ class TestReadFrameContract:
             idxs = [i for i, _ in r.iter_frames(batch=1)]
         assert idxs == list(range(len(idxs)))     # 0-based 连续
         assert len(idxs) >= 28                    # 30 帧允许容器级 ±2
+
+    def test_videoreader_batch_floor(self, sample_video):
+        """iter_frames batch<1 视为 1（防取模除零，P2 防御回归）。"""
+        with VideoReader(sample_video) as r:
+            idxs = [i for i, _ in r.iter_frames(batch=0)]
+        assert idxs                               # 不抛 ZeroDivisionError 且能出帧
+
+    def test_videoreader_del_releases_container(self, sample_video):
+        """漏掉 with/close 时 __del__ 兜底释放容器（句柄泄漏回归防护）。"""
+        r = VideoReader(sample_video)
+        assert r.container is not None
+        del r                                     # 触发 __del__ → close()
+        import gc
+        gc.collect()

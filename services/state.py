@@ -136,6 +136,10 @@ kept_goal_indices = set()
 # 用 threading.Event 替代裸 bool：跨线程标志的 set/clear/is_set 天然原子且语义明确
 cancel_event = threading.Event()
 
+# 流水线集锦独立取消标志：批量检测的「取消」不应连带杀死正在进行的
+# 流水线集锦生成（两者是对不同对象的独立操作，见 detection.generate_highlights）
+hl_cancel_event = threading.Event()
+
 # 预览片段缓存：key=(视频路径, 进球时间戳元组) -> [片段dict, ...]
 clip_cache = {}
 

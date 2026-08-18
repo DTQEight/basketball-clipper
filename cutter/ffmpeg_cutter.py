@@ -305,6 +305,18 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             "-movflags", "+faststart",
             output_path,
         ]
+
+        def _run_concat_encode():
+            # NVENC 会话配额（消费卡限 2 路）：与切片/预览片段线程池共用信号量，
+            # 避免并发时第 3 路会话 OpenEncodeSession 失败导致兜底拼接失败
+            if use_nvenc:
+                with nvenc_semaphore:
+                    subprocess.run(concat_encode_cmd, check=True, capture_output=True,
+                                   text=True, creationflags=_SBOX, timeout=1800)
+            else:
+                subprocess.run(concat_encode_cmd, check=True, capture_output=True,
+                               text=True, creationflags=_SBOX, timeout=1800)
+
         try:
             # 流拷贝不做编解码，600s 超时已非常宽裕
             subprocess.run(concat_copy_cmd, check=True, capture_output=True, text=True,
@@ -312,8 +324,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
         except subprocess.TimeoutExpired:
             _log.warning("[剪辑] 流拷贝拼接超时（>600s），回退重编码拼接...")
             try:
-                subprocess.run(concat_encode_cmd, check=True, capture_output=True, text=True,
-                               creationflags=_SBOX, timeout=1800)
+                _run_concat_encode()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 _log.warning(f"[剪辑] 拼接失败: {_stderr_tail(e) or e}")
                 return None
@@ -321,8 +332,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             # 流拷贝失败（个别片段参数异常，如源视频中途变分辨率）→ 回退重编码
             _log.warning(f"[剪辑] 流拷贝拼接失败，回退重编码拼接: {_stderr_tail(e) or e}")
             try:
-                subprocess.run(concat_encode_cmd, check=True, capture_output=True, text=True,
-                               creationflags=_SBOX, timeout=1800)
+                _run_concat_encode()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
                 _log.warning(f"[剪辑] 拼接失败: {_stderr_tail(e2) or e2}")
                 return None

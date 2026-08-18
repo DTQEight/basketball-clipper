@@ -207,6 +207,26 @@ class TestFpsScaling:
         det.feed(None, 1, 60.0, frame=_base_frame())                     # 同 fps 不重复重算（幂等）
         assert det.above_timeout_frames == 90
 
+    def test_invalid_fps_falls_back_to_instance_value(self):
+        """fps=0/None 不崩溃且不污染实例状态（P2 防御回归）。
+
+        旧实现 else 分支会把无效值写回 self.fps（fps=0 使 persistent_trigger
+        一帧即触发、None 使 self.fps*5 抛 TypeError），冷却路径 /fps 直接除零。
+        """
+        det = GoalDetector(HOOP, min_gap_sec=3.0, diff_threshold=25,
+                           rolling_baseline_sec=0, auto_threshold=False, fps=60.0)
+        det.feed(None, 0, 0, frame=_base_frame())       # fps=0 → 回退实例值 60
+        assert det.fps == 60.0
+        assert det.above_timeout_frames == 90
+        det.feed(None, 1, None, frame=_base_frame())    # fps=None → 回退实例值 60
+        assert det.fps == 60.0
+        # 冷却除法路径（/fps）在 fps=0 下不抛 ZeroDivisionError
+        det2 = _detector()
+        _feed_seq(det2, [40, 40, 100, 100])             # 进球 @ idx 3
+        assert len(det2.goals) == 1
+        g = det2.feed(_ball_pos(100), 4, 0, frame=_frame_with_ball(100))
+        assert g is None                                # 冷却期内不重复进球
+
     def test_cooldown_records_ball_pos_samples(self):
         """冷却期内 YOLO 检出的球位置仍入历史（补篮候选的 YOLO 确认依赖窗口内样本）。"""
         det = _detector()

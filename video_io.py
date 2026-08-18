@@ -59,6 +59,10 @@ def get_video_info(path: str) -> dict:
     """
     c = av_open(path)
     try:
+        # 显式检查无视频流（纯音频/损坏文件）：直接 streams.video[0] 抛 IndexError，
+        # 调用方只能看到裸下标错误；给出明确错误信息便于区分"文件坏了"和"代码 bug"
+        if not c.streams.video:
+            raise ValueError(f"文件没有视频流: {path}")
         s = c.streams.video[0]
         # s.frames 可能为 None/0（部分视频头信息不全），or 0 兜底；
         # 不能写 int(s.frames)，None 会抛 TypeError
@@ -92,10 +96,11 @@ def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
 
     path:  视频文件路径
     idx:   帧号（0-based）
-    total: 总帧数（用于 clamp）
-    fps:   帧率（用于 pts 转换，0 则自动读取）
+    total: 总帧数（用于 clamp，0/None 均视为不 clamp）
+    fps:   帧率（用于 pts 转换，0/None 则自动读取）
     """
-    if total > 0:
+    # None 防御：显式传入 None 时不抛 TypeError，与 0 同语义（不 clamp）
+    if total and total > 0:
         idx = min(int(idx), total - 1)
     else:
         idx = int(idx)
@@ -106,7 +111,7 @@ def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
     try:
         container = av_open(path)
         stream = container.streams.video[0]
-        if fps <= 0:
+        if not fps or fps <= 0:
             fps = float(stream.average_rate) if stream.average_rate else 30.0
         tb = float(stream.time_base) if stream.time_base else 1.0 / fps
         start_pts = _stream_start_pts(stream, fps)
@@ -175,9 +180,10 @@ class VideoReader:
 
         start: 起始帧号
         end:   结束帧号（不包含），None 则到视频末尾
-        batch: 抽帧间隔，每 batch 帧取 1 帧
+        batch: 抽帧间隔，每 batch 帧取 1 帧（<1 视为 1，防取模除零）
         yield: (frame_idx, frame_bgr)
         """
+        batch = max(int(batch), 1)
         if end is None:
             end = self.total
         self.seek(start)
@@ -205,3 +211,12 @@ class VideoReader:
 
     def __exit__(self, *args):
         self.close()
+
+    def __del__(self):
+        # 兜底释放：调用方漏掉 with/close（尤其异常路径）时避免容器句柄泄漏
+        # （Windows 下会锁定文件，妨碍后续删除/覆盖）。
+        # 解释器退出阶段异常一律吞掉，不能因清理失败抛 __del__ 警告。
+        try:
+            self.close()
+        except Exception:
+            pass
