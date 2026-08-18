@@ -568,6 +568,17 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - **P2-1 集锦拼接全失败遗留半截文件**：`ffmpeg_cutter.py` 流拷贝与重编码兜底均失败时，ffmpeg `-y` 中断会在 `output_path` 留下无 moov 的损坏文件（播放器打不开却占磁盘、易被误当成品）——新增 `_remove_incomplete_output()` 在两条失败路径 `return None` 前主动清理
 - **P2-2 球类别解析失败不清空旧结果**：`detection.py` `_ball_classes` 为空拒绝检测时，补齐 `last_goal_clips`/`kept_goal_indices`/`last_goals` 三态清空（与 YOLO 熔断、异常路径策略对齐，防同一视频重跑失败时 UI 残留上一次的进球卡片）
 
+**P3×6 记录不修**（全部有兜底或概率极低，修复需触碰取消语义/锁契约/IO 路径，收益低于回归风险，符合定版阶段策略）：
+
+| # | 位置 | 问题 | 不修理由 |
+|---|------|------|----------|
+| 1 | detection.py `load_history()` | 未捕获 OSError，历史文件共享冲突时显示技术性异常文本 | 罕见路径，锁释放正确，仅报错文案不友好 |
+| 2 | demo_nicegui.py 批量导出集锦 | 对视频 B 点「导出集锦」而 A 正在生成时被解释为取消 A | 正确语义应为"请稍候"；触碰取消语义，定版不动 |
+| 3 | detection.py `hl_busy` | check+set 非原子，双标签页同点的极窄竞态 | UI 预检使概率趋近零；修复需引入锁机制 |
+| 4 | demo_nicegui.py `_on_load_history` | 事件循环同步读历史（`_refresh_history` 已 io_bound 化，此路径漏改） | 通常 <10ms 无感；50 条满载极端才可能卡顿，改造需重验锁契约 |
+| 5 | state.py clip_cache 驱逐 | 删磁盘文件可能与 batch_results 快照引用冲突 | UI 有 exists 兜底优雅降级；MAX=20 一般不触发 |
+| 6 | demo_nicegui.py 快照查看态 | 残留快照查看走单视频分支传 vp，内部进流水线路径（hl_cancel 而非 cancel） | 功能正确（goals 取快照、锁对称）；该路径无取消入口，实际无影响 |
+
 ### 2026.08.18（晚）第三轮审查修复（P1/P2/P3，提交 `6942998`）
 
 ETA 定版后的增量审查，按优先级修复 P1×4 / P2×3 / P3×3，测试 52 → **55 用例全过**：
