@@ -1,0 +1,266 @@
+{
+ "D:\\Downloads\\test\\2025.11.13 2nd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   443,
+   348,
+   510,
+   418
+  ],
+  "src": "D:\\Downloads\\2025.11.13\\2025.11.13 2nd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2025.11.13 3rd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   184,
+   228,
+   263,
+   336
+  ],
+  "src": "D:\\Downloads\\2025.11.13\\2025.11.13 3rd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2025.11.13 4th.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   163,
+   219,
+   251,
+   329
+  ],
+  "src": "D:\\Downloads\\2025.11.13\\2025.11.13 4th.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.07.27 1st.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   1565,
+   175,
+   1638,
+   258
+  ],
+  "src": "D:\\Downloads\\7.27\\2026.07.27 1st.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.07.27 2nd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   1567,
+   180,
+   1640,
+   262
+  ],
+  "src": "D:\\Downloads\\7.27\\2026.07.27 2nd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.07.27 3rd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   1611,
+   132,
+   1704,
+   224
+  ],
+  "src": "D:\\Downloads\\7.27\\2026.07.27 3rd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.07.27 4th.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   1611,
+   132,
+   1699,
+   217
+  ],
+  "src": "D:\\Downloads\\7.27\\2026.07.27 4th.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.08.10-4th.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   1505,
+   187,
+   1570,
+   262
+  ],
+  "src": "D:\\Downloads\\2023.08.10\\2026.08.10-4th.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.08.15-1st.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   297,
+   83,
+   404,
+   205
+  ],
+  "src": "D:\\Downloads\\2026.08.15\\2026.08.15-1st.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.08.15-2nd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   285,
+   95,
+   394,
+   209
+  ],
+  "src": "D:\\Downloads\\2026.08.15\\2026.08.15-2nd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.08.15-3rd.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   331,
+   234,
+   409,
+   323
+  ],
+  "src": "D:\\Downloads\\2026.08.15\\2026.08.15-3rd.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2026.08.15-4th.mp4": {
+  "method": "same_name_copy",
+  "hoop": [
+   335,
+   234,
+   409,
+   321
+  ],
+  "src": "D:\\Downloads\\2026.08.15\\2026.08.15-4th.mp4",
+  "n_events": null
+ },
+ "D:\\Downloads\\test\\2025.11.13 1st.mp4": {
+  "method": "yolo_track",
+  "error": "球位置点不足（2 < 8）"
+ },
+ "D:\\Downloads\\test\\2026.07.05 2nd.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   382,
+   293,
+   469,
+   390
+  ],
+  "n_pts": 47,
+  "mad": [
+   21.7,
+   33.1
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.07.05 3th.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   393,
+   224,
+   480,
+   321
+  ],
+  "n_pts": 20,
+  "mad": [
+   20.5,
+   32.3
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.07.05 4th.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   353,
+   10,
+   441,
+   107
+  ],
+  "n_pts": 17,
+  "mad": [
+   80.4,
+   34.7
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.08.02 1st.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   330,
+   229,
+   417,
+   326
+  ],
+  "n_pts": 42,
+  "mad": [
+   44.2,
+   53.5
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.08.02 2nd.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   310,
+   211,
+   397,
+   308
+  ],
+  "n_pts": 51,
+  "mad": [
+   26.6,
+   34.9
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.08.02 3rd.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   424,
+   262,
+   512,
+   360
+  ],
+  "n_pts": 29,
+  "mad": [
+   45.2,
+   51.0
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.08.02 4th.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   420,
+   247,
+   507,
+   344
+  ],
+  "n_pts": 45,
+  "mad": [
+   52.8,
+   48.9
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ },
+ "D:\\Downloads\\test\\2026.07.11\\2026.07.11 4th.mp4": {
+  "method": "yolo_track",
+  "hoop": [
+   405,
+   259,
+   493,
+   356
+  ],
+  "n_pts": 47,
+  "mad": [
+   26.0,
+   35.9
+  ],
+  "n_events_used": 24,
+  "resolution": "1920x1080"
+ }
+}

@@ -305,6 +305,21 @@ def main_page():
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
+                                try:
+                                    from services import goal_verifier as _gv_init
+                                    _fa_init = bool(_gv_init.FULL_AUTO)
+                                except Exception:
+                                    _fa_init = False
+                                full_auto_switch = ui.switch('全自动模式 (检测后自动√/×, 灰区默认×, 零人工粗剪)', value=_fa_init).classes('w-full').style('color: var(--accent)')
+                                ui.label('集成分≥阈值自动√、其余自动×；跳过场次校准（盲测精确率100%/召回79%）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
+
+                                def _on_full_auto_change(e):
+                                    try:
+                                        from services import goal_verifier as _gv
+                                        _gv.set_full_auto(bool(e.value))
+                                    except Exception:
+                                        pass
+                                full_auto_switch.on_value_change(_on_full_auto_change)
                                 yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=False).classes('w-full')
                                 ui.label('默认每2帧（推荐, 更准）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=False).classes('w-full')
@@ -440,6 +455,13 @@ def main_page():
                     source='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
                 ).classes('w-full rounded-xl bg-black').style('aspect-ratio: 16/9; object-fit: contain')
 
+                # 帧选择器（标定前拖动浏览帧；随预览图同显隐）
+                frame_select_container = ui.row().classes('w-full items-center gap-3 hidden')
+                with frame_select_container:
+                    frame_slider = ui.slider(min=0, max=0, step=1, value=0).classes('flex-1')
+                    frame_pos_label = ui.label('帧 0').classes('text-gray-400 text-xs font-mono').style(
+                        'min-width: 132px; text-align: right; flex-shrink: 0')
+
                 result_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
                 highlights_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
 
@@ -479,6 +501,66 @@ def main_page():
                 el.classes(remove='hidden')
             else:
                 el.classes(add='hidden')
+        # 帧选择器跟随预览图显隐（仅已加载多帧视频时才有意义）
+        if mode == 'preview' and (state.video_state.get('total') or 0) > 1:
+            frame_select_container.classes(remove='hidden')
+        else:
+            frame_select_container.classes(add='hidden')
+
+    # ====== 帧选择器逻辑 ======
+    _frame_sel = {"busy": False, "pending": None}
+
+    def _fmt_frame_pos(idx, total, fps):
+        m, s = divmod(idx / max(fps, 1e-6), 60)
+        return f'帧 {idx} / {max(total - 1, 0)}  {int(m):02d}:{s:04.1f}'
+
+    def _sync_frame_selector():
+        """视频加载后同步滑块范围/位置（各加载路径已将 current_frame 重置为 0）。"""
+        total = int(state.video_state.get('total') or 0)
+        if total <= 1:
+            frame_select_container.classes(add='hidden')
+            return
+        frame_slider._props.update({'min': 0, 'max': total - 1, 'step': 1})
+        frame_slider.set_value(0)
+        frame_slider.update()
+        frame_pos_label.set_text(_fmt_frame_pos(0, total, state.video_state.get('fps') or 30.0))
+        frame_select_container.classes(remove='hidden')
+
+    async def _on_frame_slider_change(e):
+        """拖动选帧：更新 current_frame（决定标定点击/基准帧所在帧）并刷新预览。
+
+        拖动过程事件密集且 read_frame 昂贵（开容器+seek+解码），
+        用 catch-up 策略：读取中只记 pending 最新值，读完直接跳过去，
+        不排队解码拖动路径上的每一帧。
+        """
+        idx = int(e.value)
+        total = int(state.video_state.get('total') or 0)
+        if total > 0:
+            idx = max(0, min(idx, total - 1))
+        frame_pos_label.set_text(_fmt_frame_pos(idx, total, state.video_state.get('fps') or 30.0))
+        if state.current_task() is not None:
+            return  # 任务运行中：预览已隐藏，防御性拒绝
+        if _frame_sel["busy"]:
+            _frame_sel["pending"] = idx
+            return
+        _frame_sel["busy"] = True
+        try:
+            from nicegui import run
+            while True:
+                target = _frame_sel["pending"]
+                _frame_sel["pending"] = None
+                if target is None:
+                    target = idx
+                state.video_state["current_frame"] = int(target)
+                result = await run.io_bound(detection.preview_frame, int(target))
+                if result is not None and result[0] is not None:
+                    preview_image.set_source(video_utils.frame_to_base64(result[0]))
+                if _frame_sel["pending"] is None:
+                    break
+        finally:
+            _frame_sel["busy"] = False
+
+    frame_slider.on_value_change(_on_frame_slider_change)
 
     # ====== 全局任务互斥：锁在 services.state（进程级，跨页面连接/刷新共享）======
     # 旧实现 _busy 是页面函数局部变量：NiceGUI 每个连接/刷新独立执行页面函数，
@@ -562,11 +644,12 @@ def main_page():
             b64 = video_utils.frame_to_base64(frame)
             preview_image.set_source(b64)
             _show_right_pane('preview')
+            _sync_frame_selector()
         else:
             # 加载失败也必须刷新卡片（state 已在 load_video 里清空，UI 要同步显示空列表）
             _refresh_result_cards()
         info_text.set_text(info)
-        calib_status.set_text('请点击画面 2 个点标定篮筐' if frame is not None else info)
+        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点标定篮筐' if frame is not None else info)
 
     def _refresh_batch_list():
         """刷新批量下拉框：三态标记（☑已完成n球 / ✓已标定 / ○未标定），保留当前选中。"""
@@ -669,6 +752,7 @@ def main_page():
             if frame is not None:
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
+                _sync_frame_selector()
             info_text.set_text(info)
             calib_status.set_text(status)
             # 刷新结果卡片（已检测过的视频会显示进球列表）
@@ -691,6 +775,7 @@ def main_page():
         if state.current_task() == 'batch':
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
             state.cancel_event.set()
+            state.batch_task_status["cancel_requested"] = True  # 跨页面取消态可见
             batch_run_btn.set_text('正在取消...')
             batch_run_btn.disable()
             return
@@ -754,16 +839,22 @@ def main_page():
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
         # 注意：正常路径锁由 run_batch_detect 内部 finally 释放（锁归任务本体，
         # 页面刷新取消 UI 协程时后台线程仍持锁跑到结束）
-        batch_run_btn.set_text('批量识别')
-        batch_run_btn.enable()
-        batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
-        _show_right_pane('preview')
-        _set_status(status, 'ok' if ok else 'err')
-        # 批量结束后：用户查看中的快照保留显示；否则回全局模式显示最后一个视频的结果
-        if _cards_video["path"] not in state.batch_results:
-            _cards_video["path"] = None
-        _refresh_result_cards()
-        _refresh_batch_list()
+        try:
+            batch_run_btn.set_text('批量识别')
+            batch_run_btn.enable()
+            batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
+            _show_right_pane('preview')
+            _set_status(status, 'ok' if ok else 'err')
+            # 批量结束后：用户查看中的快照保留显示；否则回全局模式显示最后一个视频的结果
+            if _cards_video["path"] not in state.batch_results:
+                _cards_video["path"] = None
+            _refresh_result_cards()
+            _refresh_batch_list()
+        except RuntimeError:
+            # 启动批量的页面已被刷新/关闭（客户端已销毁）：元素更新全部抛
+            # RuntimeError。进程级状态（batch_task_status / batch_results）
+            # 已就位，重连页面的轮询会自行还原进度 UI，这里静默即可
+            pass
 
     async def _on_image_click(e):
         """点击预览图标定篮筐。
@@ -818,6 +909,39 @@ def main_page():
                 if frame is not None:
                     preview_image.set_source(video_utils.frame_to_base64(frame))
 
+    def _build_cp_params():
+        """断点续识别参数快照（与 services/detection.py run_detect 的
+        _cp_params 逐项同口径，比对失配 = 参数变了，断点不可用）"""
+        _hoop = state.calib["hoop"]
+        # start/end 归一化与 run_detect 入口完全一致（end 缺省=总帧数，再夹到
+        # [start+1, total]），否则用户填的结束帧 > 总帧数时断点永远失配
+        _start = max(0, int(start_frame.value or 0))
+        _total = int(state.video_state.get("total") or 0)
+        _end = int(end_frame.value or 0)
+        _end = _end if _end > 0 else _total
+        if _total > 0:
+            _end = min(max(_start + 1, _end), _total)
+        # baseline_idx 可能合法为 0（不能用 `or -1`，会把 0 判成缺省）
+        _bidx = state.calib.get("baseline_idx")
+        _bidx = int(_bidx) if _bidx is not None else -1
+        return {
+            "start": _start,
+            "end": _end,
+            "fps": round(float(state.video_state.get("fps") or 0), 3),
+            "hoop": list(int(v) for v in (_hoop or [])),
+            "baseline_idx": _bidx,
+            "ball_conf": float(ball_conf.value),
+            "min_gap_sec": float(min_gap.value),
+            "diff_threshold": int(diff_threshold.value),
+            "auto_threshold": bool(auto_threshold_switch.value),
+            "yolo_step": 3 if yolo_3frame_switch.value else 2,
+            "skip_yolo_no_motion": bool(skip_yolo_switch.value),
+            "min_circularity": float(min_circularity.value),
+            "min_in_hoop_frames": int(min_in_hoop_frames.value),
+            "min_blob_area": int(min_blob_area.value),
+            "search_margin": int(search_margin.value),
+        }
+
     async def _on_detect():
         if state.current_task() == 'detect':
             # 检测中点击 → 请求取消，run_detect 轮询后中断
@@ -825,6 +949,29 @@ def main_page():
             detect_btn.set_text('正在取消...')
             detect_btn.disable()
             return
+        # 断点续识别：上次取消/中断留下的断点 → 询问续跑还是从头
+        _resume_flag = {'v': False}
+        _vp = state.video_state["path"]
+        if _vp and state.has_checkpoint(_vp):
+            _cp = state.load_checkpoint(_vp, _build_cp_params())
+            if _cp:
+                _cp_min = _cp["frame"] / max(state.video_state.get("fps") or 1, 1) / 60.0
+                _n_goals = len(_cp.get("goals") or [])
+                dlg = ui.dialog().props('persistent')
+
+                def _pick_answer(cont: bool):
+                    dlg.submit(cont)
+
+                with dlg:
+                    with ui.card():
+                        ui.label('检测到未完成的识别任务').classes('text-base font-bold')
+                        ui.label(f'上次中断于 {_cp_min:.1f} 分钟处，已检出 {_n_goals} 个进球。').classes('text-sm pt-1')
+                        ui.label('从断点继续，还是重新识别？').classes('text-sm pt-1')
+                        with ui.row().classes('w-full justify-end gap-2 pt-3'):
+                            ui.button('从头识别', on_click=lambda: _pick_answer(False)).props('flat')
+                            ui.button('断点续跑', on_click=lambda: _pick_answer(True)).props('color=primary')
+                _resume_flag['v'] = await dlg
+                dlg.delete()
         token = _try_acquire('detect')
         if not token:
             return
@@ -861,7 +1008,8 @@ def main_page():
                 auto_threshold=auto_threshold_switch.value,
                 yolo_step=3 if yolo_3frame_switch.value else 2,
                 skip_yolo_no_motion=skip_yolo_switch.value,
-                task_token=token)
+                task_token=token,
+                resume=_resume_flag['v'])
         except Exception as _e:
             import traceback
             status = f"❌ 检测异常: {_e}\n{traceback.format_exc()}"
@@ -879,6 +1027,82 @@ def main_page():
         # 无论成功/失败都刷新卡片：失败路径 run_detect 已清空 state，
         # 不刷新会残留上一个视频的卡片（点击预览静默无效）
         _refresh_result_cards()
+
+    # ===== L4 验证器进度轮询：后台模型打分变化时刷新卡片（分数徽标/自动√×）=====
+    _verify_last_seen: dict = {"key": None, "snapshot": None}
+
+    def _verify_watch():
+        try:
+            from services import goal_verifier
+            vp = _cards_video["path"] or state.video_state["path"]
+            if not vp:
+                return
+            st = goal_verifier.verify_status.get(vp)
+            if not st:
+                return
+            snap = (st.get("running"), st.get("done", 0), st.get("total", 0))
+            if _verify_last_seen["key"] == vp and _verify_last_seen["snapshot"] == snap:
+                return
+            # 状态变化：验证中 → 展示进度；刚结束（running False 且有完成数）→ 刷新卡片出分数
+            changed = (_verify_last_seen["key"] != vp
+                       or _verify_last_seen["snapshot"] != snap)
+            _verify_last_seen["key"] = vp
+            _verify_last_seen["snapshot"] = snap
+            if changed and (snap[0] or snap[1]):
+                _refresh_result_cards()
+        except Exception:
+            pass
+
+    ui.timer(2.0, _verify_watch)
+
+    # ===== 批量任务进度恢复：页面刷新后从进程级 state 读进度，重接进度 UI =====
+    # 背景：NiceGUI 页面函数每连接执行一次，刷新销毁旧页面的进度条/回调，
+    # 但 io_bound 检测线程还在跑。detection 把进度写进 state.batch_task_status，
+    # 这里加载时恢复显示 + 定时轮询更新；任务结束后还原批量面板状态。
+    _batch_task_last: dict = {"running": None}
+
+    def _restore_batch_task_ui():
+        try:
+            st = dict(state.batch_task_status)
+            running = bool(st.get("running"))
+            if running:
+                # 任务在跑（页面加载时或轮询中发现新任务）→ 恢复进度 UI
+                batch_panel.classes(remove='hidden')
+                batch_progress_strip.classes(remove='hidden')
+                pct = float(st.get("pct", 0.0))
+                batch_mini_bar.set_value(pct / 100.0)
+                batch_mini_text.set_text(f'{pct:.0f}%')
+                msg = st.get("message", "")
+                cur = st.get("current")
+                idx, total = st.get("index", 0), st.get("total", 0)
+                line = f'[{idx}/{total}] {cur} · {msg}' if cur else (msg or '后台识别中')
+                progress_bar.set_value(pct / 100.0)
+                progress_text.set_text('正在批量识别（页面已重连）')
+                progress_detail.set_text(line)
+                # 取消按钮回到「取消」态（新页面的按钮是初始文案，不改会显示「批量识别」
+                # 让用户以为没在跑；detection 循环轮询 cancel_event，跨页面 set 仍生效）
+                if not st.get("cancel_requested"):
+                    batch_run_btn.set_text('取消')
+                    batch_run_btn.enable()
+                else:
+                    batch_run_btn.set_text('正在取消...')
+                    batch_run_btn.disable()
+                _refresh_batch_list()
+            elif not running and _batch_task_last["running"] is True:
+                # 任务刚结束（本页面没启动过它，是刷新前的任务跑完了）→ 还原面板
+                batch_run_btn.set_text('批量识别')
+                batch_run_btn.enable()
+                batch_progress_strip.classes(add='hidden')
+                _set_status(f'后台批量识别已结束: {st.get("message", "")} | '
+                            f'结果见历史记录/批量列表', 'info')
+                _refresh_batch_list()
+                _refresh_result_cards()
+            _batch_task_last["running"] = running
+        except Exception:
+            pass
+
+    _restore_batch_task_ui()  # 页面加载即恢复（不等 2s 定时器）
+    ui.timer(2.0, _restore_batch_task_ui)
 
     def _refresh_result_cards():
         """刷新结果卡片列表。
@@ -898,42 +1122,160 @@ def main_page():
                 if vp is not None:
                     ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                         'text-xs text-center w-full py-4').style('color: var(--accent)')
-                    ui.label('该视频的片段已全部删除').classes('text-gray-400 text-xs text-center w-full')
+                    ui.label('该视频暂无片段').classes('text-gray-400 text-xs text-center w-full')
                 else:
                     ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
                     ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
             export_row.classes(add='hidden')  # 无结果时隐藏导出按钮
             _set_func_collapsed(False)  # 列表为空时展开功能区
             return
+
+        # ===== 验证中占位：全部标完再显示片段 =====
+        # 打分/自动标记完成前不渲染卡片，只显示进度；完成瞬间 _verify_watch
+        # 检测到 running=False 触发本函数 → 卡片带全部 √/× 标记一次性出现
+        from services import goal_verifier as _gv
+        _vp_v = vp if vp is not None else state.video_state.get("path")
+        _vst = _gv.verify_status.get(_vp_v) if _vp_v else None
+        if _vst and _vst.get("running"):
+            with result_container:
+                if vp is not None:
+                    ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                        'text-xs font-bold w-full pb-1').style('color: var(--accent)')
+                with ui.card().props('flat').classes('w-full rounded-lg px-3 py-8').style(
+                        'margin: 0; background: var(--bg-surface); '
+                        'border: 1px dashed var(--border-subtle)'):
+                    with ui.row().classes('w-full justify-center items-center gap-3'):
+                        ui.spinner('dots', size='lg', color='accent')
+                        ui.label(f'模型验证中 {_vst.get("done", 0)}/{_vst.get("total", 0)}').classes(
+                            'text-base font-bold').style('color: var(--accent)')
+                    ui.label('四臂打分与自动标记完成后，片段将一次性显示').classes(
+                        'text-xs text-center w-full pt-3').style(
+                        'color: var(--text-secondary)')
+            export_row.classes(add='hidden')  # 未出结果前不显示导出
+            _set_func_collapsed(False)  # 等待期间展开功能区供操作
+            return
+
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
-        for i, clip in enumerate(clips):
+
+        # 顶部统计行：√ / × / 待标 + 导出说明
+        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
+        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
+        n_pending = len(clips) - n_keep - n_reject
+        from services import goal_verifier
+        _vp_key = vp if vp is not None else state.video_state.get("path")
+        vst = goal_verifier.verify_status.get(_vp_key) if _vp_key else None
+        n_incomplete = int(vst.get("incomplete") or 0) if vst else 0
+        n_calib = sum(1 for c in clips if c.get("calib") == "need")
+        if goal_verifier.FULL_AUTO:
+            n_calib = 0  # 全自动模式无待校准概念，避免旧标记误导
+        if n_incomplete:
+            export_hint = f'⚠️ {n_incomplete} 个片段未打分，导出前请先重新验证'
+        elif n_keep:
+            export_hint = f'导出集锦：{n_keep} 个 √ 片段'
+        elif n_reject:
+            export_hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
+        else:
+            export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
+        with result_container:
+            if vp is not None:
+                ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                    'text-xs font-bold w-full pb-1').style('color: var(--accent)')
+            with ui.row().classes('w-full items-center gap-2 px-1 pb-2 flex-wrap'):
+                if goal_verifier.FULL_AUTO:
+                    ui.label('🤖 全自动').classes('text-xs font-bold').style('color: var(--accent)')
+                ui.label(f'√ {n_keep}').classes('text-xs font-bold').style('color: #22c55e')
+                ui.label(f'× {n_reject}').classes('text-xs font-bold').style('color: var(--err)')
+                ui.label(f'待标 {n_pending}').classes('text-xs').style('color: var(--text-secondary)')
+                if vst and vst.get("running"):
+                    ui.label(f'模型验证中 {vst.get("done", 0)}/{vst["total"]}...').classes(
+                        'text-xs').style('color: var(--accent)')
+                if n_incomplete:
+                    ui.label(f'⚠️ 验证不完整：{n_incomplete} 个片段未打分').classes(
+                        'text-xs font-bold').style('color: #f59e0b')
+                if n_calib:
+                    ui.label(f'🎯 先确认 {n_calib} 个高分片段完成场次校准').classes(
+                        'text-xs font-bold').style('color: #3b82f6')
+                ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
+
+        # 渲染顺序：严格按事件时间升序（用户 2026-08-31 决策：标记完成后
+        # 预览片段按时间顺序看，不再把待校准/双模判×置顶打乱时间线）。
+        # order 存原数组索引——按钮回调用原索引操作 clips，渲染重排不影响操作正确性
+        order = sorted(range(len(clips)), key=lambda k: float(clips[k]["ts"]))
+        for pos, i in enumerate(order):
+            clip = clips[i]
             ts = clip["ts"]
-            # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常量，
+            # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常数，
             # 旧实现两处各写一个 3，改一处必漏另一处）
             half = detection.PREVIEW_CLIP_HALF_SEC
             start_ts = max(0.0, ts - half)
             end_ts = ts + half
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
+            mark = clip.get("mark")
+            score = clip.get("score")
+            # 卡片视觉状态：√ 绿框 / × 红框半透明 / 待校准 蓝虚框
+            card_style = 'margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'
+            if mark == 'keep':
+                card_style = ('margin: 0; background: var(--bg-surface); '
+                              'border: 1px solid rgba(34, 197, 94, 0.6)')
+            elif mark == 'reject':
+                card_style = ('margin: 0; background: var(--bg-surface); opacity: 0.55; '
+                              'border: 1px solid rgba(239, 68, 68, 0.5)')
+            elif clip.get('calib') == 'need':
+                # 每场校准：请优先确认这些高分片段（确认完自动平移本场分数）
+                card_style = ('margin: 0; background: var(--bg-surface); '
+                              'border: 2px dashed rgba(59, 130, 246, 0.9)')
             with result_container:
-                if i == 0 and vp is not None:
+                if pos == 0 and vp is not None:
                     # 快照模式：首行显示当前查看的视频名，明确数据归属
                     ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                         'text-xs font-bold w-full pb-1').style('color: var(--accent)')
-                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style('margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'):
-                    # 第一行：时间戳徽章（mono + tabular-nums）
+                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
+                    # 第一行：时间戳徽章 + 模型分数徽标 + 校准徽标
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
-                    # 第二行：操作按钮（图标化，hover 才显文字）
+                        if score is not None:
+                            # 冠军集成分：>=keep_thr 自动 √ 绿色，<=reject_thr 自动 × 红色
+                            # （阈值来自 model_temporal_meta.json 的 ensemble 段）；
+                            # 校准后显示 score_calibrated
+                            _keep_thr, _rej_thr = goal_verifier.get_thresholds()
+                            _disp = clip.get('score_calibrated', score)
+                            _score_color = '#22c55e' if _disp >= _keep_thr else (
+                                'var(--err)' if _disp <= _rej_thr else 'var(--text-secondary)')
+                            _src = '模型' if clip.get('mark_source') == 'auto' else '分数'
+                            ui.label(f'{_src} {_disp * 100:.0f}%').classes(
+                                'text-xs px-1.5 py-0.5 rounded').style(
+                                f'color: {_score_color}; border: 1px solid var(--border-subtle)')
+                        elif vst and vst.get("running"):
+                            ui.label('验证中...').classes('text-xs').style('color: var(--text-secondary)')
+                        if clip.get('calib') == 'need':
+                            ui.label('🎯 请先确认（场次校准）').classes(
+                                'text-xs px-1.5 py-0.5 rounded').style(
+                                'color: #3b82f6; border: 1px dashed rgba(59, 130, 246, 0.8)')
+                        if clip.get('calib_shift'):
+                            ui.label(f'校准+{clip["calib_shift"]:.2f}').classes(
+                                'text-xs px-1.5 py-0.5 rounded').style(
+                                'color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.6)')
+                    # 第二行：操作按钮（预览 / √ / × / 导出）
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
+                        _keep_on = mark == 'keep'
+                        ui.button('√ 确认', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')).classes(
+                            'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
+                            f'color: {"#22c55e" if _keep_on else "var(--text-secondary)"}; '
+                            f'border: 1px solid {"rgba(34, 197, 94, 0.7)" if _keep_on else "var(--border-subtle)"}; '
+                            f'background: {"rgba(34, 197, 94, 0.12)" if _keep_on else "transparent"}')
+                        _rej_on = mark == 'reject'
+                        ui.button('× 误报', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')).classes(
+                            'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
+                            f'color: {"var(--err)" if _rej_on else "var(--text-secondary)"}; '
+                            f'border: 1px solid {"rgba(239, 68, 68, 0.7)" if _rej_on else "var(--border-subtle)"}; '
+                            f'background: {"rgba(239, 68, 68, 0.12)" if _rej_on else "transparent"}')
                         ui.button('导出', on_click=lambda e, idx=i: _on_export_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
-                        ui.button('删除', on_click=lambda e, idx=i: _on_delete_clip(idx)).classes(
-                            'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--err); border: 1px solid rgba(239, 68, 68, 0.3)')
 
     def _on_preview_clip(idx):
         # 全局模式下有任务运行时拒绝：检测线程可能正在 clear/extend clips，
@@ -956,13 +1298,11 @@ def main_page():
             ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
-    def _on_delete_clip(idx):
-        # 快照模式（查看批量已完成视频）随时可删，仅改快照；
-        # 全局模式有任务运行时拒绝（会与检测线程冲突）
+    def _on_mark_clip(idx, action):
+        # 快照模式随时可标（只改快照 dict）；全局模式有任务运行时拒绝（会与检测线程冲突）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        # 点击直接删除，不弹确认框
-        _, status = detection.clip_action("delete", idx, video_path=_cards_video["path"])
+        _, status = detection.clip_action(action, idx, video_path=_cards_video["path"])
         _refresh_result_cards()
         _set_status(status, 'info')
 
@@ -1063,7 +1403,14 @@ def main_page():
             with history_list:
                 ui.label('暂无历史记录').classes('text-gray-400 text-xs')
             return
-        for i, r in enumerate(records):
+        # 磁盘全量保留，但 UI 只渲染最近 HISTORY_UI_LIMIT 条（防止上千条卡死）
+        HISTORY_UI_LIMIT = 200
+        shown = records[:HISTORY_UI_LIMIT]
+        if len(records) > HISTORY_UI_LIMIT:
+            with history_list:
+                ui.label(f'共 {len(records)} 条记录，仅显示最近 {HISTORY_UI_LIMIT} 条'
+                         ).classes('text-xs text-gray-400 py-1')
+        for i, r in enumerate(shown):
             video = r.get("video", "")
             name = os.path.basename(video) if video else "未知"
             goals = len(r.get("goals", []))
@@ -1131,6 +1478,7 @@ def main_page():
         _show_right_pane('preview')
         if frame is not None:
             preview_image.set_source(video_utils.frame_to_base64(frame))
+            _sync_frame_selector()
         # 同步路径输入框，显示当前加载的视频
         if state.video_state["path"]:
             path_input.set_value(state.video_state["path"])

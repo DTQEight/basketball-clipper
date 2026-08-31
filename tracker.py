@@ -171,6 +171,41 @@ class GoalDetector:
             "baseline_updates": 0, # 滚动基准帧更新次数
         }
 
+    def set_hoop(self, hoop_box, frame=None, frame_idx=None):
+        """检测中途篮筐移位（支架被撞等）：更新篮筐坐标及全部派生量。
+
+        - 搜索区域按新坐标重建
+        - frame 给定时用当前帧重置基准帧（旧基准 ROI 对应的是旧位置）
+        - 进球状态机复位：坐标基准变了，穿越/进框状态作废（最多丢一个
+          移位瞬间的候选球，远好于用旧坐标继续跑产生的整段错误结果）
+        """
+        self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
+        self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
+        self.hoop_cy = (self.hoop_y1 + self.hoop_y2) / 2
+        self.hoop_w = self.hoop_x2 - self.hoop_x1
+        self.hoop_h = self.hoop_y2 - self.hoop_y1
+        self.hoop_top = self.hoop_y1
+        self.hoop_bot = self.hoop_y2
+        self.search_x1 = max(0, self.hoop_x1 - self.search_margin)
+        self.search_y1 = max(0, self.hoop_y1 - self.search_margin)
+        self.search_x2 = self.hoop_x2 + self.search_margin
+        self.search_y2 = self.hoop_y2 + self.search_margin
+        # 状态机复位
+        self.blob_above_hoop = False
+        self.blob_in_hoop = False
+        self.blob_in_hoop_frames = 0
+        self.last_blob_box = None
+        self.last_above_frame = -999
+        self.last_in_hoop_frame = -999
+        # 滚动基准候选作废（对应旧位置）
+        self._baseline_candidate_frame = None
+        self._baseline_candidate_diff = float("inf")
+        self._baseline_candidate_idx = -1
+        if frame is not None:
+            self.set_baseline(frame)
+            if frame_idx is not None:
+                self.last_baseline_frame_idx = int(frame_idx)
+
     def _roi_gray(self, frame):
         """裁剪篮筐搜索区域 → 灰度 → 高斯模糊。
 

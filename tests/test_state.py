@@ -42,6 +42,25 @@ class TestHistory:
         with pytest.raises(TypeError):
             state_mod.add_history("/a.mp4", (1, 2, 3, 4), [], typo_field=1)
 
+    def test_update_history_marks(self, state_mod):
+        """verify 自动标记回写历史：按 ts 键存，basename 兜底匹配。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0, 5.0])
+        clips = [{"ts": 1.0, "score": 0.9, "mark": "keep", "mark_source": "auto"},
+                 {"ts": 5.0, "score": 0.05, "mark": "reject", "mark_source": "auto"}]
+        assert state_mod.update_history_marks("/a.mp4", clips)
+        rec = state_mod.load_history()[0]
+        assert rec["clip_marks"]["1.0"]["mark"] == "keep"
+        assert rec["clip_marks"]["5.0"]["score"] == 0.05
+        # 路径迁移兜底：按文件名匹配同一条记录，增量合并不丢已有键
+        assert state_mod.update_history_marks("/moved/a.mp4",
+                                              [{"ts": 1.0, "score": 0.91,
+                                                "mark": "keep", "mark_source": "auto"}])
+        rec = state_mod.load_history()[0]
+        assert rec["clip_marks"]["1.0"]["score"] == 0.91
+        assert "5.0" in rec["clip_marks"]
+        assert not state_mod.update_history_marks("/nope.mp4", clips)
+        assert not state_mod.update_history_marks("/a.mp4", [{"ts": 1.0}])
+
     def test_corrupt_file_backed_up_not_wiped(self, state_mod):
         """损坏的历史文件必须先备份 .corrupt-*.bak，而不是被静默覆盖清空。"""
         state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0])
@@ -93,12 +112,15 @@ class TestHistory:
         records = state_mod.load_history()
         assert len(records) == 1 and records[0]["video"] == "/a.mp4"
 
-    def test_max_records_truncated(self, state_mod):
-        """历史记录上限截断到 MAX_HISTORY_RECORDS。"""
-        n = state_mod.MAX_HISTORY_RECORDS + 5
+    def test_no_truncation_unlimited(self, state_mod):
+        """历史记录不限量保留（MAX_HISTORY_RECORDS=None，全部落盘）。"""
+        n = 60  # 超出旧上限 50，验证不再截断
         for i in range(n):
             state_mod.add_history(f"/v{i}.mp4", (1, 2, 3, 4), [float(i)])
-        assert len(state_mod.load_history()) == state_mod.MAX_HISTORY_RECORDS
+        records = state_mod.load_history()
+        assert len(records) == n
+        # 最近的在最前
+        assert records[0]["video"] == f"/v{n - 1}.mp4"
 
 
 class TestClipCache:
@@ -146,6 +168,41 @@ class TestClipCache:
                                      [{"ts": 1.0, "path": str(hl_file), "idx": 0}])
         assert hl_file.exists()
 
+    def test_marks_roundtrip(self, state_mod, tmp_path):
+        """verify 分数/标记随缓存落盘并可读回（重启后免重新验证）。"""
+        clip_file = tmp_path / "goal_1_0s.mp4"
+        clip_file.write_bytes(b"x")
+        key = state_mod.clip_cache_key("/v.mp4", [1.0])
+        state_mod.put_clip_cache(key, [{"ts": 1.0, "path": str(clip_file), "idx": 0,
+                                        "score": 0.83, "mark": "keep",
+                                        "mark_source": "auto"}])
+        state_mod.clip_cache.clear()
+        state_mod.init_clip_cache()
+        c = state_mod.clip_cache[key][0]
+        assert c["score"] == 0.83
+        assert c["mark"] == "keep"
+        assert c["mark_source"] == "auto"
+
+    def test_update_clip_cache_marks(self, state_mod, tmp_path):
+        """回写按 ts 匹配、就地更新并落盘；无匹配视频返回 False。"""
+        clip_file = tmp_path / "goal_2_0s.mp4"
+        clip_file.write_bytes(b"x")
+        key = state_mod.clip_cache_key("/v.mp4", [2.0, 5.0])
+        state_mod.put_clip_cache(key, [
+            {"ts": 2.0, "path": str(clip_file), "idx": 0},
+            {"ts": 5.0, "path": str(clip_file), "idx": 1},
+        ])
+        marked = [{"ts": 2.0, "score": 0.9, "mark": "keep", "mark_source": "auto"},
+                  {"ts": 5.0, "score": 0.05, "mark": "reject", "mark_source": "auto"}]
+        assert state_mod.update_clip_cache_marks("/v.mp4", marked)
+        cached = state_mod.clip_cache[key]
+        assert cached[0]["mark"] == "keep" and cached[1]["mark"] == "reject"
+        # 落盘：清内存重读仍在
+        state_mod.clip_cache.clear()
+        state_mod.init_clip_cache()
+        assert state_mod.clip_cache[key][1]["score"] == 0.05
+        assert not state_mod.update_clip_cache_marks("/other.mp4", marked)
+
 
 class TestTaskLock:
     def test_acquire_release_with_token(self, state_mod):
@@ -180,3 +237,65 @@ class TestCancelEvent:
         state_mod.cancel_event.set()
         assert state_mod.cancel_event.is_set()
         state_mod.cancel_event.clear()
+
+
+class TestCheckpoint:
+    """检测断点（断点续识别）持久化测试。"""
+
+    _PARAMS = {"start": 0, "end": 9000, "fps": 30.0,
+               "hoop": [100, 200, 300, 400], "baseline_idx": 7,
+               "ball_conf": 0.3, "min_gap_sec": 3.0,
+               "diff_threshold": 15, "auto_threshold": True,
+               "yolo_step": 2, "skip_yolo_no_motion": False,
+               "min_circularity": 0.35, "min_in_hoop_frames": 2,
+               "min_blob_area": 30, "search_margin": 80}
+
+    def test_roundtrip_same_params(self, state_mod):
+        state_mod.save_checkpoint("/a.mp4", 3000, [12.5, 40.0], self._PARAMS)
+        cp = state_mod.load_checkpoint("/a.mp4", dict(self._PARAMS))
+        assert cp is not None
+        assert cp["frame"] == 3000
+        assert cp["goals"] == [12.5, 40.0]
+
+    def test_saved_extra_keys_do_not_break_match(self, state_mod):
+        """写盘附带 auto_threshold_value 等扩展字段，比对只看调用方参数。"""
+        params = {**self._PARAMS, "auto_threshold_value": 17}
+        state_mod.save_checkpoint("/a.mp4", 100, [], params)
+        assert state_mod.load_checkpoint("/a.mp4", dict(self._PARAMS)) is not None
+
+    def test_param_mismatch_rejected(self, state_mod):
+        state_mod.save_checkpoint("/a.mp4", 3000, [], self._PARAMS)
+        changed = dict(self._PARAMS)
+        changed["ball_conf"] = 0.5
+        assert state_mod.load_checkpoint("/a.mp4", changed) is None
+        changed2 = dict(self._PARAMS)
+        changed2["hoop"] = [100, 200, 300, 401]
+        assert state_mod.load_checkpoint("/a.mp4", changed2) is None
+
+    def test_zero_frame_rejected(self, state_mod):
+        state_mod.save_checkpoint("/a.mp4", 0, [], self._PARAMS)
+        assert state_mod.load_checkpoint("/a.mp4", dict(self._PARAMS)) is None
+
+    def test_other_video_no_checkpoint(self, state_mod):
+        state_mod.save_checkpoint("/a.mp4", 100, [], self._PARAMS)
+        assert state_mod.load_checkpoint("/b.mp4", dict(self._PARAMS)) is None
+        assert not state_mod.has_checkpoint("/b.mp4")
+        assert state_mod.has_checkpoint("/a.mp4")
+
+    def test_clear_single_keeps_others(self, state_mod):
+        state_mod.save_checkpoint("/a.mp4", 100, [], self._PARAMS)
+        state_mod.save_checkpoint("/b.mp4", 200, [], self._PARAMS)
+        state_mod.clear_checkpoint("/a.mp4")
+        assert not state_mod.has_checkpoint("/a.mp4")
+        assert state_mod.has_checkpoint("/b.mp4")
+        state_mod.clear_checkpoint()                     # 全清
+        assert not state_mod.has_checkpoint("/b.mp4")
+
+    def test_corrupt_file_safe(self, state_mod):
+        """断点文件损坏：读/判都安全返回空，写盘可自愈覆盖。"""
+        with open(state_mod.CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            f.write("{ corrupted !!!")
+        assert state_mod.load_checkpoint("/a.mp4", self._PARAMS) is None
+        assert not state_mod.has_checkpoint("/a.mp4")
+        state_mod.save_checkpoint("/a.mp4", 50, [], self._PARAMS)
+        assert state_mod.load_checkpoint("/a.mp4", dict(self._PARAMS))["frame"] == 50

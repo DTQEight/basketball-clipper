@@ -18,6 +18,24 @@ train_data_manual/
 runs/
 demo_output/
 
+# training/ 大体积中间数据（帧缓存/特征/裁剪块，可由 training/ 脚本再生）
+training/frames_b/
+training/frames_b_feat/
+training/frames_b_feat_simclr/
+training/frames_c/
+training/flow_b/
+training/feat_c_ball/
+training/feat_c_glob/
+training/feat_flow/
+training/feat_traj/
+training/tracks_c/
+training/traj_c/
+training/vm_feat/
+training/clips/
+training/yolo_data/
+training/crops_all.npy
+training/features*.jsonl
+
 # 视频文件（太大）
 *.mp4
 *.avi

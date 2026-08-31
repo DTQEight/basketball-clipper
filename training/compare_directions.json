@@ -1,0 +1,325 @@
+{
+  "trained_at": "2026-08-29 16:44:16",
+  "n_events": 2232,
+  "n_pos": 906,
+  "grouping": "by_game_day",
+  "arms": {
+    "AB_baseline": {
+      "oof_auc": 0.8959,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.7273,
+          "precision": 0.9008,
+          "recall": 0.4812
+        },
+        "0.95": {
+          "threshold": 0.8804,
+          "precision": 0.9535,
+          "recall": 0.1358
+        },
+        "0.98": {
+          "threshold": 0.9179,
+          "precision": 0.9846,
+          "recall": 0.0706
+        }
+      },
+      "fixed_050": {
+        "precision": 0.7048,
+        "recall": 0.8642
+      }
+    },
+    "C_ball": {
+      "oof_auc": 0.7825,
+      "working_points": {
+        "0.9": {
+          "threshold": 1.0,
+          "precision": 0.9048,
+          "recall": 0.021
+        },
+        "0.95": {
+          "threshold": 1.0,
+          "precision": 1.0,
+          "recall": 0.0132
+        },
+        "0.98": {
+          "threshold": 1.0,
+          "precision": 1.0,
+          "recall": 0.0132
+        }
+      },
+      "fixed_050": {
+        "precision": 0.6546,
+        "recall": 0.6611
+      },
+      "fold_aucs": [
+        0.8237,
+        0.7822,
+        0.7226,
+        0.8473,
+        0.803
+      ]
+    },
+    "C_glob": {
+      "oof_auc": 0.5624,
+      "working_points": {},
+      "fixed_050": {
+        "precision": 0.4419,
+        "recall": 0.6711
+      },
+      "fold_aucs": [
+        0.621,
+        0.5881,
+        0.6066,
+        0.5786,
+        0.5789
+      ]
+    },
+    "C_cat": {
+      "oof_auc": 0.744,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.9971,
+          "precision": 0.9014,
+          "recall": 0.0706
+        },
+        "0.95": {
+          "threshold": 0.9982,
+          "precision": 0.9623,
+          "recall": 0.0563
+        },
+        "0.98": {
+          "threshold": 0.9982,
+          "precision": 0.9808,
+          "recall": 0.0563
+        }
+      },
+      "fixed_050": {
+        "precision": 0.637,
+        "recall": 0.585
+      },
+      "fold_aucs": [
+        0.8185,
+        0.7334,
+        0.6987,
+        0.8133,
+        0.7615
+      ]
+    },
+    "Flow_T": {
+      "oof_auc": 0.936,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.9194,
+          "precision": 0.9004,
+          "recall": 0.7285
+        },
+        "0.95": {
+          "threshold": 0.9787,
+          "precision": 0.9507,
+          "recall": 0.596
+        },
+        "0.98": {
+          "threshold": 0.9958,
+          "precision": 0.9811,
+          "recall": 0.3444
+        }
+      },
+      "fixed_050": {
+        "precision": 0.8102,
+        "recall": 0.8764
+      },
+      "fold_aucs": [
+        0.9268,
+        0.9115,
+        0.9184,
+        0.9593,
+        0.9693
+      ]
+    },
+    "Flow_S": {
+      "oof_auc": 0.5483,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.952,
+          "precision": 1.0,
+          "recall": 0.0011
+        },
+        "0.95": {
+          "threshold": 0.952,
+          "precision": 1.0,
+          "recall": 0.0011
+        },
+        "0.98": {
+          "threshold": 0.952,
+          "precision": 1.0,
+          "recall": 0.0011
+        }
+      },
+      "fixed_050": {
+        "precision": 0.4324,
+        "recall": 0.4658
+      },
+      "fold_aucs": [
+        0.5031,
+        0.533,
+        0.5656,
+        0.5698,
+        0.5545
+      ]
+    },
+    "Traj": {
+      "oof_auc": 0.7157,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.9701,
+          "precision": 0.9111,
+          "recall": 0.0453
+        },
+        "0.95": {
+          "threshold": 0.989,
+          "precision": 1.0,
+          "recall": 0.0077
+        },
+        "0.98": {
+          "threshold": 0.989,
+          "precision": 1.0,
+          "recall": 0.0077
+        }
+      },
+      "fixed_050": {
+        "precision": 0.6028,
+        "recall": 0.5243
+      },
+      "fold_aucs": [
+        0.7493,
+        0.6973,
+        0.7042,
+        0.7301,
+        0.7204
+      ]
+    },
+    "VM": {
+      "oof_auc": 0.872,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.96,
+          "precision": 0.9004,
+          "recall": 0.4492
+        },
+        "0.95": {
+          "threshold": 0.9856,
+          "precision": 0.9512,
+          "recall": 0.3013
+        },
+        "0.98": {
+          "threshold": 0.9994,
+          "precision": 1.0,
+          "recall": 0.0155
+        }
+      },
+      "fixed_050": {
+        "precision": 0.7178,
+        "recall": 0.7947
+      },
+      "fold_aucs": [
+        0.9277,
+        0.8928,
+        0.8528,
+        0.9057,
+        0.9217
+      ]
+    },
+    "SimCLR": {
+      "oof_auc": 0.7624,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.9912,
+          "precision": 0.9038,
+          "recall": 0.2075
+        },
+        "0.95": {
+          "threshold": 0.9983,
+          "precision": 0.9537,
+          "recall": 0.1137
+        },
+        "0.98": {
+          "threshold": 0.9999,
+          "precision": 1.0,
+          "recall": 0.0408
+        }
+      },
+      "fixed_050": {
+        "precision": 0.6183,
+        "recall": 0.7152
+      },
+      "fold_aucs": [
+        0.8468,
+        0.6793,
+        0.7783,
+        0.9584,
+        0.8415
+      ]
+    },
+    "AB+Flow_T": {
+      "oof_auc": 0.9614,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.6125,
+          "precision": 0.901,
+          "recall": 0.8333
+        },
+        "0.95": {
+          "threshold": 0.6704,
+          "precision": 0.9513,
+          "recall": 0.7329
+        },
+        "0.98": {
+          "threshold": 0.7528,
+          "precision": 0.9817,
+          "recall": 0.5342
+        }
+      },
+      "fixed_050": {
+        "precision": 0.7957,
+        "recall": 0.9415
+      }
+    },
+    "AB+Flow_T+VM": {
+      "oof_auc": 0.9663,
+      "working_points": {
+        "0.9": {
+          "threshold": 0.5676,
+          "precision": 0.9006,
+          "recall": 0.8896
+        },
+        "0.95": {
+          "threshold": 0.6473,
+          "precision": 0.9509,
+          "recall": 0.7693
+        },
+        "0.98": {
+          "threshold": 0.712,
+          "precision": 0.9812,
+          "recall": 0.6325
+        }
+      },
+      "fixed_050": {
+        "precision": 0.8179,
+        "recall": 0.9371
+      }
+    }
+  },
+  "ensembles": {
+    "AB+C_ball": 0.8888,
+    "AB+C_glob": 0.801,
+    "AB+C_cat": 0.8732,
+    "AB+Flow_T": 0.9614,
+    "AB+Flow_S": 0.8012,
+    "AB+Traj": 0.8616,
+    "AB+VM": 0.9458,
+    "AB+SimCLR": 0.8785,
+    "AB+Flow_T+VM": 0.9663
+  },
+  "best_ensemble": "AB+Flow_T+VM",
+  "elapsed_sec": 923.2
+}

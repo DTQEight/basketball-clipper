@@ -190,10 +190,14 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             duration = end - start
 
             def _build_cmd(e_args):
+                # -vf format=yuv420p：iPhone HEVC Main10 (yuv420p10le) 源直接进
+                # NVENC 会 "No capable devices found"（NVENC 不支持 10-bit 输入），
+                # 必须先转 8-bit；libx264 同样受益（部分播放器不放 10-bit H.264）
                 return [
                     ffmpeg, "-y", "-loglevel", "error",
                     "-ss", f"{start:.3f}", "-i", video_path,
                     "-t", f"{duration:.3f}",
+                    "-vf", "format=yuv420p",
                 ] + e_args + [
                     "-c:a", "aac", "-b:a", "128k",
                     "-movflags", "+faststart",

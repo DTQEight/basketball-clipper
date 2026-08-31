@@ -56,6 +56,7 @@ def load_video(video_path, task_token=0):
         state.last_goal_clips.clear()
         state.last_goals.clear()
         state.kept_goal_indices.clear()
+        state.last_hoop_track.clear()
         state.video_state.update(path=video_path, total=info["total"], fps=info["fps"],
                                  codec=info["codec"], current_frame=0,
                                  width=info["width"], height=info["height"])
@@ -63,6 +64,19 @@ def load_video(video_path, task_token=0):
         state.calib["hoop"] = None
         state.calib["baseline_frame"] = None
         state.calib["baseline_idx"] = -1
+        # 历史记录里有本视频的标定 → 自动恢复（重跑检测免重新点标）
+        if restore_calib_from_history(video_path, info):
+            frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
+            if frame is not None:
+                x1, y1, x2, y2 = state.calib["hoop"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(frame, "HOOP", (x1, max(y1 - 10, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
+            info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
+                        f"{info['width']}x{info['height']} | {info['codec']}"
+                        f"\n✅ 已复用历史标定（检测可直接开始）")
+            return preview, info_str
         frame = read_frame(video_path, 0, total=info["total"], fps=info["fps"])
         preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
         info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
@@ -88,6 +102,46 @@ def _draw_calib_overlay(frame, hoop, clicks):
         cv2.putText(out, str(i + 1), (x - 6, y - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
     return out
+
+
+def restore_calib_from_history(video_path, info=None):
+    """从历史检测记录恢复篮筐标定（hoop + 基准帧），重跑检测免重新点标。
+
+    匹配规则与批量历史加载一致：路径精确匹配，失败按文件名兜底。
+    基准帧按历史 baseline_idx 现读（视频同一文件，帧号仍有效；
+    读不到帧则视为恢复失败，不写半套标定）。
+    返回 True=已恢复（state.calib 已填好）。
+    """
+    try:
+        records = state.load_history()
+        base_name = os.path.basename(video_path)
+        matched = None
+        for r in records:
+            rv = r.get("video", "")
+            if rv == video_path or (rv and os.path.basename(rv) == base_name):
+                matched = r
+                break
+        if not matched:
+            return False
+        hoop = matched.get("hoop")
+        bidx = matched.get("baseline_idx", -1)
+        if not hoop or hoop is None or bidx is None or int(bidx) < 0:
+            return False
+        hoop = tuple(int(v) for v in hoop)
+        if info is None:
+            info = get_video_info(video_path)
+        base_frame = read_frame(video_path, int(bidx),
+                                 total=info.get("total", 0),
+                                 fps=info.get("fps", 0))
+        if base_frame is None:
+            return False
+        state.calib["hoop"] = hoop
+        state.calib["baseline_frame"] = base_frame
+        state.calib["baseline_idx"] = int(bidx)
+        state.calib["clicks"] = []
+        return True
+    except Exception:
+        return False
 
 
 def preview_frame(frame_idx):
@@ -172,10 +226,12 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     _enc_x264 = None if not _is_nvenc else build_encode_args(ff, quality="preview", use_nvenc=False)
 
     def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
+        # format=yuv420p：iPhone HEVC Main10 (yuv420p10le) 源直接进 NVENC 会
+        # "No capable devices found"（NVENC 不支持 10-bit 输入），必须先转 8-bit
         return [ff, "-y", "-loglevel", "error",
                 "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                 "-t", f"{seg_dur_sec:.3f}",
-                "-vf", "scale=-2:480"] + enc_args + \
+                "-vf", "scale=-2:480,format=yuv420p"] + enc_args + \
                ["-movflags", "+faststart", clip_path]
 
     def _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args):
@@ -261,13 +317,16 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                min_blob_area=30, search_margin=80, progress_callback=None,
                auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False,
-               task_token=0):
+               task_token=0, resume=False):
     """运行进球检测。返回 (结果文本, 是否成功)。
 
     task_token: UI 侧 try_acquire_task 返回的 token。
     传入时锁由本函数持有并在 finally 释放（锁归任务本体：UI 协程在页面
     刷新/断开时被取消，io_bound 线程无法取消继续跑，若由 UI release
     会出现"锁已释放、本线程还在写 state"的并发窗口）。
+
+    resume: 断点续识别。True 时检测前读 checkpoint（同视频同参数），
+    从断点帧继续迭代，已检出进球直接并入结果；参数不一致则忽略断点从头跑。
     """
     def _release_lock():
         if task_token:
@@ -316,6 +375,32 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     video_width = state.video_state.get("width")
     video_height = state.video_state.get("height")
 
+    # ===== 断点续识别：参数快照 + 断点读取 =====
+    # 参数快照同时用于写盘校验（load_checkpoint 逐项比对）与续跑合法性判断。
+    # 阈值存实际生效值（auto 模式预热后才知道，写盘在主循环内完成）。
+    _cp_params = {
+        "start": int(start), "end": int(end), "fps": round(float(fps), 3),
+        "hoop": list(int(v) for v in hoop), "baseline_idx": int(baseline_idx),
+        "ball_conf": float(ball_conf), "min_gap_sec": float(min_gap_sec),
+        "diff_threshold": int(diff_threshold), "auto_threshold": bool(auto_threshold),
+        "yolo_step": int(yolo_step), "skip_yolo_no_motion": bool(skip_yolo_no_motion),
+        "min_circularity": float(min_circularity),
+        "min_in_hoop_frames": int(min_in_hoop_frames),
+        "min_blob_area": int(min_blob_area), "search_margin": int(search_margin),
+    }
+    _cp = state.load_checkpoint(video_path, _cp_params) if resume else None
+    if not _cp:
+        # 全新检测（含 resume=True 但参数失配/无断点）：旧断点作废，
+        # 防止主循环 finally 的兜底写盘把旧断点"复活"成新状态
+        state.clear_checkpoint(video_path)
+    _resume_frame = int(_cp["frame"]) if _cp else None
+    _resume_goals = [float(t) for t in (_cp.get("goals") or [])] if _cp else []
+    if _cp:
+        _resume_ts = _resume_frame / max(fps, 1) / 60.0
+        log.info(f"[RESUME] 命中断点: 从第 {_resume_frame} 帧 ({_resume_ts:.1f} min) 续跑，"
+                 f"已检出进球 {len(_resume_goals)} 个 (断点时间 {_cp.get('time')})")
+        _report(5, f'命中断点，从 {_resume_ts:.1f} 分钟处续跑（已检出 {len(_resume_goals)} 球）...')
+
     _report(5, '初始化检测器...')
     try:
         # 取消短路：预热阶段已被取消时不再加载模型/构建检测器，
@@ -333,7 +418,17 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # ============================================================
         _warmup_info = None   # 保存预热阶段诊断（auto_threshold_value / median / samples）
         _effective_diff_threshold = int(diff_threshold)
-        if bool(auto_threshold):
+        if _cp and _cp.get("auto_threshold_value") is not None:
+            # 续跑：直接复用断点保存的自适应阈值，跳过预热（预热只依赖前 30s，
+            # 结果已固定，重算既浪费 ~1 分钟还可能与断点帧的检测不一致）
+            _effective_diff_threshold = int(_cp["auto_threshold_value"])
+            _warmup_info = {
+                "auto_threshold_value": _cp["auto_threshold_value"],
+                "warmup_p95_median": _cp.get("warmup_p95_median"),
+                "warmup_sample_count": _cp.get("warmup_sample_count", 0),
+            }
+            log.info(f"[RESUME] 复用断点自适应阈值 {_effective_diff_threshold}（跳过预热）")
+        if bool(auto_threshold) and _warmup_info is None:
             _report(6, '预热：收集前30s帧噪声水平...')
             _warmup_detector = GoalDetector(
                 hoop, baseline_frame=baseline_frame,
@@ -420,6 +515,20 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         _report(10, '加载 YOLO 模型...')
         model, _weights_path = get_ball_model()
+        # ===== 篮筐跟踪：标定帧模板匹配，支架被撞时自动跟上新位置 =====
+        # 每 ~5s 校验一次；移位时更新检测器坐标并记录轨迹（hoop_track，
+        # 验证阶段按事件时间取各自的篮筐坐标）。跟踪丢失则保持原位置。
+        from services.hoop_tracker import HoopTracker
+        try:
+            _hoop_tracker = HoopTracker(baseline_frame, hoop)
+        except Exception:
+            import traceback
+            log.warning(f"[HOOP TRACK] 跟踪器初始化失败（跳过跟踪）: "
+                        f"{traceback.format_exc(limit=2)}")
+            _hoop_tracker = None
+        _hoop_track = []           # [{"frame", "ts", "hoop"}]
+        _hoop_check_every = max(75, int(5.0 * fps))
+        _hoop_lost_reported = False
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
         # 回退 COCO 权重（yolov8n.pt）时类 0 是 person，硬编码会误把球员当球确认
         _ball_classes = get_ball_class_ids(model, _weights_path)
@@ -464,6 +573,30 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _debug_last_processed = 0
 
         _report(15, f'开始检测 {n_frames} 帧...')
+        # 断点续识别：恢复已检出进球（冷却窗口跨断点：恢复的最后一个进球 ts
+        # 写回 last_goal_frame，续跑首个进球仍受 min_gap_sec 冷却约束）
+        if _resume_goals:
+            detector.goals.extend(sorted(_resume_goals))
+            if detector.goals:
+                detector.last_goal_frame = int(detector.goals[-1] * fps)
+                log.info(f"[RESUME] 恢复进球 {len(_resume_goals)} 个，"
+                         f"冷却基准帧 {detector.last_goal_frame}")
+        # 续跑起点：iter_frames 半开区间，从断点帧继续（断点帧本身未处理过）
+        _loop_start = start if _resume_frame is None else max(start, _resume_frame)
+        if _resume_frame is not None:
+            # 进度/ETA 只按剩余帧算（否则进度条从 15% 重走、ETA 按全程高估）
+            n_frames = max(end - _loop_start, 1)
+            _report(15, f'断点续跑：从第 {_loop_start} 帧继续（前 {_loop_start - start} 帧已完成）')
+        # 周期写盘：每 ~30s 或每 5 个进球写一次断点（原子写，失败不影响检测）
+        _cp_last_write = time.time()
+        _cp_goals_last = len(detector.goals)
+        _fidx_last = _loop_start - 1   # 已处理的最后一帧（循环体未进时兜底）
+
+        def _save_cp():
+            state.save_checkpoint(video_path, _fidx_last + 1, detector.goals,
+                                  {**_cp_params,
+                                   "auto_threshold_value": _warmup_info.get("auto_threshold_value")
+                                   if _warmup_info else None})
         reader = VideoReader(video_path)
         # 跳帧检测：每 N 帧跑一次 YOLO，跳过的帧复用上一帧 ball_pos（只跑 diff）
         # 篮球下落速度 ~8m/s，30fps 下每帧位移 <0.3m，连续 2 帧丢失不会漏检
@@ -475,7 +608,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _stat_yolo_skipped = 0
         _stat_yolo_failed = 0   # YOLO 推理异常次数（如驱动升级后 CUDA 上下文失效）
         try:
-            for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
+            for fidx, frame in reader.iter_frames(start=_loop_start, end=end, batch=1):
+                _fidx_last = fidx
                 if state.cancel_event.is_set():
                     break
                 ball_pos = None
@@ -539,6 +673,36 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 detector.feed(ball_pos, fidx, fps, frame=frame,
                               ball_frame=ball_frame, frame_roi=_pending_roi)
                 processed += 1
+                # ===== 篮筐位置校验（每 ~5s）=====
+                if _hoop_tracker is not None and processed % _hoop_check_every == 0:
+                    try:
+                        _mv = _hoop_tracker.update(frame)
+                        if _mv is not None:
+                            hoop = tuple(_mv["hoop"])
+                            detector.set_hoop(_mv["hoop"], frame=frame, frame_idx=fidx)
+                            _hoop_track.append({
+                                "frame": int(fidx),
+                                "ts": round(fidx / max(fps, 1.0), 2),
+                                "hoop": list(_mv["hoop"]),
+                            })
+                            log.info(f"[HOOP MOVE] 帧 {fidx} ({fidx/max(fps,1):.1f}s) "
+                                     f"篮筐移位 {_mv['shift_px']:.0f}px "
+                                     f"(匹配 {_mv['score']:.2f}) → 已自动跟踪到 "
+                                     f"{_mv['hoop']}，检测继续")
+                            _report(15 + 60 * processed / n_frames,
+                                    f'🏀 篮筐移位 {fidx/max(fps,1):.0f}s 处 '
+                                    f'(位移 {_mv["shift_px"]:.0f}px)，已自动跟踪，检测继续')
+                        elif (_hoop_tracker.lost_streak >= 6
+                              and not _hoop_lost_reported):
+                            # 连续 6 次（~30s）跟踪丢失：提示但不动坐标
+                            _hoop_lost_reported = True
+                            log.warning("[HOOP TRACK] 连续跟踪丢失（遮挡/变焦？），"
+                                        "沿用原标定继续检测")
+                    except Exception:
+                        import traceback
+                        log.warning(f"[HOOP TRACK] 校验异常（跳过本次）: "
+                                    f"{traceback.format_exc(limit=2)}")
+                        _hoop_tracker = None
                 # 每 10 帧更新一次进度
                 if processed % 10 == 0:
                     pct = 15 + 60 * processed / n_frames
@@ -576,8 +740,21 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                              f"ETA {_eta/60:>4.1f} min | 进球累计 {len(detector.goals):>3d}")
                     _debug_last_print_time = _now
                     _debug_last_processed = processed
+                # 断点续识别：周期写盘（每 30s 或每 5 个新进球）。fidx+1 = 下一未处理帧
+                if ((_now - _cp_last_write) >= 30.0
+                        or (len(detector.goals) - _cp_goals_last) >= 5):
+                    _save_cp()
+                    _cp_last_write = _now
+                    _cp_goals_last = len(detector.goals)
         finally:
             reader.close()
+            # 取消/崩溃兜底：循环结束（无论正常/取消/异常出循环）都落一次盘。
+            # 正常完成时 fidx 已到 end-1，随后成功路径会 clear，此处写盘无副作用；
+            # 取消时这就是断点的最终状态（下次可续跑）
+            try:
+                _save_cp()
+            except Exception:
+                pass
 
         # YOLO 失败率报警：推理环境损坏（如驱动升级后旧进程 CUDA 上下文失效）时，
         # 结果不可信（所有候选进球都会被 YOLO 确认拒绝），直接报错让用户重启服务
@@ -589,6 +766,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
+            state.clear_checkpoint(video_path)   # 结果不可信，断点同样作废
             return (f"❌ YOLO 推理失败率过高 ({_stat_yolo_failed}/{_stat_yolo_called})，"
                     f"疑似 CUDA 环境失效（如升级显卡驱动后未重启服务），请重启服务后重试", False)
 
@@ -619,8 +797,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
-            log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出")
-            return f"已取消 | 已处理 {processed} 帧", False
+            # 断点已在 finally 里写盘（含已检出进球），此处仅提示可续跑
+            log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出"
+                     f"（断点已保存，可续跑）")
+            _cp_min = (_fidx_last + 1) / max(fps, 1) / 60.0
+            return (f"已取消 | 已处理 {processed} 帧\n"
+                    f"💾 已保存断点（{_cp_min:.1f} 分钟处），"
+                    f"进球 {len(detector.goals)} 个已保留，重新点识别可从断点续跑", False)
 
         # 检测成功后写入片段缓存并持久化（key 统一走 clip_cache_key，排序+round）
         if state.last_goal_clips:
@@ -635,6 +818,43 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
         state.last_goals.clear()
         state.last_goals.extend(detector.goals)
+
+        # 同视频重跑：恢复上次的人工 √/× 标记（ts 对得上的才生效，检测参数变了自然失配）
+        try:
+            _prev = state.get_labels(video_path)
+            _kept_ts = {round(float(t), 3) for t in (_prev.get("kept") or [])}
+            _del_ts = {round(float(t), 3) for t in (_prev.get("deleted") or [])}
+            if _kept_ts or _del_ts:
+                _kept_idx = set()
+                for _i, _c in enumerate(state.last_goal_clips):
+                    _ts = round(float(_c["ts"]), 3)
+                    if _ts in _del_ts:
+                        _c["mark"] = "reject"
+                        _c["mark_source"] = "manual"
+                    elif _ts in _kept_ts:
+                        _c["mark"] = "keep"
+                        _c["mark_source"] = "manual"
+                        _kept_idx.add(_i)
+                if _kept_idx:
+                    state.kept_goal_indices = _kept_idx
+        except Exception:
+            pass
+
+        # 篮筐移位过：同步 UI 标定坐标到最终位置（预览叠加层显示新位置）
+        # 轨迹同时存入 state.last_hoop_track（批量快照验证阶段取用）
+        state.last_hoop_track = list(_hoop_track)
+        if _hoop_track:
+            try:
+                state.calib["hoop"] = tuple(int(v) for v in hoop)
+            except Exception:
+                pass
+
+        # L4 验证器后台打分 + 自动 √/× 预标记 + VLM 灰区仲裁（模型缺失时静默跳过）
+        if state.last_goal_clips:
+            from services.goal_verifier import start_verify_thread, needs_verify
+            if needs_verify(state.last_goal_clips):
+                start_verify_thread(video_path, state.last_goal_clips, hoop,
+                                    hoop_track=_hoop_track or None)
 
         d = detector.diag
         total_yolo = d['yolo_confirmed'] + d['yolo_rejected']
@@ -728,6 +948,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         _saved_record = state.add_history(video_path, hoop, detector.goals,
                           baseline_idx=baseline_idx,
+                          hoop_track=_hoop_track or None,
                           ball_conf=ball_conf,
                           min_gap_sec=min_gap_sec,
                           diff_threshold=_diff_for_history,
@@ -773,6 +994,15 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if _saved_record is None:
             # 磁盘/权限问题导致未落盘：显式告知（旧实现静默，用户下次启动才发现历史缺失）
             status += "\n⚠ 历史记录写入失败（磁盘/权限问题），本次结果未持久化"
+        if _hoop_track:
+            _moves_str = "、".join(f"{t['ts']:.0f}s" for t in _hoop_track[:4])
+            if len(_hoop_track) > 4:
+                _moves_str += f" 等{len(_hoop_track)}次"
+            status += (f"\n🏀 检测中篮筐移位（{_moves_str}），已自动跟踪新位置，"
+                       f"验证按各事件时间的篮筐坐标打分")
+        # 检测成功：断点使命完成，清理（finally 的兜底写盘在成功路径先于此 return
+        # 执行，故此处 clear 是最终状态；取消路径保留断点供续跑）
+        state.clear_checkpoint(video_path)
         return status, True
     except Exception as e:
         import traceback
@@ -781,6 +1011,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.last_goal_clips.clear()
         state.kept_goal_indices.clear()
         state.last_goals.clear()
+        # 断点保留：reader 的 finally 已在异常传播前写入一致的断点
+        # （下一未处理帧 + 已检出进球），崩溃/异常正是断点续跑要覆盖的场景。
+        # 只有成功完成和 YOLO 熔断（结果整体不可信）才清断点。
         return f"❌ 检测失败: {e}\n{traceback.format_exc()}", False
     finally:
         # 锁归任务本体：无论成功/失败/取消，线程真正结束时才释放。
@@ -812,28 +1045,67 @@ def clip_action(action, idx, video_path=None):
         return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
     elif action == "export":
         return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
-    elif action == "delete":
-        deleted = clips[idx]
-        ts = deleted["ts"]
-        del clips[idx]
-        # kept 集合整体前移：删除 idx 后，大于 idx 的索引 -1
-        new_kept = set()
-        for old_i in sorted(kept):
-            if old_i < idx:
-                new_kept.add(old_i)
-            elif old_i > idx:
-                new_kept.add(old_i - 1)
+    elif action in ("mark_keep", "mark_reject"):
+        # √/× 仅做标记，不删除片段（列表保持完整，导出集锦只取 √）
+        target = "keep" if action == "mark_keep" else "reject"
+        clip = clips[idx]
+        # toggle：再次点击同标记 = 取消
+        clip["mark"] = None if clip.get("mark") == target else target
+        clip["mark_source"] = "manual" if clip["mark"] else None
+        ts = clip["ts"]
+        # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）
         kept.clear()
-        kept.update(new_kept)
-        # 同步 goals：按保留的片段时间戳重建（快照模式下直接改快照的 goals 列表）
-        kept_ts = [clips[i]["ts"] for i in sorted(kept) if i < len(clips)]
-        if video_path is not None:
-            snap["goals"] = kept_ts
-        else:
-            state.last_goals.clear()
-            state.last_goals.extend(kept_ts)
-        return None, f"已删除第 {idx+1} 个片段（{ts:.1f}s）| 剩余 {len(clips)} 个"
+        kept.update(i for i, c in enumerate(clips) if c.get("mark") == "keep")
+        # 标签飞轮：√ → kept_ts_list（正样本），× → deleted_ts_list（负样本）
+        kept_ts = [c["ts"] for c in clips if c.get("mark") == "keep"]
+        reject_ts = [c["ts"] for c in clips if c.get("mark") == "reject"]
+        try:
+            state.update_history_labels(
+                video_path if video_path else state.video_state["path"],
+                kept_ts_list=kept_ts,
+                deleted_ts_list=reject_ts,
+            )
+        except Exception:
+            pass
+        sym = {"keep": "√ 确认", "reject": "× 误报"}.get(clip["mark"], "已取消标记")
+        n_keep = len(kept_ts)
+        n_reject = len(reject_ts)
+        msg = (f"第 {idx+1} 个片段（{ts:.1f}s）{sym} | "
+               f"√ {n_keep} · × {n_reject} · 待标 {len(clips) - n_keep - n_reject}")
+        # ===== 每场自适应校准：待校准片段全部人工确认后自动触发 =====
+        calib_need = [c for c in clips if c.get("calib") == "need"]
+        if calib_need and all(c.get("mark") in ("keep", "reject") for c in calib_need):
+            try:
+                from services import goal_verifier as _gv
+                n_ok = sum(1 for c in calib_need if c.get("mark") == "keep")
+                shift = _gv.calibrate_clips(clips, (n_ok, len(calib_need)))
+                if shift:
+                    nk, nr = _gv.apply_calibration(
+                        video_path if video_path else state.video_state["path"],
+                        clips, None)
+                    msg += f" | 🎯 场次校准 +{shift:.2f} → 自动√ {nk} · 自动× {nr}"
+                elif shift is None and _gv._get_calib_shift(clips) is None:
+                    msg += " | 🎯 场次校准：分布正常，无需平移"
+            except Exception:
+                import traceback
+                print(f"[calib] 校准异常: {traceback.format_exc()}")
+        return None, msg
     return None, ""
+
+
+def _export_goals(clips, all_goals):
+    """导出集锦的进球时间戳筛选：
+
+    有 √ 标记 → 只导出 √ 的；
+    无 √ 但有 × → 导出未标记的（× 排除在外）；
+    完全没标记 → 导出全部（老行为兼容）。
+    """
+    keep_ts = [float(c["ts"]) for c in clips if c.get("mark") == "keep"]
+    if keep_ts:
+        return sorted(keep_ts)
+    if any(c.get("mark") == "reject" for c in clips):
+        return sorted(float(c["ts"]) for c in clips if c.get("mark") != "reject")
+    return [float(t) for t in all_goals]
 
 
 def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
@@ -859,13 +1131,15 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
             snap = state.batch_results.get(video_path)
             if not snap:
                 return None, "❌ 该视频没有检测结果"
-            goals = list(snap["goals"])
+            clips = snap["clips"]
             src = video_path
         else:
             if state.video_state["path"] is None:
                 return None, "❌ 请先加载视频并检测进球"
-            goals = list(state.last_goals)
+            clips = state.last_goal_clips
             src = state.video_state["path"]
+        goals = _export_goals(clips, list(state.last_goals if video_path is None
+                                          else snap["goals"]))
         if not goals:
             return None, "❌ 没有检测到进球"
         # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
@@ -926,6 +1200,18 @@ def _on_load_history_impl(idx_choice, progress_callback):
     r = records[idx_choice]
     video_path = r.get("video", "")
     if not os.path.exists(video_path):
+        # 视频迁移目录回退：历史记录是旧路径（如 D:\Downloads\<日期>\<名>.mp4），
+        # 视频已集中移到 D:\Downloads\test\<名>.mp4 时按文件名找回，
+        # 并就地重写该记录的 video 字段（否则后续标签写入按新路径找不到旧记录）
+        cand = os.path.join(r"D:\Downloads\test", os.path.basename(video_path))
+        if os.path.exists(cand):
+            video_path = cand
+            try:
+                records[idx_choice]["video"] = cand
+                state.save_history(records)
+            except OSError:
+                pass
+    if not os.path.exists(video_path):
         return None, f"视频文件不存在: {video_path}", ""
     # 加载历史 = 回到单视频模式：清空批量状态，
     # 否则残留的 batch_files/batch_current_video 会让后续单视频检测的历史
@@ -982,16 +1268,65 @@ def _on_load_history_impl(idx_choice, progress_callback):
         if state.last_goal_clips:
             state.put_clip_cache(cache_key, state.last_goal_clips)
 
-    # 加载后全部进球默认保留（筛选结果不持久化，删除操作仅影响当前会话的集锦导出）
-    state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+    # 若历史里已有人工标签（kept=√ / deleted=×），恢复为标记而非删除
+    labels = state.get_labels(video_path)
+    deleted_set = set(labels["deleted"]) if labels.get("deleted") else set()
+    kept_set = set(labels["kept"]) if labels.get("kept") else set()
+    if deleted_set or kept_set:
+        kept_indices = []
+        for idx, c in enumerate(state.last_goal_clips):
+            ts = round(float(c["ts"]), 3)
+            if ts in deleted_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "manual"
+            elif ts in kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "manual"
+                kept_indices.append(idx)
+        state.kept_goal_indices = set(kept_indices)
+    else:
+        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+
+    # verify 自动标记回填（验证完成后回写历史；片段缓存被驱逐时的兜底）：
+    # 只补无标记也无分数的片段，人工标记优先。补到分数后 needs_verify
+    # 返回 False，免重跑整轮验证
+    _cm = r.get("clip_marks") or {}
+    for c in state.last_goal_clips:
+        if "mark" in c or "score" in c:
+            continue
+        m = _cm.get(str(round(float(c["ts"]), 3)))
+        if not m:
+            continue
+        for _k in ("score", "mark", "mark_source"):
+            if _k in m:
+                c[_k] = m[_k]
+    if any(c.get("mark") for c in state.last_goal_clips):
+        state.kept_goal_indices = {i for i, c in enumerate(state.last_goal_clips)
+                                     if c.get("mark") == "keep"}
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
-    status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
-              f"进球: {len(all_goals)} 个\n"
-              f"已生成 {len(state.last_goal_clips)} 个预览片段")
+    n_show = len(state.last_goal_clips)
+    n_keep = len(state.kept_goal_indices)
+    n_reject = sum(1 for c in state.last_goal_clips if c.get("mark") == "reject")
+    if labels.get("label_time") and (n_keep or n_reject):
+        status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
+                  f"进球: {n_show} 个（恢复上次标记 √ {n_keep} · × {n_reject}）\n"
+                  f"已生成 {n_show} 个预览片段")
+    else:
+        status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
+                  f"进球: {len(all_goals)} 个\n"
+                  f"已生成 {n_show} 个预览片段")
+
+    # L4 验证器后台打分 + VLM 灰区仲裁（缺分数或缺 VLM 结论的片段才需要）
+    if state.last_goal_clips:
+        from services.goal_verifier import start_verify_thread, needs_verify
+        if needs_verify(state.last_goal_clips):
+            start_verify_thread(video_path, state.last_goal_clips,
+                                state.calib["hoop"] or hoop,
+                                hoop_track=r.get("hoop_track"))
     return preview, info_str, status
 
 
@@ -1032,6 +1367,7 @@ def _on_batch_load_video_impl(selected, progress_callback):
     state.last_goal_clips.clear()
     state.last_goals.clear()
     state.kept_goal_indices.clear()
+    _calib_restored = False
     if video_path in state.batch_calibs:
         cal = state.batch_calibs[video_path]
         state.calib["hoop"] = cal["hoop"]
@@ -1050,6 +1386,8 @@ def _on_batch_load_video_impl(selected, progress_callback):
         state.calib["baseline_frame"] = None
         state.calib["baseline_idx"] = -1
         state.calib["clicks"] = []
+        # 无本轮批量标定 → 尝试从历史记录恢复（重跑检测免重新点标）
+        _calib_restored = restore_calib_from_history(video_path)
     try:
         info = get_video_info(video_path)
     except Exception as e:
@@ -1073,18 +1411,29 @@ def _on_batch_load_video_impl(selected, progress_callback):
     if snap and snap.get("clips"):
         state.last_goals.extend(snap["goals"])
         state.last_goal_clips.extend([dict(c) for c in snap["clips"]])
-        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+        # kept = √ 标记索引；快照里一个标记都没有（旧数据）时视作全保留
+        if any(c.get("mark") for c in state.last_goal_clips):
+            state.kept_goal_indices = {i for i, c in enumerate(state.last_goal_clips)
+                                       if c.get("mark") == "keep"}
+        else:
+            state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+        n_keep = len(state.kept_goal_indices)
+        n_reject = sum(1 for c in state.last_goal_clips if c.get("mark") == "reject")
+        mark_info = f"（√ {n_keep} · × {n_reject}）" if (n_keep or n_reject) else ""
         status = (f"已加载: {os.path.basename(video_path)}\n"
-                  f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
-                  f"进球: {len(snap['goals'])} 个（含人工删减）\n"
+                  f"{'已标定' if (video_path in state.batch_calibs or _calib_restored) else '未标定'}\n"
+                  f"进球: {len(snap['goals'])} 个{mark_info}\n"
                   f"复用 {len(state.last_goal_clips)} 个预览片段")
         return preview, info_str, status
 
     # —— 查找历史记录：批量识别完成后，下拉框选视频时自动加载检测结果 ——
+    # 视频迁移目录回退：历史记录可能是旧路径，按文件名兜底匹配
     records = state.load_history()
     matched = None
+    base_name = os.path.basename(video_path)
     for r in records:
-        if r.get("video") == video_path:
+        rv = r.get("video", "")
+        if rv == video_path or (rv and os.path.basename(rv) == base_name):
             matched = r
             break
 
@@ -1113,17 +1462,57 @@ def _on_batch_load_video_impl(selected, progress_callback):
             if state.last_goal_clips:
                 state.put_clip_cache(cache_key, state.last_goal_clips)
 
-        # 加载后全部进球默认保留（筛选结果不持久化）
-        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+        # 恢复历史人工标签为 √/× 标记（与单视频历史加载逻辑一致）
+        _labels = state.get_labels(video_path)
+        _deleted = set(_labels["deleted"]) if _labels.get("deleted") else set()
+        _kept = set(_labels["kept"]) if _labels.get("kept") else set()
+        if _deleted or _kept:
+            _keep_idx = []
+            for idx, c in enumerate(state.last_goal_clips):
+                ts = round(float(c["ts"]), 3)
+                if ts in _deleted:
+                    c["mark"] = "reject"
+                    c["mark_source"] = "manual"
+                elif ts in _kept:
+                    c["mark"] = "keep"
+                    c["mark_source"] = "manual"
+                    _keep_idx.append(idx)
+            state.kept_goal_indices = set(_keep_idx)
+        else:
+            state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+
+        # verify 自动标记回填（与单视频历史加载同逻辑）：补到分数后
+        # needs_verify 返回 False，免重跑整轮验证
+        _cm = matched.get("clip_marks") or {}
+        for c in state.last_goal_clips:
+            if "mark" in c or "score" in c:
+                continue
+            m = _cm.get(str(round(float(c["ts"]), 3)))
+            if not m:
+                continue
+            for _k in ("score", "mark", "mark_source"):
+                if _k in m:
+                    c[_k] = m[_k]
+        if any(c.get("mark") for c in state.last_goal_clips):
+            state.kept_goal_indices = {i for i, c in enumerate(state.last_goal_clips)
+                                         if c.get("mark") == "keep"}
 
         status = (f"已加载: {os.path.basename(video_path)}\n"
-                  f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
+                  f"{'已标定' if (video_path in state.batch_calibs or _calib_restored) else '未标定'}\n"
                   f"进球: {len(all_goals)} 个\n"
                   f"已加载 {len(state.last_goal_clips)} 个预览片段")
+
+        # L4 验证器后台打分 + VLM 灰区仲裁（缺分数或缺 VLM 结论的片段才需要）
+        if state.last_goal_clips:
+            from services.goal_verifier import start_verify_thread, needs_verify
+            if needs_verify(state.last_goal_clips):
+                start_verify_thread(video_path, state.last_goal_clips,
+                                    state.calib["hoop"],
+                                    hoop_track=matched.get("hoop_track"))
     else:
         # 未检测过：函数入口已统一清空 state，这里只写状态文本，无需再清
         status = (f"已加载: {os.path.basename(video_path)}\n"
-                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
+                  f"{'✅ 已标定（复用历史），可直接批量识别' if (video_path in state.batch_calibs or _calib_restored) else '未标定，请点击画面 2 个点标定'}")
     return preview, info_str, status
 
 
@@ -1198,6 +1587,12 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
     n_total = len(state.batch_files)
     cancelled = False
     _batch_t0 = time.time()
+    # 全局任务状态置 running（页面刷新后恢复进度 UI 的数据源）
+    state.batch_task_status.update({
+        "running": True, "current": None, "index": 0, "total": n_total,
+        "pct": 0.0, "message": "批量识别启动...",
+        "started_at": time.strftime("%H:%M:%S"), "cancel_requested": False,
+    })
     # ============ DEBUG: BATCH 开始 ============
     log.info("\n" + "#" * 68)
     log.info(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos")
@@ -1214,6 +1609,24 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
         name = os.path.basename(video_path)
         log.info(f"\n>>> [{i+1}/{n_total}] {name} <<<")
         state.batch_current_video = video_path  # 同步当前视频，供 run_detect 内写历史时查 batch_idx
+        if video_path not in state.batch_calibs:
+            # 无本轮标定 → 从历史记录恢复 hoop+基准帧号（重跑免重新点标）
+            try:
+                _hist = state.load_history()
+                _bn = os.path.basename(video_path)
+                for _r in _hist:
+                    _rv = _r.get("video", "")
+                    if (_rv == video_path or (_rv and os.path.basename(_rv) == _bn)) \
+                            and _r.get("hoop") and _r.get("baseline_idx", -1) is not None \
+                            and int(_r.get("baseline_idx", -1)) >= 0:
+                        state.batch_calibs[video_path] = {
+                            "hoop": tuple(int(v) for v in _r["hoop"]),
+                            "baseline_idx": int(_r["baseline_idx"]),
+                        }
+                        log.info(f"    ↳ 标定复用自历史记录")
+                        break
+            except Exception:
+                pass
         if video_path not in state.batch_calibs:
             lines.append(f"✗ {name}: 未标定，跳过")
             log.info(f"    ↳ SKIP (未标定)")
@@ -1240,6 +1653,16 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
         state.calib["clicks"] = []
 
         def _cb(pct, msg, vname=name, idx=i):
+            # 进度写进程级 state（页面刷新后新页面轮询恢复进度 UI 用）
+            try:
+                overall = (idx + max(0, min(100, pct)) / 100.0) / n_total * 100.0
+                state.batch_task_status.update({
+                    "running": True, "current": vname,
+                    "index": idx + 1, "total": n_total,
+                    "pct": round(overall, 1), "message": msg,
+                })
+            except Exception:
+                pass
             if progress_callback:
                 try:
                     # 归一化：每个视频占 1/n_total 份，pct 为当前视频的 0-100
@@ -1259,7 +1682,8 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
                                      diff_threshold, min_circularity, min_in_hoop_frames,
                                      min_blob_area, search_margin, progress_callback=_cb,
                                      auto_threshold=auto_threshold, yolo_step=yolo_step,
-                                     skip_yolo_no_motion=skip_yolo_no_motion)
+                                     skip_yolo_no_motion=skip_yolo_no_motion,
+                                     resume=True)
         except Exception as e:
             _status, ok = f"异常: {e}", False
         if state.cancel_event.is_set():
@@ -1275,12 +1699,36 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
             log.info(f"    ↳ OK: {len(state.last_goals)} goals")
             # ===== 流水线快照：深拷贝当前视频结果，前台可立即查看/确认 =====
             # 检测线程只写这个 key，之后永不触碰；前台删卡片只改快照，互不干扰
+            # 若此视频已有历史人工标签（同视频重跑），恢复为 √/× 标记（× 不删除只标记）
+            labels = state.get_labels(video_path)
+            deleted_set = {round(float(t), 3) for t in (labels.get("deleted") or [])}
+            kept_set = {round(float(t), 3) for t in (labels.get("kept") or [])}
+            filtered_clips = [dict(c) for c in state.last_goal_clips]
+            kept = set()
+            for _i, _c in enumerate(filtered_clips):
+                _ts = round(float(_c["ts"]), 3)
+                if _ts in deleted_set:
+                    _c["mark"] = "reject"
+                    _c["mark_source"] = "manual"
+                elif _ts in kept_set:
+                    _c["mark"] = "keep"
+                    _c["mark_source"] = "manual"
+                    kept.add(_i)
+            if not kept:
+                kept = set(state.kept_goal_indices)
+            filtered_goals = [c["ts"] for c in filtered_clips]
             state.batch_results[video_path] = {
-                "goals": list(state.last_goals),
-                "clips": [dict(c) for c in state.last_goal_clips],
-                "kept": set(state.kept_goal_indices),
+                "goals": filtered_goals,
+                "clips": filtered_clips,
+                "kept": kept,
                 "finished_at": time.strftime("%H:%M:%S"),
             }
+            # L4 验证器后台打分 + VLM 灰区仲裁（对快照 clips 操作，模型缺失时静默跳过）
+            if filtered_clips:
+                from services.goal_verifier import start_verify_thread, needs_verify
+                if needs_verify(filtered_clips):
+                    start_verify_thread(video_path, filtered_clips, cal["hoop"],
+                                        hoop_track=state.last_hoop_track or None)
             if per_video_callback:
                 try:
                     per_video_callback(video_path, len(state.last_goals))
@@ -1294,6 +1742,13 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
     # 批量结束（含取消路径）重置当前视频标记：防止之后切单视频检测时
     # 残留的 batch_current_video 让历史记录误带 batch_idx/batch_total
     state.batch_current_video = None
+    # 全局任务状态置结束（页面轮询据此恢复/关闭进度 UI）
+    state.batch_task_status.update({
+        "running": False, "current": None,
+        "pct": 100.0 if not cancelled else state.batch_task_status.get("pct", 0.0),
+        "message": "已完成" if not cancelled else "已取消",
+        "cancel_requested": False,
+    })
     _batch_elapsed = time.time() - _batch_t0
     _end_time = time.strftime('%H:%M:%S')
     log.info("")

@@ -1,0 +1,38 @@
+{
+  "calibrated_at": "2026-08-31 13:00:13",
+  "composition": "mean4",
+  "weights": {
+    "lgbm": 1.0,
+    "b": 1.0,
+    "flow": 1.0,
+    "vm": 1.0
+  },
+  "keep_thr": 0.511,
+  "reject_thr": 0.07,
+  "oof_auc": 0.9501,
+  "n_events": 2725,
+  "keep_wp": {
+    "threshold": 0.511,
+    "precision": 0.9518,
+    "recall": 0.798
+  },
+  "arms_oof_auc": {
+    "A": 0.8263,
+    "B(mean pool+bigru)": 0.8121,
+    "Flow_T": 0.9161,
+    "VM": 0.8841,
+    "AB(mean)": 0.8925,
+    "mean4": 0.9501,
+    "ab_f_vm": 0.9468
+  },
+  "fold_aucs_flow": [
+    0.9629,
+    0.9649,
+    0.9339,
+    0.9134,
+    0.8672
+  ],
+  "flow_final_epochs": 22,
+  "reject_kill_cap": 0.02,
+  "elapsed_sec": 364.5
+}

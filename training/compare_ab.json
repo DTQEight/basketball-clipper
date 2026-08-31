@@ -1,0 +1,149 @@
+{
+  "trained_at": "2026-08-29 02:02:53",
+  "n_events": 2232,
+  "n_pos": 906,
+  "n_games": 17,
+  "grouping": "by_game_day",
+  "b_aug": true,
+  "fold_aucs_lgbm": [
+    0.8204,
+    0.8297,
+    0.8284,
+    0.8193,
+    0.8296
+  ],
+  "fold_aucs_b_pool": [
+    0.8336,
+    0.7791,
+    0.792,
+    0.8701,
+    0.8561
+  ],
+  "fold_aucs_b_bigru": [
+    0.8757,
+    0.7422,
+    0.7382,
+    0.876,
+    0.8443
+  ],
+  "A_lgbm": {
+    "oof_auc": 0.8255,
+    "working_points": {
+      "0.9": {
+        "threshold": 0.9716,
+        "precision": 0.9231,
+        "recall": 0.0265
+      },
+      "0.95": {
+        "threshold": 0.9776,
+        "precision": 0.95,
+        "recall": 0.021
+      },
+      "0.98": {
+        "threshold": 0.9797,
+        "precision": 1.0,
+        "recall": 0.0155
+      }
+    },
+    "fixed_050": {
+      "precision": 0.6885,
+      "recall": 0.6976
+    }
+  },
+  "B_pool_aug": {
+    "oof_auc": 0.8208,
+    "working_points": {
+      "0.9": {
+        "threshold": 0.7457,
+        "precision": 0.9,
+        "recall": 0.3477
+      },
+      "0.95": {
+        "threshold": 0.9907,
+        "precision": 0.95,
+        "recall": 0.1258
+      },
+      "0.98": {
+        "threshold": 0.9984,
+        "precision": 0.9831,
+        "recall": 0.064
+      }
+    },
+    "fixed_050": {
+      "precision": 0.8577,
+      "recall": 0.4658
+    }
+  },
+  "B_bigru_aug": {
+    "oof_auc": 0.795,
+    "working_points": {
+      "0.9": {
+        "threshold": 0.9498,
+        "precision": 0.9006,
+        "recall": 0.3102
+      },
+      "0.95": {
+        "threshold": 0.9768,
+        "precision": 0.9522,
+        "recall": 0.2638
+      },
+      "0.98": {
+        "threshold": 0.9871,
+        "precision": 0.98,
+        "recall": 0.2163
+      }
+    },
+    "fixed_050": {
+      "precision": 0.7328,
+      "recall": 0.6115
+    }
+  },
+  "B_ensemble": {
+    "oof_auc": 0.8336,
+    "working_points": {
+      "0.9": {
+        "threshold": 0.7883,
+        "precision": 0.9,
+        "recall": 0.4172
+      },
+      "0.95": {
+        "threshold": 0.9024,
+        "precision": 0.9524,
+        "recall": 0.1987
+      },
+      "0.98": {
+        "threshold": 0.9406,
+        "precision": 0.9811,
+        "recall": 0.1148
+      }
+    },
+    "fixed_050": {
+      "precision": 0.6717,
+      "recall": 0.7792
+    }
+  },
+  "AB_ensemble": {
+    "oof_auc": 0.8959,
+    "working_points": {
+      "0.9": {
+        "threshold": 0.7273,
+        "precision": 0.9008,
+        "recall": 0.4812
+      },
+      "0.95": {
+        "threshold": 0.8804,
+        "precision": 0.9535,
+        "recall": 0.1358
+      },
+      "0.98": {
+        "threshold": 0.9179,
+        "precision": 0.9846,
+        "recall": 0.0706
+      }
+    },
+    "fixed_050": {
+      "precision": 0.7048,
+      "recall": 0.8642
+    }
+  }
+}

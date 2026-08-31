@@ -36,12 +36,15 @@ os.environ["TMP"] = _tmp_root
 HISTORY_FILE = os.path.join(CACHE_ROOT, "detection_history.json")
 # 预览片段缓存索引（持久化，重启后可复用上一次生成的片段）
 CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
+# 检测断点（断点续识别）：每个视频一份，检测成功/彻底失败后清理
+CHECKPOINT_FILE = os.path.join(CACHE_ROOT, "detect_checkpoint.json")
 
 DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 
-# 历史记录上限（防止 detection_history.json 无限增长）
-MAX_HISTORY_RECORDS = 50
+# 历史记录不限量保留：hoop 标定和人工标签都存在记录里，
+# 截断会永久丢失旧视频的标定数据（曾导致 755 个训练事件 hoop 无法恢复）
+MAX_HISTORY_RECORDS = None
 
 # 预览片段缓存最大条目数（超出按插入顺序驱逐最旧）
 CLIP_CACHE_MAX_ENTRIES = 20
@@ -131,6 +134,9 @@ calib = {
 last_goals = []
 last_goal_clips = []
 kept_goal_indices = set()
+# 最近一次 run_detect 的篮筐移位轨迹 [{"frame","ts","hoop"}]
+# （检测中支架被撞时由 hoop_tracker 写入，批量快照验证按事件时间取坐标用）
+last_hoop_track = []
 
 # 检测取消标志（UI 点击「取消」时 set，检测循环轮询后中断）
 # 用 threading.Event 替代裸 bool：跨线程标志的 set/clear/is_set 天然原子且语义明确
@@ -152,6 +158,23 @@ batch_current_video = None
 # 检测线程只写入新 key；前台人工确认（删卡片/导出集锦）只读写快照。
 # 与全局 last_goals/last_goal_clips 完全隔离，支持流水线：后台跑检测 + 前台确认已完成视频
 batch_results = {}
+
+# ============ 批量任务全局进度（跨页面连接/刷新可见）============
+# NiceGUI 页面函数每连接执行一次：浏览器刷新销毁旧页面的进度条，
+# 但 io_bound 检测线程还在跑。进度必须写在进程级 state，
+# 新页面加载时读它恢复「识别中」UI（进度条/取消按钮/已完成列表）。
+# 线程安全：检测线程是唯一写者（每视频一次 + 每帧回调），UI 只读；
+# dict 整体替换赋值在 CPython 下原子，读侧拿到新旧快照之一，均一致。
+batch_task_status = {
+    "running": False,      # 批量识别是否在跑
+    "current": None,       # 当前正在检测的视频名（basename）
+    "index": 0,            # 当前是第几个视频（1-based）
+    "total": 0,            # 本批视频总数
+    "pct": 0.0,            # 整批百分比 0~100（含单视频内部进度）
+    "message": "",         # 最近一条进度消息
+    "started_at": "",      # 开始时间
+    "cancel_requested": False,  # UI 请求取消（页面刷新后取消按钮仍可用）
+}
 
 # ============ 全局任务互斥（进程级，跨页面连接/刷新共享）============
 # 旧实现的 _busy 锁在 NiceGUI 页面函数局部：每个浏览器连接/刷新独立执行页面函数，
@@ -350,10 +373,17 @@ _HISTORY_FIELD_CASTS = {
 
 
 def add_history(video_path, hoop, goals, baseline_idx=-1,
-                diff_threshold=None, **fields):
+                diff_threshold=None,
+                kept_ts_list=None, deleted_ts_list=None, label_time=None,
+                hoop_track=None,
+                **fields):
     """添加一条历史记录（同视频会覆盖旧记录）。
 
-    可选字段见 _HISTORY_FIELD_CASTS；未知字段抛 TypeError（防调用方拼错字段名静默丢数据）。
+    平铺可选字段见 _HISTORY_FIELD_CASTS；未知字段抛 TypeError（防调用方拼错字段名静默丢数据）。
+    kept_ts_list / deleted_ts_list / label_time 是特殊嵌套字段（组成 "labels" 块），
+    不走单值 cast 表。
+    hoop_track 是特殊嵌套字段：检测中途篮筐移位的轨迹
+    [{"frame", "ts", "hoop"}]，验证阶段按事件时间取各自的篮筐坐标。
     返回: 新记录 dict；读取/写入失败（IO 错误）时返回 None 且**不覆盖**磁盘旧数据。
     """
     unknown = set(fields) - set(_HISTORY_FIELD_CASTS)
@@ -365,7 +395,16 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         logging.getLogger("state").warning(
             f"[WARN] 历史记录读取失败，本次结果未写入（避免空列表覆盖旧数据）: {e}")
         return None
-    records = [r for r in records if r.get("video") != video_path]
+    # 同视频重跑：先取出旧记录的人工标签再覆盖（不显式传标签时继承，防止重跑丢标注）
+    old_labels = None
+    kept_records = []
+    for r in records:
+        if r.get("video") == video_path:
+            if old_labels is None:
+                old_labels = r.get("labels")
+        else:
+            kept_records.append(r)
+    records = kept_records
     rec = {
         "video": video_path,
         "video_name": os.path.basename(video_path),
@@ -375,8 +414,28 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         "total": len(goals),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    # 人工确认标签（L4 训练飞轮）
+    if kept_ts_list is not None or deleted_ts_list is not None:
+        labels: dict = {}
+        if kept_ts_list is not None:
+            labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
+        if deleted_ts_list is not None:
+            labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+        labels["label_time"] = label_time or rec["time"]
+        rec["labels"] = labels
+    elif old_labels:
+        # 继承旧标签：时间戳与新 goals 对得上的在读取端继续生效，对不上的自动忽略
+        rec["labels"] = old_labels
     if diff_threshold is not None:
         rec["diff_threshold"] = diff_threshold  # 可能为 int 或 str 'auto'
+    # 篮筐移位轨迹（检测中途支架被撞等）：验证阶段按事件时间取各自坐标
+    if hoop_track:
+        rec["hoop_track"] = [
+            {"frame": int(t.get("frame", 0)),
+             "ts": round(float(t.get("ts", 0.0)), 2),
+             "hoop": [int(v) for v in t.get("hoop", [])]}
+            for t in hoop_track
+        ]
     for name, value in fields.items():
         if value is None:
             continue
@@ -386,10 +445,99 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
             value = round(value, ndigits)
         rec[name] = value
     records.insert(0, rec)
-    records = records[:MAX_HISTORY_RECORDS]
     if not save_history(records):
         return None
     return rec
+
+
+def _find_history_record(records, video_path):
+    """按 video 字段找记录：精确匹配优先，失败后按文件名兜底
+    （视频迁移目录后历史记录里还是旧路径，basename 一致即视为同一条）。
+    返回记录下标或 None。
+    """
+    for i, r in enumerate(records):
+        if r.get("video") == video_path:
+            return i
+    base = os.path.basename(video_path)
+    for i, r in enumerate(records):
+        rv = r.get("video", "")
+        if rv and os.path.basename(rv) == base:
+            return i
+    return None
+
+
+def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
+    """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
+
+    找不到对应记录时返回 False；写入磁盘成功返回 True。
+    """
+    try:
+        records = load_history()
+    except OSError:
+        return False
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return False
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    target = records[hit_idx]
+    labels = dict(target.get("labels") or {})
+    if kept_ts_list is not None:
+        labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
+    if deleted_ts_list is not None:
+        labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+    labels["label_time"] = now
+    target["labels"] = labels
+    target["time"] = now
+    # 上浮到顶部（最近更新优先），保持其他条目顺序
+    final = [target] + records[:hit_idx] + records[hit_idx + 1:]
+    return save_history(final)
+
+
+def get_labels(video_path):
+    """读取某视频的已保存标签。
+
+    返回 {"kept": list|None, "deleted": list|None, "label_time": str|None}。
+    找不到记录 / 无标签时返回 None 字段。
+    """
+    try:
+        records = load_history()
+    except OSError:
+        return {"kept": None, "deleted": None, "label_time": None}
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return {"kept": None, "deleted": None, "label_time": None}
+    lab = records[hit_idx].get("labels") or {}
+    return {"kept": list(lab["kept"]) if "kept" in lab else None,
+            "deleted": list(lab["deleted"]) if "deleted" in lab else None,
+            "label_time": lab.get("label_time")}
+
+
+def update_history_marks(video_path, clips):
+    """verify 完成后把自动分数/标记回写历史记录（clip_marks: ts字符串 → {score,mark,mark_source}）。
+
+    片段缓存被驱逐/重启清空时的兜底：历史回读按 ts 补标记，免重跑整轮验证。
+    重跑检测会重建记录（clip_marks 随之失效，新检测本来就要重新验证）。
+    找不到记录/无可写标记返回 False。
+    """
+    marks = {}
+    for c in clips:
+        m = {k: c[k] for k in ("score", "mark", "mark_source") if k in c}
+        if m:
+            marks[str(round(float(c["ts"]), 3))] = m
+    if not marks:
+        return False
+    try:
+        records = load_history()
+    except OSError:
+        return False
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return False
+    target = records[hit_idx]
+    merged = dict(target.get("clip_marks") or {})
+    merged.update(marks)
+    target["clip_marks"] = merged
+    return save_history(records)
 
 
 # ============ 片段缓存 ============
@@ -428,8 +576,14 @@ def load_clip_cache():
                 data = json.load(f)
             for item in data:
                 key = (item["video"], tuple(float(g) for g in item["goals"]))
-                clips = [{"ts": float(c["ts"]), "path": c["path"], "idx": int(c["idx"])}
-                         for c in item.get("clips", [])]
+                clips = []
+                for c in item.get("clips", []):
+                    d = {"ts": float(c["ts"]), "path": c["path"], "idx": int(c["idx"])}
+                    # verify 回写的分数/标记（旧格式无这些键 → 按未验证处理）
+                    for k in ("score", "mark", "mark_source"):
+                        if k in c:
+                            d[k] = c[k]
+                    clips.append(d)
                 if clips and all(os.path.exists(c["path"]) for c in clips):
                     cache[key] = clips
     except json.JSONDecodeError as e:
@@ -445,16 +599,127 @@ def load_clip_cache():
 def save_clip_cache():
     """把内存片段缓存索引写入磁盘（原子写）。"""
     try:
-        data = [{"video": v, "goals": list(g),
-                 "clips": [{"ts": c["ts"], "path": c["path"], "idx": c["idx"]} for c in clips]}
-                for (v, g), clips in clip_cache.items()]
+        data = []
+        for (v, g), clips in clip_cache.items():
+            out_clips = []
+            for c in clips:
+                d = {"ts": c["ts"], "path": c["path"], "idx": c["idx"]}
+                for k in ("score", "mark", "mark_source"):
+                    if k in c:
+                        d[k] = c[k]
+                out_clips.append(d)
+            data.append({"video": v, "goals": list(g), "clips": out_clips})
         os.makedirs(os.path.dirname(CLIP_CACHE_FILE), exist_ok=True)
         _atomic_write_json(CLIP_CACHE_FILE, data)
     except Exception as e:
         logging.getLogger("state").warning(f"[WARN] 保存片段缓存失败: {e}")
 
 
+def update_clip_cache_marks(video_path, clips):
+    """verify 完成后把分数/标记回写该视频的缓存条目（按 ts 匹配，就地改并落盘）。
+
+    缓存条目在检测成功时写入（此时还没打分）；不回写的话，历史/缓存回读
+    拿到的是无分数副本 → needs_verify 触发整轮重验（~5 分钟/视频）。
+    返回是否有条目被更新。
+    """
+    by_ts = {round(float(c["ts"]), 3): c for c in clips}
+    hit = False
+    for (v, _g), cached in clip_cache.items():
+        if v != video_path:
+            continue
+        for cc in cached:
+            src = by_ts.get(round(float(cc["ts"]), 3))
+            if src is None:
+                continue
+            for k in ("score", "mark", "mark_source"):
+                if k in src:
+                    cc[k] = src[k]
+            hit = True
+    if hit:
+        save_clip_cache()
+    return hit
+
+
 def init_clip_cache():
     """启动时调用，从磁盘恢复片段缓存到内存。"""
     clip_cache.clear()
     clip_cache.update(load_clip_cache())
+
+
+# ============ 检测断点（断点续识别） ============
+# 结构: {video_path: {"frame": 已处理到的下一帧号, "goals": [已检出进球 ts],
+#                     "params": 本次检测参数快照, "time": 写盘时间}}
+# 同视频同参数才可续跑；检测成功/换参数重跑时清除。
+
+def save_checkpoint(video_path, frame, goals, params):
+    """写检测断点（原子写，失败仅记日志不影响检测主流程）。"""
+    try:
+        data = {}
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        data[video_path] = {
+            "frame": int(frame),
+            "goals": [round(float(t), 3) for t in goals],
+            "params": dict(params),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
+        _atomic_write_json(CHECKPOINT_FILE, data, indent=2)
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 断点写入失败（不影响检测）: {e}")
+
+
+def load_checkpoint(video_path, params):
+    """读取断点。参数一致（含标定/帧区间）才返回断点 dict，否则 None。"""
+    try:
+        if not os.path.exists(CHECKPOINT_FILE):
+            return None
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cp = data.get(video_path)
+        if not isinstance(cp, dict):
+            return None
+        saved = cp.get("params") or {}
+        # 逐项严格比对：参数变了旧断点不可用（阈值/帧区间/标定不同 → 结果不一致）
+        for k, v in (params or {}).items():
+            if saved.get(k) != v:
+                return None
+        if int(cp.get("frame", 0)) <= 0:
+            return None
+        return cp
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return None
+
+
+def clear_checkpoint(video_path=None):
+    """清除断点。video_path=None 清全部；检测成功或用户放弃续跑时调用。"""
+    try:
+        if not os.path.exists(CHECKPOINT_FILE):
+            return
+        if video_path is None:
+            os.remove(CHECKPOINT_FILE)
+            return
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if video_path in data:
+            del data[video_path]
+            _atomic_write_json(CHECKPOINT_FILE, data, indent=2)
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 断点清理失败: {e}")
+
+
+def has_checkpoint(video_path):
+    """是否存在该视频的断点（用于 UI 提示，不校验参数）。"""
+    try:
+        if not os.path.exists(CHECKPOINT_FILE):
+            return False
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            return video_path in (json.load(f) or {})
+    except (json.JSONDecodeError, OSError):
+        return False

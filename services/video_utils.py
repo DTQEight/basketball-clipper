@@ -35,6 +35,8 @@ def scan_video_files(folder: str) -> list:
         return []
     files = []
     for name in os.listdir(folder):
+        if name.startswith("._"):
+            continue  # macOS 资源文件（Mac 拷贝的伴生文件），不是真视频
         ext = os.path.splitext(name)[1].lower()
         if ext in state.VIDEO_EXTS:
             files.append(os.path.join(folder, name))
