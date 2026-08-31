@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -36,28 +37,53 @@ class TestHoopTracker:
         assert tr.update(_make_frame(tex, 100, 60)) is None
         assert tr.n_moves == 0
 
-    def test_move_detected_and_followed(self):
+    def test_move_confirmed_after_two_checks(self):
+        """真实移位需连续 2 次一致测量：第 1 次立候选、第 2 次提交。"""
         tex = _texture()
         tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
-        # 纹理整体平移 (40, 25)：画面里篮筐移位
+        # 纹理整体平移 (40, 25)：第一次观测只立候选，不提交
         mv = tr.update(_make_frame(tex, 140, 85))
-        assert mv is not None, "移位未被检出"
+        assert mv is None and tr.pending, "第一次观测应只立候选"
+        # 第二次一致观测 → 确认提交
+        mv = tr.update(_make_frame(tex, 140, 85))
+        assert mv is not None, "移位未被确认"
+        assert mv["confirm"] >= 2
         assert mv["shift_px"] >= 40
         nx1, ny1, nx2, ny2 = mv["hoop"]
         assert abs(nx1 - 140) <= 2 and abs(ny1 - 85) <= 2, mv["hoop"]
         assert abs(nx2 - 200) <= 2 and abs(ny2 - 145) <= 2, mv["hoop"]
         assert tr.n_moves == 1
+        assert not tr.pending
         # 跟踪器已跟上：新位置再查 → 无移位
         assert tr.update(_make_frame(tex, 140, 85)) is None
 
     def test_two_consecutive_moves(self):
         tex = _texture()
         tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        # 第一次移位：两次一致观测
+        assert tr.update(_make_frame(tex, 150, 100)) is None
         mv1 = tr.update(_make_frame(tex, 150, 100))
+        assert mv1 is not None
+        # 第二次移位：两次一致观测
+        assert tr.update(_make_frame(tex, 90, 130)) is None
         mv2 = tr.update(_make_frame(tex, 90, 130))
-        assert mv1 is not None and mv2 is not None
+        assert mv2 is not None
         assert abs(mv2["hoop"][0] - 90) <= 2 and abs(mv2["hoop"][1] - 130) <= 2
         assert tr.n_moves == 2
+
+    def test_oscillation_never_commits(self):
+        """匹配峰在两个远距离目标间往复 → 永不提交、坐标不被带走。
+
+        复刻 app.log 旧版失效：每 5s 一次"移位"、坐标乱跳 30 秒。
+        """
+        tex = _texture()
+        tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        # 两个远离原位、彼此也远离的目标交替出现
+        for i in range(8):
+            pos = (200, 60) if i % 2 == 0 else (300, 160)
+            assert tr.update(_make_frame(tex, *pos)) is None
+        assert tr.n_moves == 0
+        assert tr.box[:2] == (100.0, 60.0)   # 坐标保持原位
 
     def test_lost_on_blank_frame(self):
         tex = _texture()
@@ -68,12 +94,63 @@ class TestHoopTracker:
         assert tr.lost_streak >= 1
         assert tr.box == (100.0, 60.0, 160.0, 120.0)
 
+    def test_lost_then_recovery_reanchors(self):
+        """连续丢失后纹理在远处重现 → 恢复搜索 + 两次确认重锚定。"""
+        tex = _texture()
+        tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        blank = np.full((_FH, _FW, 3), 60, dtype=np.uint8)
+        # 连续丢失 3 次（= _RECOVER_AFTER）
+        for _ in range(3):
+            assert tr.update(blank) is None
+        assert tr.lost_streak >= 3
+        # 纹理在远处重现：距原位 ~314px > 全图距离上限（~276）且超出
+        # 局部窗口 → 只能走恢复搜索；第二次确认时候选验证期仍可恢复命中。
+        # （位置须保证 120x120 模板裁剪区完整在画面内，贴边会拉低匹配分）
+        far = (390, 180)
+        assert tr.update(_make_frame(tex, *far)) is None
+        assert tr.pending                    # 恢复命中立为候选
+        assert tr.lost_streak == 0
+        mv = tr.update(_make_frame(tex, *far))
+        assert mv is not None
+        assert abs(mv["hoop"][0] - far[0]) <= 2 and abs(mv["hoop"][1] - far[1]) <= 2
+        assert tr.stats["recover"] >= 1
+
+    def test_region_clean_flags_occlusion(self):
+        """模板区域被遮挡物覆盖 → 判脏（禁止刷新，防模板污染）。"""
+        tex = _texture()
+        tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        assert tr._region_clean(cv2.cvtColor(_make_frame(tex, 100, 60),
+                                             cv2.COLOR_BGR2GRAY))
+        # 用深色块盖住模板区域（篮筐框外扩 pad 的范围）
+        occ = _make_frame(tex, 100, 60)
+        cv2.rectangle(occ, (50, 10), (210, 170), (10, 10, 10), -1)
+        assert not tr._region_clean(cv2.cvtColor(occ, cv2.COLOR_BGR2GRAY))
+
+    def test_template_heals_after_move(self):
+        """移位提交后，稳定干净的后续帧允许重新刷新模板（自愈）。"""
+        tex = _texture()
+        tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        tr.update(_make_frame(tex, 140, 85))
+        assert tr.update(_make_frame(tex, 140, 85)) is not None
+        r0 = tr.stats["refreshes"]
+        for _ in range(4):
+            assert tr.update(_make_frame(tex, 140, 85)) is None
+        assert tr.stats["refreshes"] > r0
+
     def test_small_jitter_not_a_move(self):
         """亚阈值抖动（< move_thr）不算移位，模板继续用旧位置。"""
         tex = _texture()
         tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
         assert tr.update(_make_frame(tex, 104, 62)) is None
         assert tr.n_moves == 0
+
+    def test_summary_reports_counters(self):
+        tex = _texture()
+        tr = HoopTracker(_make_frame(tex, 100, 60), _HOOP)
+        tr.update(_make_frame(tex, 100, 60))
+        s = tr.summary()
+        for key in ("checks=", "committed=", "lost=", "max_lost_streak="):
+            assert key in s
 
 
 class TestGoalDetectorSetHoop:

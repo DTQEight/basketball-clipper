@@ -528,6 +528,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             _hoop_tracker = None
         _hoop_track = []           # [{"frame", "ts", "hoop"}]
         _hoop_check_every = max(75, int(5.0 * fps))
+        # 有待确认移位候选时加密校验（~1s 一次），1-2 秒内给出确认结论
+        _hoop_check_fast = max(15, int(1.0 * fps))
         _hoop_lost_reported = False
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
         # 回退 COCO 权重（yolov8n.pt）时类 0 是 person，硬编码会误把球员当球确认
@@ -673,36 +675,39 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 detector.feed(ball_pos, fidx, fps, frame=frame,
                               ball_frame=ball_frame, frame_roi=_pending_roi)
                 processed += 1
-                # ===== 篮筐位置校验（每 ~5s）=====
-                if _hoop_tracker is not None and processed % _hoop_check_every == 0:
-                    try:
-                        _mv = _hoop_tracker.update(frame)
-                        if _mv is not None:
-                            hoop = tuple(_mv["hoop"])
-                            detector.set_hoop(_mv["hoop"], frame=frame, frame_idx=fidx)
-                            _hoop_track.append({
-                                "frame": int(fidx),
-                                "ts": round(fidx / max(fps, 1.0), 2),
-                                "hoop": list(_mv["hoop"]),
-                            })
-                            log.info(f"[HOOP MOVE] 帧 {fidx} ({fidx/max(fps,1):.1f}s) "
-                                     f"篮筐移位 {_mv['shift_px']:.0f}px "
-                                     f"(匹配 {_mv['score']:.2f}) → 已自动跟踪到 "
-                                     f"{_mv['hoop']}，检测继续")
-                            _report(15 + 60 * processed / n_frames,
-                                    f'🏀 篮筐移位 {fidx/max(fps,1):.0f}s 处 '
-                                    f'(位移 {_mv["shift_px"]:.0f}px)，已自动跟踪，检测继续')
-                        elif (_hoop_tracker.lost_streak >= 6
-                              and not _hoop_lost_reported):
-                            # 连续 6 次（~30s）跟踪丢失：提示但不动坐标
-                            _hoop_lost_reported = True
-                            log.warning("[HOOP TRACK] 连续跟踪丢失（遮挡/变焦？），"
-                                        "沿用原标定继续检测")
-                    except Exception:
-                        import traceback
-                        log.warning(f"[HOOP TRACK] 校验异常（跳过本次）: "
-                                    f"{traceback.format_exc(limit=2)}")
-                        _hoop_tracker = None
+                # ===== 篮筐位置校验（正常每 ~5s；移位待确认期间加密到 ~1s）=====
+                if _hoop_tracker is not None:
+                    _hoop_every = (_hoop_check_fast if _hoop_tracker.pending
+                                   else _hoop_check_every)
+                    if processed % _hoop_every == 0:
+                        try:
+                            _mv = _hoop_tracker.update(frame)
+                            if _mv is not None:
+                                hoop = tuple(_mv["hoop"])
+                                detector.set_hoop(_mv["hoop"], frame=frame, frame_idx=fidx)
+                                _hoop_track.append({
+                                    "frame": int(fidx),
+                                    "ts": round(fidx / max(fps, 1.0), 2),
+                                    "hoop": list(_mv["hoop"]),
+                                })
+                                log.info(f"[HOOP MOVE] 帧 {fidx} ({fidx/max(fps,1):.1f}s) "
+                                         f"篮筐移位 {_mv['shift_px']:.0f}px "
+                                         f"(匹配 {_mv['score']:.2f}，连续 {_mv['confirm']} 次确认) "
+                                         f"→ 已自动跟踪到 {_mv['hoop']}，检测继续")
+                                _report(15 + 60 * processed / n_frames,
+                                        f'🏀 篮筐移位 {fidx/max(fps,1):.0f}s 处 '
+                                        f'(位移 {_mv["shift_px"]:.0f}px)，已自动跟踪，检测继续')
+                            elif (_hoop_tracker.lost_streak >= 6
+                                  and not _hoop_lost_reported):
+                                # 连续 6 次（~30s）跟踪丢失：提示但不动坐标
+                                _hoop_lost_reported = True
+                                log.warning("[HOOP TRACK] 连续跟踪丢失（遮挡/变焦？），"
+                                            "沿用原标定继续检测")
+                        except Exception:
+                            import traceback
+                            log.warning(f"[HOOP TRACK] 校验异常（跳过本次）: "
+                                        f"{traceback.format_exc(limit=2)}")
+                            _hoop_tracker = None
                 # 每 10 帧更新一次进度
                 if processed % 10 == 0:
                     pct = 15 + 60 * processed / n_frames
@@ -876,6 +881,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if goals:
             _timestamps_str = ", ".join(f"{g:.1f}s" for g in goals[:8]) + ("..." if len(goals) > 8 else "")
             log.info(f"                {_timestamps_str}")
+        if _hoop_tracker is not None:
+            log.info(f"  HoopTrack   : {_hoop_tracker.summary()}")
         if skip_yolo_no_motion:
             _yolo_total_scheduled = _stat_yolo_called + _stat_yolo_skipped
             _skip_rate = _stat_yolo_skipped / max(_yolo_total_scheduled, 1) * 100
