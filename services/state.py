@@ -299,6 +299,50 @@ def save_history(records) -> bool:
         return False
 
 
+def _find_history_record(records, video_path):
+    """按 video 字段找记录：精确匹配优先，失败后按文件名兜底
+    （视频迁移目录后历史记录里还是旧路径，basename 一致即视为同一条）。
+    返回记录下标或 None。
+    """
+    for i, r in enumerate(records):
+        if r.get("video") == video_path:
+            return i
+    base = os.path.basename(video_path)
+    for i, r in enumerate(records):
+        rv = r.get("video", "")
+        if rv and os.path.basename(rv) == base:
+            return i
+    return None
+
+
+def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
+    """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
+
+    √ 确认 → kept_ts_list（正样本），× 误报 → deleted_ts_list（负样本）。
+    找不到对应记录时返回 False；写入磁盘成功返回 True。
+    """
+    try:
+        records = load_history()
+    except OSError:
+        return False
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return False
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    target = records[hit_idx]
+    labels = dict(target.get("labels") or {})
+    if kept_ts_list is not None:
+        labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
+    if deleted_ts_list is not None:
+        labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+    labels["label_time"] = now
+    target["labels"] = labels
+    target["time"] = now
+    # 上浮到顶部（最近更新优先），保持其他条目顺序
+    final = [target] + records[:hit_idx] + records[hit_idx + 1:]
+    return save_history(final)
+
+
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
 # 新增字段只需在此表加一行（旧实现要同时改签名/赋值块/调用方三处）。
 # diff_threshold 例外：可能为 int 或 str 'auto'，原样保存，不入表。

@@ -120,11 +120,19 @@ def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
         # 提前解码再跳到目标帧，保证返回的是目标帧而非更晚的帧
         pre_pts = int(2.0 / fps / tb) if tb > 0 else 0
         container.seek(max(0, target_pts - pre_pts), stream=stream)
-        for f in container.decode(stream):
-            cur_pts = f.pts if f.pts is not None else 0
-            cur_idx = int(round((cur_pts - start_pts) * tb * fps))
-            if cur_idx >= idx:
-                return f.to_ndarray(format="bgr24")
+        # demux + codec_context.decode 替代 container.decode：逐 packet try/except
+        # 跳过损坏的 NAL（兼容开头损坏但后续数据完好的视频，如断电录制）。
+        # 正常视频无损坏 packet，try/except 不触发，零开销。
+        cc = stream.codec_context
+        for p in container.demux(stream):
+            try:
+                for f in cc.decode(p):
+                    cur_pts = f.pts if f.pts is not None else 0
+                    cur_idx = int(round((cur_pts - start_pts) * tb * fps))
+                    if cur_idx >= idx:
+                        return f.to_ndarray(format="bgr24")
+            except Exception:
+                continue
         return None
     except Exception as e:
         # 旧实现静默返回 None，解码问题（容器损坏/编码不支持）无从排查
@@ -187,16 +195,23 @@ class VideoReader:
         if end is None:
             end = self.total
         self.seek(start)
-        for f in self.container.decode(self.stream):
-            cur_pts = f.pts if f.pts is not None else 0
-            fidx = int(round((cur_pts - self.start_pts) * self.tb * self.fps))
-            if fidx < start:
+        # demux + codec_context.decode 替代 container.decode：逐 packet try/except
+        # 跳过损坏 NAL（与 read_frame 同一容错策略，保证检测流程也能处理损坏视频）
+        cc = self.stream.codec_context
+        for p in self.container.demux(self.stream):
+            try:
+                for f in cc.decode(p):
+                    cur_pts = f.pts if f.pts is not None else 0
+                    fidx = int(round((cur_pts - self.start_pts) * self.tb * self.fps))
+                    if fidx < start:
+                        continue
+                    if fidx >= end:
+                        return
+                    if (fidx - start) % batch != 0:
+                        continue
+                    yield fidx, f.to_ndarray(format="bgr24")
+            except Exception:
                 continue
-            if fidx >= end:
-                break
-            if (fidx - start) % batch != 0:
-                continue
-            yield fidx, f.to_ndarray(format="bgr24")
 
     def close(self):
         if self.container:

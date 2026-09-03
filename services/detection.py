@@ -812,27 +812,34 @@ def clip_action(action, idx, video_path=None):
         return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
     elif action == "export":
         return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
-    elif action == "delete":
-        deleted = clips[idx]
-        ts = deleted["ts"]
-        del clips[idx]
-        # kept 集合整体前移：删除 idx 后，大于 idx 的索引 -1
-        new_kept = set()
-        for old_i in sorted(kept):
-            if old_i < idx:
-                new_kept.add(old_i)
-            elif old_i > idx:
-                new_kept.add(old_i - 1)
+    elif action in ("mark_keep", "mark_reject"):
+        # √/× 仅做标记，不删除片段（列表保持完整，导出集锦只取 √）
+        target = "keep" if action == "mark_keep" else "reject"
+        clip = clips[idx]
+        # toggle：再次点击同标记 = 取消
+        clip["mark"] = None if clip.get("mark") == target else target
+        clip["mark_source"] = "manual" if clip["mark"] else None
+        ts = clip["ts"]
+        # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）
         kept.clear()
-        kept.update(new_kept)
-        # 同步 goals：按保留的片段时间戳重建（快照模式下直接改快照的 goals 列表）
-        kept_ts = [clips[i]["ts"] for i in sorted(kept) if i < len(clips)]
-        if video_path is not None:
-            snap["goals"] = kept_ts
-        else:
-            state.last_goals.clear()
-            state.last_goals.extend(kept_ts)
-        return None, f"已删除第 {idx+1} 个片段（{ts:.1f}s）| 剩余 {len(clips)} 个"
+        kept.update(i for i, c in enumerate(clips) if c.get("mark") == "keep")
+        # 标签飞轮：√ → kept_ts_list（正样本），× → deleted_ts_list（负样本）
+        kept_ts = [c["ts"] for c in clips if c.get("mark") == "keep"]
+        reject_ts = [c["ts"] for c in clips if c.get("mark") == "reject"]
+        try:
+            state.update_history_labels(
+                video_path if video_path else state.video_state["path"],
+                kept_ts_list=kept_ts,
+                deleted_ts_list=reject_ts,
+            )
+        except Exception:
+            pass
+        sym = {"keep": "√ 确认", "reject": "× 误报"}.get(clip["mark"], "已取消标记")
+        n_keep = len(kept_ts)
+        n_reject = len(reject_ts)
+        msg = (f"第 {idx+1} 个片段（{ts:.1f}s）{sym} | "
+               f"√ {n_keep} · × {n_reject} · 待标 {len(clips) - n_keep - n_reject}")
+        return None, msg
     return None, ""
 
 

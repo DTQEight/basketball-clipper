@@ -440,6 +440,13 @@ def main_page():
                     source='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
                 ).classes('w-full rounded-xl bg-black').style('aspect-ratio: 16/9; object-fit: contain')
 
+                # 帧选择器（标定前拖动浏览帧；随预览图同显隐）
+                frame_select_container = ui.row().classes('w-full items-center gap-3 hidden')
+                with frame_select_container:
+                    frame_slider = ui.slider(min=0, max=0, step=1, value=0).classes('flex-1')
+                    frame_pos_label = ui.label('帧 0').classes('text-gray-400 text-xs font-mono').style(
+                        'min-width: 132px; text-align: right; flex-shrink: 0')
+
                 result_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
                 highlights_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
 
@@ -479,6 +486,61 @@ def main_page():
                 el.classes(remove='hidden')
             else:
                 el.classes(add='hidden')
+        # 帧选择器跟随预览图显隐（仅已加载多帧视频时才有意义）
+        if mode == 'preview' and (state.video_state.get('total') or 0) > 1:
+            frame_select_container.classes(remove='hidden')
+        else:
+            frame_select_container.classes(add='hidden')
+
+    # ====== 帧选择器逻辑 ======
+    _frame_sel = {"busy": False, "pending": None}
+
+    def _fmt_frame_pos(idx, total, fps):
+        m, s = divmod(idx / max(fps, 1e-6), 60)
+        return f'帧 {idx} / {max(total - 1, 0)}  {int(m):02d}:{s:04.1f}'
+
+    def _sync_frame_selector():
+        """视频加载后同步滑块范围/位置（各加载路径已将 current_frame 重置为 0）。"""
+        total = int(state.video_state.get('total') or 0)
+        if total <= 1:
+            frame_select_container.classes(add='hidden')
+            return
+        frame_slider._props.update({'min': 0, 'max': total - 1, 'step': 1})
+        frame_slider.set_value(0)
+        frame_slider.update()
+        frame_pos_label.set_text(_fmt_frame_pos(0, total, state.video_state.get('fps') or 30.0))
+        frame_select_container.classes(remove='hidden')
+
+    async def _on_frame_slider_change(e):
+        """拖动选帧：更新 current_frame 并刷新预览。拖动用 catch-up：解码中只记 pending。"""
+        idx = int(e.value)
+        total = int(state.video_state.get('total') or 0)
+        if total > 0:
+            idx = max(0, min(idx, total - 1))
+        frame_pos_label.set_text(_fmt_frame_pos(idx, total, state.video_state.get('fps') or 30.0))
+        if state.current_task() is not None:
+            return
+        if _frame_sel["busy"]:
+            _frame_sel["pending"] = idx
+            return
+        _frame_sel["busy"] = True
+        try:
+            from nicegui import run
+            while True:
+                target = _frame_sel["pending"]
+                _frame_sel["pending"] = None
+                if target is None:
+                    target = idx
+                state.video_state["current_frame"] = int(target)
+                result = await run.io_bound(detection.preview_frame, int(target))
+                if result is not None and result[0] is not None:
+                    preview_image.set_source(video_utils.frame_to_base64(result[0]))
+                if _frame_sel["pending"] is None:
+                    break
+        finally:
+            _frame_sel["busy"] = False
+
+    frame_slider.on_value_change(_on_frame_slider_change)
 
     # ====== 全局任务互斥：锁在 services.state（进程级，跨页面连接/刷新共享）======
     # 旧实现 _busy 是页面函数局部变量：NiceGUI 每个连接/刷新独立执行页面函数，
@@ -562,11 +624,12 @@ def main_page():
             b64 = video_utils.frame_to_base64(frame)
             preview_image.set_source(b64)
             _show_right_pane('preview')
+            _sync_frame_selector()
         else:
             # 加载失败也必须刷新卡片（state 已在 load_video 里清空，UI 要同步显示空列表）
             _refresh_result_cards()
         info_text.set_text(info)
-        calib_status.set_text('请点击画面 2 个点标定篮筐' if frame is not None else info)
+        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点标定篮筐' if frame is not None else info)
 
     def _refresh_batch_list():
         """刷新批量下拉框：三态标记（☑已完成n球 / ✓已标定 / ○未标定），保留当前选中。"""
@@ -669,6 +732,7 @@ def main_page():
             if frame is not None:
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
+                _sync_frame_selector()
             info_text.set_text(info)
             calib_status.set_text(status)
             # 刷新结果卡片（已检测过的视频会显示进球列表）
@@ -898,7 +962,7 @@ def main_page():
                 if vp is not None:
                     ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                         'text-xs text-center w-full py-4').style('color: var(--accent)')
-                    ui.label('该视频的片段已全部删除').classes('text-gray-400 text-xs text-center w-full')
+                    ui.label('该视频暂无片段').classes('text-gray-400 text-xs text-center w-full')
                 else:
                     ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
                     ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
@@ -907,6 +971,25 @@ def main_page():
             return
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
+        # 顶部统计行：√ / × / 待标 + 导出说明
+        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
+        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
+        n_pending = len(clips) - n_keep - n_reject
+        if n_keep:
+            export_hint = f'导出集锦：{n_keep} 个 √ 片段'
+        elif n_reject:
+            export_hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
+        else:
+            export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
+        with result_container:
+            if vp is not None:
+                ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                    'text-xs font-bold w-full pb-1').style('color: var(--accent)')
+            with ui.row().classes('w-full items-center gap-2 px-1 pb-2 flex-wrap'):
+                ui.label(f'√ {n_keep}').classes('text-xs font-bold').style('color: #22c55e')
+                ui.label(f'× {n_reject}').classes('text-xs font-bold').style('color: var(--err)')
+                ui.label(f'待标 {n_pending}').classes('text-xs').style('color: var(--text-secondary)')
+                ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
         for i, clip in enumerate(clips):
             ts = clip["ts"]
             # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常量，
@@ -916,24 +999,39 @@ def main_page():
             end_ts = ts + half
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
+            mark = clip.get("mark")
+            # 卡片视觉状态：√ 绿框 / × 红框半透明
+            card_style = 'margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'
+            if mark == 'keep':
+                card_style = ('margin: 0; background: var(--bg-surface); '
+                              'border: 1px solid rgba(34, 197, 94, 0.6)')
+            elif mark == 'reject':
+                card_style = ('margin: 0; background: var(--bg-surface); opacity: 0.55; '
+                              'border: 1px solid rgba(239, 68, 68, 0.5)')
             with result_container:
-                if i == 0 and vp is not None:
-                    # 快照模式：首行显示当前查看的视频名，明确数据归属
-                    ui.label(f'当前查看: {os.path.basename(vp)}').classes(
-                        'text-xs font-bold w-full pb-1').style('color: var(--accent)')
-                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style('margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'):
+                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
                     # 第一行：时间戳徽章（mono + tabular-nums）
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
-                    # 第二行：操作按钮（图标化，hover 才显文字）
+                    # 第二行：操作按钮（预览 / √ / × / 导出）
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
+                        _keep_on = mark == 'keep'
+                        ui.button('√ 确认', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')).classes(
+                            'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
+                            f'color: {"#22c55e" if _keep_on else "var(--text-secondary)"}; '
+                            f'border: 1px solid {"rgba(34, 197, 94, 0.7)" if _keep_on else "var(--border-subtle)"}; '
+                            f'background: {"rgba(34, 197, 94, 0.12)" if _keep_on else "transparent"}')
+                        _rej_on = mark == 'reject'
+                        ui.button('× 误报', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')).classes(
+                            'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
+                            f'color: {"var(--err)" if _rej_on else "var(--text-secondary)"}; '
+                            f'border: 1px solid {"rgba(239, 68, 68, 0.7)" if _rej_on else "var(--border-subtle)"}; '
+                            f'background: {"rgba(239, 68, 68, 0.12)" if _rej_on else "transparent"}')
                         ui.button('导出', on_click=lambda e, idx=i: _on_export_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
-                        ui.button('删除', on_click=lambda e, idx=i: _on_delete_clip(idx)).classes(
-                            'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--err); border: 1px solid rgba(239, 68, 68, 0.3)')
 
     def _on_preview_clip(idx):
         # 全局模式下有任务运行时拒绝：检测线程可能正在 clear/extend clips，
@@ -956,13 +1054,11 @@ def main_page():
             ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
-    def _on_delete_clip(idx):
-        # 快照模式（查看批量已完成视频）随时可删，仅改快照；
-        # 全局模式有任务运行时拒绝（会与检测线程冲突）
+    def _on_mark_clip(idx, action):
+        # 快照模式随时可标（只改快照 dict）；全局模式有任务运行时拒绝（会与检测线程冲突）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        # 点击直接删除，不弹确认框
-        _, status = detection.clip_action("delete", idx, video_path=_cards_video["path"])
+        _, status = detection.clip_action(action, idx, video_path=_cards_video["path"])
         _refresh_result_cards()
         _set_status(status, 'info')
 
@@ -1131,6 +1227,7 @@ def main_page():
         _show_right_pane('preview')
         if frame is not None:
             preview_image.set_source(video_utils.frame_to_base64(frame))
+            _sync_frame_selector()
         # 同步路径输入框，显示当前加载的视频
         if state.video_state["path"]:
             path_input.set_value(state.video_state["path"])
