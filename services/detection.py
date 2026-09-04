@@ -843,6 +843,21 @@ def clip_action(action, idx, video_path=None):
     return None, ""
 
 
+def _export_goals(clips, all_goals):
+    """导出集锦的进球时间戳筛选：
+
+    有 √ 标记 → 只导出 √ 的；
+    无 √ 但有 × → 导出未标记的（× 排除在外）；
+    完全没标记 → 导出全部（老行为兼容）。
+    """
+    keep_ts = [float(c["ts"]) for c in clips if c.get("mark") == "keep"]
+    if keep_ts:
+        return sorted(keep_ts)
+    if any(c.get("mark") == "reject" for c in clips):
+        return sorted(float(c["ts"]) for c in clips if c.get("mark") != "reject")
+    return [float(t) for t in all_goals]
+
+
 def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
                         video_path=None, task_token=0):
     """生成集锦视频。
@@ -866,12 +881,13 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
             snap = state.batch_results.get(video_path)
             if not snap:
                 return None, "❌ 该视频没有检测结果"
-            goals = list(snap["goals"])
+            clips = snap["clips"]
+            goals = _export_goals(clips, list(snap["goals"]))
             src = video_path
         else:
             if state.video_state["path"] is None:
                 return None, "❌ 请先加载视频并检测进球"
-            goals = list(state.last_goals)
+            goals = _export_goals(state.last_goal_clips, list(state.last_goals))
             src = state.video_state["path"]
         if not goals:
             return None, "❌ 没有检测到进球"
@@ -976,7 +992,8 @@ def _on_load_history_impl(idx_choice, progress_callback):
     _report(30, f'生成 {len(all_goals)} 个预览片段...')
     cache_key = state.clip_cache_key(video_path, all_goals)
     cached = state.clip_cache.get(cache_key)
-    if cached and all(os.path.exists(c["path"]) for c in cached):
+    cache_hit = bool(cached and all(os.path.exists(c["path"]) for c in cached))
+    if cache_hit:
         # 命中缓存：直接复用已生成的片段，跳过 ffmpeg
         state.last_goal_clips.extend(list(cached))
         _report(30, f'命中缓存，复用 {len(state.last_goal_clips)} 个片段')
@@ -988,17 +1005,59 @@ def _on_load_history_impl(idx_choice, progress_callback):
         # 写入缓存并持久化
         if state.last_goal_clips:
             state.put_clip_cache(cache_key, state.last_goal_clips)
+    log.info(f"[LOAD] {os.path.basename(video_path)} | "
+             f"cache={'HIT' if cache_hit else 'MISS'} | "
+             f"clips={len(state.last_goal_clips)}/{len(all_goals)}")
 
-    # 加载后全部进球默认保留（筛选结果不持久化，删除操作仅影响当前会话的集锦导出）
-    state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+    # 先清空所有 clip 的 mark/mark_source，避免缓存共享引用携带上一次加载的
+    # 残留标记（cache 命中时 last_goal_clips 与 clip_cache 共享同一批 dict，
+    # 若 get_labels 因瞬态 IO 错误返回空，残留 mark 不会被覆盖，造成误显/漏显）。
+    for c in state.last_goal_clips:
+        c.pop("mark", None)
+        c.pop("mark_source", None)
+
+    # 若历史里已有人工标签（kept=√ / deleted=×），恢复为标记而非清空
+    labels = state.get_labels(video_path)
+    deleted_set = set(labels["deleted"]) if labels.get("deleted") else set()
+    kept_set = set(labels["kept"]) if labels.get("kept") else set()
+    log.info(f"[LOAD] labels: kept={len(kept_set)} deleted={len(deleted_set)} "
+             f"label_time={labels.get('label_time')}")
+    if deleted_set or kept_set:
+        kept_indices = []
+        n_match_keep = 0
+        n_match_reject = 0
+        for idx, c in enumerate(state.last_goal_clips):
+            ts = round(float(c["ts"]), 3)
+            if ts in deleted_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "manual"
+                n_match_reject += 1
+            elif ts in kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "manual"
+                kept_indices.append(idx)
+                n_match_keep += 1
+        state.kept_goal_indices = set(kept_indices)
+        log.info(f"[LOAD] matched: keep={n_match_keep} reject={n_match_reject} "
+                 f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject})")
+    else:
+        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
     info_str = (f"{info['total']} 帧 | {info['fps']:.1f} fps | "
                 f"{info['width']}x{info['height']} | {info['codec']}")
-    status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
-              f"进球: {len(all_goals)} 个\n"
-              f"已生成 {len(state.last_goal_clips)} 个预览片段")
+    n_show = len(state.last_goal_clips)
+    n_keep = len(state.kept_goal_indices)
+    n_reject = sum(1 for c in state.last_goal_clips if c.get("mark") == "reject")
+    if labels.get("label_time") and (n_keep or n_reject):
+        status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
+                  f"进球: {n_show} 个（恢复上次标记 √ {n_keep} · × {n_reject}）\n"
+                  f"已生成 {n_show} 个预览片段")
+    else:
+        status = (f"已加载历史记录\n视频: {r.get('video_name', '')}\n"
+                  f"进球: {len(all_goals)} 个\n"
+                  f"已生成 {len(state.last_goal_clips)} 个预览片段")
     return preview, info_str, status
 
 

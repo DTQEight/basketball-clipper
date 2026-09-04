@@ -343,6 +343,38 @@ def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
     return save_history(final)
 
 
+def get_labels(video_path):
+    """读取某视频的已保存标签。
+
+    返回 {"kept": list|None, "deleted": list|None, "label_time": str|None}。
+    找不到记录 / 无标签时返回 None 字段。
+
+    瞬态 IO 错误（Windows 文件共享冲突）时额外重试：load_history 内置 3 次
+    短重试仍可能不足（文件被 update_history_labels 的原子写占用），此处再补
+    2 次较长等待，避免标签读空导致标记无法回填。
+    """
+    records = None
+    last_err = None
+    for attempt in range(2):
+        try:
+            records = load_history()
+            break
+        except OSError as e:
+            last_err = e
+            time.sleep(0.1 * (attempt + 1))
+    if records is None:
+        logging.getLogger("state").warning(
+            f"[WARN] get_labels 读取历史失败（{last_err}），本次不回填标记")
+        return {"kept": None, "deleted": None, "label_time": None}
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return {"kept": None, "deleted": None, "label_time": None}
+    lab = records[hit_idx].get("labels") or {}
+    return {"kept": list(lab["kept"]) if "kept" in lab else None,
+            "deleted": list(lab["deleted"]) if "deleted" in lab else None,
+            "label_time": lab.get("label_time")}
+
+
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
 # 新增字段只需在此表加一行（旧实现要同时改签名/赋值块/调用方三处）。
 # diff_threshold 例外：可能为 int 或 str 'auto'，原样保存，不入表。
