@@ -839,6 +839,7 @@ def main_page():
         batch_mini_text.set_text('后台识别中')
         batch_run_btn.set_text('取消')
         batch_run_btn.enable()
+        state.set_live('batch', 0, '正在批量识别...')
         # 显示进度
         _show_right_pane('progress')
         progress_bar.set_value(0)
@@ -855,6 +856,7 @@ def main_page():
                 # 迷你进度条同步（右侧面板被预览顶掉时，用户仍能看到后台进度）
                 batch_mini_bar.set_value(pct / 100)
                 batch_mini_text.set_text(f'{pct:.0f}%')
+                state.set_live('batch', pct, msg)
             except Exception:
                 pass
 
@@ -890,6 +892,7 @@ def main_page():
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
         batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
+        state.clear_live('batch')
         _show_right_pane('preview')
         _set_status(status, 'ok' if ok else 'err')
         # 批量结束后：用户查看中的快照保留显示；否则回全局模式显示最后一个视频的结果
@@ -1019,6 +1022,8 @@ def main_page():
         state.cancel_event.clear()
         detect_btn.set_text('取消')
         detect_btn.enable()
+        # 写入共享进度槽：刷新后新页面可恢复"运行中"UI（timer 轮询）
+        state.set_live('detect', 0, '正在加载模型...')
         # 显示进度条
         _show_right_pane('progress')
         progress_bar.set_value(0)
@@ -1032,6 +1037,7 @@ def main_page():
                 # 主行短状态 + 详情行完整消息（含帧数/ETA），避免两行重复显示同一内容
                 progress_text.set_text('检测中...' if pct < 80 else '生成预览片段...')
                 progress_detail.set_text(msg)
+                state.set_live('detect', pct, msg)
             except Exception:
                 pass
 
@@ -1063,6 +1069,7 @@ def main_page():
             _set_status(status, 'ok' if ok else 'err')
         detect_btn.set_text('开始识别')
         detect_btn.enable()
+        state.clear_live('detect')  # 任务结束：进度槽清空，timer 复位运行态 UI
         # 无论成功/失败都刷新卡片：失败路径 run_detect 已清空 state，
         # 不刷新会残留上一个视频的卡片（点击预览静默无效）
         _refresh_result_cards()
@@ -1340,11 +1347,13 @@ def main_page():
             hl_progress_strip.classes(remove='hidden')
             hl_mini_bar.set_value(0)
             hl_mini_text.set_text(f'集锦: {os.path.basename(vp)}')
+            state.set_live('hl', 0, f'集锦: {os.path.basename(vp)}', mini=True)
 
             def _hl_progress(pct, msg):
                 try:
                     hl_mini_bar.set_value(pct / 100)
                     hl_mini_text.set_text(f'集锦 {pct:.0f}%')
+                    state.set_live('hl', pct, msg, mini=True)
                 except Exception:
                     pass
 
@@ -1362,6 +1371,7 @@ def main_page():
                 # 页面刷新取消 UI 协程时后台线程仍在跑，UI 提前重置会让新页面
                 # 对同一视频再次启动集锦，两线程写同一输出文件）；UI 只收迷你条
                 hl_progress_strip.classes(add='hidden')
+                state.clear_live('hl')
             if path and os.path.exists(path):
                 ui.download(path)
             _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
@@ -1380,6 +1390,7 @@ def main_page():
         progress_bar.set_value(0)
         progress_text.set_text('正在生成集锦...')
         progress_detail.set_text('')
+        state.set_live('hl', 0, '正在生成集锦...')
 
         def _progress_callback(pct, msg):
             try:
@@ -1387,6 +1398,7 @@ def main_page():
                 # 主行短状态 + 详情行完整消息，避免两行重复
                 progress_text.set_text('正在生成集锦...')
                 progress_detail.set_text(msg)
+                state.set_live('hl', pct, msg)
             except Exception:
                 pass
 
@@ -1401,6 +1413,7 @@ def main_page():
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
         # 正常路径锁由 generate_highlights 内部 finally 释放（锁归任务本体）
+        state.clear_live('hl')
 
         if path and os.path.exists(path):
             ui.download(path)
@@ -1430,11 +1443,13 @@ def main_page():
             hl_progress_strip.classes(remove='hidden')
             hl_mini_bar.set_value(0)
             hl_mini_text.set_text('整场集锦生成中')
+            state.set_live('hl', 0, '整场集锦生成中', mini=True)
 
             def _hl_progress(pct, msg):
                 try:
                     hl_mini_bar.set_value(pct / 100)
                     hl_mini_text.set_text(f'整场集锦 {pct:.0f}%')
+                    state.set_live('hl', pct, msg, mini=True)
                 except Exception:
                     pass
 
@@ -1450,6 +1465,7 @@ def main_page():
                 path, status = None, f"❌ 整场集锦生成异常: {_e}\n{traceback.format_exc()}"
             finally:
                 hl_progress_strip.classes(add='hidden')
+                state.clear_live('hl')
             if path and os.path.exists(path):
                 ui.download(path)
             _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
@@ -1465,12 +1481,14 @@ def main_page():
         progress_bar.set_value(0)
         progress_text.set_text('正在生成整场集锦...')
         progress_detail.set_text('')
+        state.set_live('hl', 0, '正在生成整场集锦...')
 
         def _progress_callback(pct, msg):
             try:
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text('正在生成整场集锦...')
                 progress_detail.set_text(msg)
+                state.set_live('hl', pct, msg)
             except Exception:
                 pass
 
@@ -1485,6 +1503,7 @@ def main_page():
             import traceback
             path, status = None, f"❌ 整场集锦生成异常: {_e}\n{traceback.format_exc()}"
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
+        state.clear_live('hl')
 
         if path and os.path.exists(path):
             ui.download(path)
@@ -1592,6 +1611,54 @@ def main_page():
         info_text.set_text(info)
         _set_status(status, 'ok' if frame is not None else 'err')
         _refresh_result_cards()
+
+    # ===== 运行中任务 UI 恢复（跨刷新） =====
+    # NiceGUI 刷新会重建页面并重置所有 UI；任务线程持模块级锁继续跑，进度回调
+    # 写的旧元素已销毁。此处每 0.4s 轮询共享进度槽：任务运行中恢复按钮=取消、
+    # 进度条/迷你条与阶段消息；任务结束（槽清空）自动复位按钮与进度条。
+    def _sync_live_ui():
+        try:
+            d = state.live_progress["detect"]
+            if d is not None:
+                if detect_btn.text != '取消':
+                    detect_btn.set_text('取消')
+                    detect_btn.enable()
+                _show_right_pane('progress')
+                progress_bar.set_value(d["pct"] / 100)
+                progress_text.set_text('检测中...' if d["pct"] < 80 else '生成预览片段...')
+                progress_detail.set_text(d["msg"])
+            elif detect_btn.text in ('取消', '正在取消...'):
+                detect_btn.set_text('开始识别')
+                detect_btn.enable()
+            b = state.live_progress["batch"]
+            if b is not None:
+                if batch_run_btn.text != '取消':
+                    batch_run_btn.set_text('取消')
+                    batch_run_btn.enable()
+                batch_progress_strip.classes(remove='hidden')
+                batch_mini_bar.set_value(b["pct"] / 100)
+                batch_mini_text.set_text(f"{b['pct']:.0f}%")
+            elif batch_run_btn.text != '批量识别':
+                batch_run_btn.set_text('批量识别')
+                batch_run_btn.enable()
+                batch_progress_strip.classes(add='hidden')
+            h = state.live_progress["hl"]
+            if h is not None:
+                if h.get("mini"):
+                    hl_progress_strip.classes(remove='hidden')
+                    hl_mini_bar.set_value(h["pct"] / 100)
+                    hl_mini_text.set_text(h["msg"])
+                else:
+                    _show_right_pane('progress')
+                    progress_bar.set_value(h["pct"] / 100)
+                    progress_text.set_text('正在生成集锦...')
+                    progress_detail.set_text(h["msg"])
+            else:
+                hl_progress_strip.classes(add='hidden')
+        except Exception:
+            pass
+
+    ui.timer(0.4, _sync_live_ui)
 
     # 页面初始化：不自动加载历史列表（空白初始状态），点「刷新」才加载
     _refresh_result_cards()

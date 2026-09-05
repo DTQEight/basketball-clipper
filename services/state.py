@@ -214,6 +214,35 @@ def current_task():
 # 同理下沉到模块级：页面局部 dict 刷新后失效会导致两连接同时跑集锦。
 hl_busy = {"on": False}
 
+# 运行中任务的实时进度（跨页面连接/刷新共享）：NiceGUI 刷新会重建页面并重置
+# 全部 UI，而任务线程（持模块级锁）仍继续跑、进度回调写的是旧页面已销毁的元素。
+# 各 io_bound 进度回调把 (pct, msg) 写入本表，页面 ui.timer 轮询后恢复/刷新新页面
+# 的按钮、进度条与阶段消息，任务结束（置 None）后自动复位。
+# 键：'detect' / 'batch' / 'hl'（hl 覆盖单视频/整场集锦与批量流水线迷你条）。
+live_progress = {"detect": None, "batch": None, "hl": None}
+
+
+def set_live(task: str, pct: float, msg: str, mini: bool = False) -> None:
+    """写任务实时进度（供刷新后的新页面恢复运行态 UI）。
+
+    mini=True：进度走流水线迷你条（批量运行中的集锦），刷新恢复时不占用右侧
+    进度面板。否则视为独占任务，走右侧主进度面板。
+    """
+    try:
+        if task in live_progress:
+            live_progress[task] = {"pct": float(pct), "msg": str(msg), "mini": bool(mini)}
+    except Exception:
+        pass
+
+
+def clear_live(task: str) -> None:
+    """任务结束/失败/取消：清进度槽，触发页面 timer 复位运行态 UI。"""
+    try:
+        if task in live_progress:
+            live_progress[task] = None
+    except Exception:
+        pass
+
 # NVENC 编码会话信号量：GeForce 消费卡驱动限制同时 2 路编码会话。
 # 预览片段线程池（services/detection）与集锦（cutter/ffmpeg_cutter）跨模块
 # 共用同一配额：超限时第 3 路在 acquire 上排队等待，而不是 OpenEncodeSession 失败。
