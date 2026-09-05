@@ -325,6 +325,39 @@ class TestHistory:
         assert state_mod.load_persons() == ["小明"]
 
 
+    def test_harvest_persons_from_history(self, state_mod):
+        """存量回填：旧分类（仅 labels.persons、无 persons.json）→ 全局名单。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0])
+        state_mod.update_history_labels("/a.mp4", None, None, person_map={10.0: "智"})
+        state_mod.add_history("/b.mp4", (1, 2, 3, 4), [20.0])
+        state_mod.update_history_labels("/b.mp4", None, None,
+                                        person_map={20.0: "浩", 21.0: "智"})
+        # 名单为空 → 回填收录全部历史人物（跨视频去重）
+        assert state_mod.load_persons() == []
+        assert state_mod.harvest_persons_from_history() == 2
+        assert set(state_mod.load_persons()) == {"智", "浩"}
+        # 幂等：重复回填不增不减
+        assert state_mod.harvest_persons_from_history() == 0
+        assert set(state_mod.load_persons()) == {"智", "浩"}
+        # 显式登记（最近使用）优先在前，回填新名字追加在后
+        state_mod.add_person("小明")
+        state_mod.add_history("/c.mp4", (1, 2, 3, 4), [30.0])
+        state_mod.update_history_labels("/c.mp4", None, None, person_map={30.0: "诚"})
+        assert state_mod.harvest_persons_from_history() == 1
+        persons = state_mod.load_persons()
+        assert persons[0] == "小明" and "诚" in persons and "智" in persons
+        # 历史里没有任何人物分类 → 0 且不写盘
+        monkey = state_mod.PERSONS_FILE + ".probe"
+        state_mod.PERSONS_FILE = monkey
+        orig_load = state_mod.load_history
+        state_mod.load_history = lambda: []
+        try:
+            assert state_mod.harvest_persons_from_history() == 0
+            assert not os.path.exists(monkey)
+        finally:
+            state_mod.load_history = orig_load
+
+
 class TestClipCache:
     def test_key_order_insensitive(self, state_mod):
         """写入方（sorted）与历史回读方（原序）必须命中同一 key。"""

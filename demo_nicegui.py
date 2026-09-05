@@ -34,6 +34,9 @@ from services import state, detection, video_utils
 
 # 启动时从磁盘恢复片段缓存
 state.init_clip_cache()
+# 存量人物名单回填：全局名单上线前的旧分类（仅写在各视频 labels.persons）
+# 一次性补收进 persons.json（幂等），使旧场次建的人物在新场次可选
+state.harvest_persons_from_history()
 
 
 # ============ 人物分类配色 ============

@@ -494,6 +494,42 @@ def add_person(name) -> bool:
         return False
 
 
+def harvest_persons_from_history() -> int:
+    """从所有历史记录的 labels.persons 存量收集人物名，合并进全局名单（幂等）。
+
+    背景：全局名单（persons.json）上线前，人物分类只写进单视频 labels.persons、
+    未登记全局名单 —— 旧场次建过的人物在新场次的对话框里不可选。这里一次性
+    把存量名字补收进名单；已存在的跳过（不改变现有最近使用顺序），新收录的
+    追加在名单末尾。返回新收录的名字数。
+    """
+    try:
+        records = load_history()
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 人物名单存量回填读取历史失败: {e}")
+        return 0
+    names = set()
+    for r in records:
+        lab = r.get("labels") or {}
+        for v in (lab.get("persons") or {}).values():
+            v = (str(v) or "").strip()
+            if v:
+                names.add(v)
+    if not names:
+        return 0
+    persons = load_persons()
+    new_names = sorted(n for n in names if n not in set(persons))
+    if not new_names:
+        return 0
+    try:
+        _atomic_write_json(PERSONS_FILE, persons + new_names, indent=2)
+        logging.getLogger("state").info(
+            f"[PERSONS] 从历史记录存量回填 {len(new_names)} 个人物: {new_names}")
+        return len(new_names)
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 人物名单存量回填写盘失败: {e}")
+        return 0
+
+
 def get_record(video_path: str):
     """读取单个视频的历史记录（只读该视频对应的 JSON 文件，比 load_history 轻）。
 
