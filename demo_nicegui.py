@@ -36,6 +36,29 @@ from services import state, detection, video_utils
 state.init_clip_cache()
 
 
+# ============ 人物分类配色 ============
+# 人物徽章/快捷选择/统计行统一从该调色板取色（暗色主题高可读）。
+# 分配策略：按人物名排序循环取色 —— 同屏人物（通常 2-6 个）不撞色；
+# 新增人物可能使整体色相偏移，但保证任何时刻同屏颜色唯一。
+_PERSON_PALETTE = [
+    ('#22d3ee', 'rgba(34, 211, 238, 0.14)'),   # cyan（与全局 accent 同色，排第一）
+    ('#a78bfa', 'rgba(167, 139, 250, 0.14)'),  # violet
+    ('#f472b6', 'rgba(244, 114, 182, 0.14)'),  # pink
+    ('#fbbf24', 'rgba(251, 191, 36, 0.14)'),   # amber
+    ('#4ade80', 'rgba(74, 222, 128, 0.14)'),   # green
+    ('#fb923c', 'rgba(251, 146, 60, 0.14)'),   # orange
+    ('#38bdf8', 'rgba(56, 189, 248, 0.14)'),   # sky
+    ('#e879f9', 'rgba(232, 121, 249, 0.14)'),  # fuchsia
+]
+
+
+def _person_color_map(clips):
+    """从 clips 列表构建 {人物名: (文字色, 背景色)} 映射（按名字排序循环取色）。"""
+    names = sorted({c.get("person") for c in (clips or []) if c.get("person")})
+    return {n: _PERSON_PALETTE[i % len(_PERSON_PALETTE)]
+            for i, n in enumerate(names)}
+
+
 # ============ YOLO/CUDA 启动自检 ============
 
 YOLO_SELFCHECK = {"ok": False, "msg": ""}
@@ -410,9 +433,13 @@ def main_page():
                     hl_mini_text = ui.label('集锦生成中').classes('text-xs flex-shrink-0').style('color: var(--text-secondary)')
 
                 # 导出集锦按钮（固定在列表上方，仅列表有内容时显示）
-                with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 hidden') as export_row:
+                # 人物筛选下拉：全部人物 / 已分类的各个人物（按人物导出集锦）
+                with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 hidden items-center gap-2') as export_row:
+                    hl_person_select = ui.select(
+                        {'': '全部人物'}, value='').props('dense outlined standout dark'
+                        ).classes('text-xs flex-1').style('max-width: 60%')
                     ui.button('导出集锦', on_click=lambda: _on_highlights()).classes(
-                        'w-full text-sm font-bold').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
+                        'flex-1 text-sm font-bold').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
 
                 # 进球列表区域（独立滚动）
                 with ui.column().classes('w-full p-2 gap-1 overflow-y-auto flex-1').style('min-height: 0'):
@@ -590,11 +617,15 @@ def main_page():
             state.batch_calibs = {}
             state.batch_current_video = None
             state.batch_results.clear()  # 清掉上一轮快照，防止新文件夹同名视频显示旧结果
+            # 跨会话复用标定：该文件夹此前跑过批量识别的话，历史记录里存有
+            # 每个视频的篮筐标定，回填后列表直接显示 ✓、可直接批量识别
+            _n_cal = detection.backfill_batch_calibs_from_history()
             batch_panel.classes(remove='hidden')
             _refresh_batch_list()
             # 自动加载第一个视频（同时同步下拉框）
             await _on_batch_load_video(files[0])
-            _set_status(f'批量模式 | 扫描到 {len(files)} 个视频，逐个标定后批量识别', 'info')
+            _cal_hint = f'，已从历史恢复 {_n_cal} 个标定' if _n_cal else ''
+            _set_status(f'批量模式 | 扫描到 {len(files)} 个视频{_cal_hint}，逐个标定后批量识别', 'info')
             return
         # 单视频文件路径 → 原有流程（清空批量状态，避免写历史误带 batch_idx）
         # 必须占任务锁：io_bound 期间事件循环会让出，双击「加载」会并发跑两个
@@ -1027,6 +1058,104 @@ def main_page():
         # 不刷新会残留上一个视频的卡片（点击预览静默无效）
         _refresh_result_cards()
 
+    # ===== 人物分类对话框（页面级创建一次；内容每次打开时重建） =====
+    with ui.dialog() as person_dlg, ui.card().classes('p-4 gap-3 w-96'):
+        person_dlg_body = ui.column().classes('w-full gap-2')
+    # persistent：禁止点遮罩/ESC 关闭（与断点对话框同一防御口径）
+    person_dlg.props('persistent')
+    _person_dlg_idx = {"idx": None}
+
+    def _person_apply(name: str):
+        """应用人物分类：写 clip + 持久化历史 labels.persons，刷新卡片。"""
+        idx = _person_dlg_idx["idx"]
+        _person_dlg_idx["idx"] = None
+        person_dlg.close()
+        if idx is None:
+            return
+        # 全局模式下有任务运行时拒绝（与 √/× 标记同一规则：避免与检测线程竞态）
+        if _cards_video["path"] is None and _refuse_if_busy():
+            return
+        _, status = detection.clip_action(
+            "set_person", idx, video_path=_cards_video["path"], person=name)
+        _refresh_result_cards()
+        _set_status(status, 'info')
+
+    def _on_person_clip(idx):
+        """打开人物分类对话框：已有人物快捷选择 + 自定义新人物 + 清除分类。"""
+        vp = _cards_video["path"]
+        if vp is not None:
+            snap = state.batch_results.get(vp)
+            clips = snap["clips"] if snap else []
+        else:
+            clips = state.last_goal_clips
+        if idx < 0 or idx >= len(clips):
+            return
+        cur = clips[idx].get("person") or ''
+        # 本视频已用人物（有色 chips）+ 全局名单里的其他场次人物（灰 chips）
+        in_video = sorted({c.get("person") for c in clips if c.get("person")})
+        if cur and cur not in in_video:
+            in_video.append(cur)
+        try:
+            global_persons = state.load_persons()
+        except Exception:
+            global_persons = []
+        others = [p for p in global_persons if p and p not in in_video]
+        # 人物专属色（与卡片徽章/统计行同源映射；仅本视频已用人物有色）
+        color_map = _person_color_map(clips)
+
+        body = person_dlg_body
+        body.clear()
+        _person_dlg_idx["idx"] = idx
+        ts = clips[idx]["ts"]
+        with body:
+            ui.label('👤 人物分类').classes('text-base font-bold')
+            ui.label(f'片段 {ts:.1f}s' + (f' · 当前: {cur}' if cur else ' · 未分类')).classes(
+                'text-xs').style('color: var(--text-secondary)')
+            if in_video:
+                ui.label('本视频人物').classes('text-xs').style('color: var(--text-secondary)')
+                with ui.row().classes('w-full flex-wrap gap-1'):
+                    for p in in_video:
+                        _c = color_map.get(p, _PERSON_PALETTE[0])
+                        _sel = (p == cur)
+                        ui.button(p, on_click=lambda e, name=p: _person_apply(name)).classes(
+                            'text-xs rounded-full px-3 py-1 no-caps').props('ripple flat dense').style(
+                            f'color: {_c[0]}; '
+                            f'border: 1px solid {_c[0]}; '
+                            f'background: {_c[1] if _sel else "transparent"}')
+            if others:
+                ui.label('其他场次人物').classes('text-xs').style('color: var(--text-secondary)')
+                with ui.row().classes('w-full flex-wrap gap-1'):
+                    for p in others:
+                        _sel = (p == cur)
+                        ui.button(p, on_click=lambda e, name=p: _person_apply(name)).classes(
+                            'text-xs rounded-full px-3 py-1 no-caps').props('ripple flat dense').style(
+                            'color: var(--text-secondary); '
+                            f'border: 1px solid {"var(--accent)" if _sel else "var(--border-subtle)"}; '
+                            f'background: {"var(--accent-muted)" if _sel else "transparent"}')
+            with ui.row().classes('w-full items-center gap-2'):
+                new_name = ui.input(placeholder='输入新人物名').props('dense outlined dark').classes(
+                    'flex-1').style('color: var(--text-primary)')
+
+                def _add_new():
+                    name = (new_name.value or '').strip()
+                    if name:
+                        _person_apply(name)
+                ui.button('添加并使用', on_click=_add_new).props('ripple dense').classes(
+                    'text-xs no-caps').style('background: var(--accent); color: var(--bg-canvas)')
+                new_name.on('keydown.enter', lambda e: _add_new())
+            with ui.row().classes('w-full justify-between gap-2 mt-1'):
+                ui.button('清除分类' if cur else '不分类',
+                          on_click=lambda: _person_apply('')).props('ripple flat dense').classes(
+                    'text-xs no-caps').style(
+                    'color: var(--text-secondary); border: 1px solid var(--border-subtle)')
+
+                def _cancel_person():
+                    _person_dlg_idx["idx"] = None
+                    person_dlg.close()
+                ui.button('取消', on_click=_cancel_person).props('ripple flat dense').classes(
+                    'text-xs').style('color: var(--text-secondary)')
+        person_dlg.open()
+
     def _refresh_result_cards():
         """刷新结果卡片列表。
 
@@ -1054,16 +1183,36 @@ def main_page():
             return
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
-        # 顶部统计行：√ / × / 待标 + 导出说明
+        # 顶部统计行：√ / × / 待标 + 人物分类 + 导出说明
         n_keep = sum(1 for c in clips if c.get("mark") == "keep")
         n_reject = sum(1 for c in clips if c.get("mark") == "reject")
         n_pending = len(clips) - n_keep - n_reject
+        person_counts = {}
+        for c in clips:
+            p = c.get("person")
+            if p:
+                person_counts[p] = person_counts.get(p, 0) + 1
+        n_person = sum(person_counts.values())
+        # 人物配色映射（徽章 / 统计行 / 对话框同源，同屏不撞色）
+        person_colors = _person_color_map(clips)
         if n_keep:
             export_hint = f'导出集锦：{n_keep} 个 √ 片段'
         elif n_reject:
             export_hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
         else:
             export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
+        # 人物筛选下拉选项：'' = 全部 / 仅已分类（存在未分类片段时才有意义）/ 各人物（带计数）
+        try:
+            _opts = {'': '全部人物'}
+            if person_counts and n_person < len(clips):
+                _opts[detection.PERSON_FILTER_CLASSIFIED] = f'仅已分类（{n_person}）'
+            _opts.update({p: f'{p}（{n}）' for p, n in sorted(person_counts.items())})
+            _cur = hl_person_select.value
+            if _cur not in _opts:
+                hl_person_select.set_value('')
+            hl_person_select.set_options(_opts, value=hl_person_select.value)
+        except Exception:
+            pass
         with result_container:
             if vp is not None:
                 ui.label(f'当前查看: {os.path.basename(vp)}').classes(
@@ -1072,6 +1221,12 @@ def main_page():
                 ui.label(f'√ {n_keep}').classes('text-xs font-bold').style('color: #22c55e')
                 ui.label(f'× {n_reject}').classes('text-xs font-bold').style('color: var(--err)')
                 ui.label(f'待标 {n_pending}').classes('text-xs').style('color: var(--text-secondary)')
+                if person_counts:
+                    for p, n in sorted(person_counts.items()):
+                        _c = person_colors.get(p, _PERSON_PALETTE[0])
+                        ui.label(f'👤 {p}×{n}').classes(
+                            'text-xs font-bold rounded-full px-2 py-0.5').style(
+                            f'color: {_c[0]}; background: {_c[1]}; border: 1px solid {_c[0]}')
                 ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
         for i, clip in enumerate(clips):
             ts = clip["ts"]
@@ -1093,10 +1248,19 @@ def main_page():
                               'border: 1px solid rgba(239, 68, 68, 0.5)')
             with result_container:
                 with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
-                    # 第一行：时间戳徽章（mono + tabular-nums）
+                    # 第一行：时间戳徽章（mono + tabular-nums）+ 右上角人物分类徽章（人物专属色）
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
+                        person = clip.get("person")
+                        _pc = person_colors.get(person) if person else None
+                        ui.button((f'👤 {person}' if _pc else '👤 分类'),
+                                  on_click=lambda e, idx=i: _on_person_clip(idx)).classes(
+                            'ml-auto text-xs rounded-full px-3 py-0.5').props('ripple flat dense no-caps').style(
+                            f'color: {_pc[0] if _pc else "var(--text-secondary)"}; '
+                            f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
+                            f'background: {_pc[1] if _pc else "transparent"}; '
+                            'max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap')
                     # 第二行：操作按钮（预览 / √ / × / 导出）
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
@@ -1174,7 +1338,8 @@ def main_page():
             try:
                 path, status = await run.io_bound(
                     detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
-                    hl_min_gap.value, _hl_progress, vp)
+                    hl_min_gap.value, _hl_progress, vp,
+                    person_filter=(hl_person_select.value or None))
             except Exception as _e:
                 import traceback
                 path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
@@ -1210,7 +1375,8 @@ def main_page():
         try:
             path, status = await run.io_bound(
                 detection.generate_highlights, hl_pre_roll.value, hl_post_roll.value,
-                hl_min_gap.value, _progress_callback, vp, task_token=token)
+                hl_min_gap.value, _progress_callback, vp, task_token=token,
+                person_filter=(hl_person_select.value or None))
         except Exception as _e:
             import traceback
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"

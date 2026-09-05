@@ -916,12 +916,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _release_lock()
 
 
-def clip_action(action, idx, video_path=None):
+def clip_action(action, idx, video_path=None, person=None):
     """处理卡片按钮操作。
 
     video_path=None: 单视频模式，操作全局 last_goal_clips（原逻辑不变）。
     video_path 非空: 流水线快照模式，操作 batch_results[video_path] 内的数据，
                      不触碰全局 state（后台批量检测运行中也可安全调用）。
+    person: set_person 动作的人物名（"" = 清除分类）。
     """
     # ===== 选择数据源：快照模式 or 全局模式 =====
     if video_path is not None:
@@ -940,6 +941,30 @@ def clip_action(action, idx, video_path=None):
         return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
     elif action == "export":
         return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
+    elif action == "set_person":
+        # 人物分类：clip["person"] = 名字（""=清除）；持久化到历史 labels.persons
+        clip = clips[idx]
+        ts = clip["ts"]
+        name = (str(person) or "").strip()
+        clip["person"] = name or None
+        try:
+            state.update_history_labels(
+                video_path if video_path else state.video_state["path"],
+                kept_ts_list=None, deleted_ts_list=None,
+                person_map={ts: name},
+            )
+        except Exception:
+            pass
+        # 跨视频复用：登记进全局人物名单（最近使用在前；空名不登记）
+        if name:
+            try:
+                state.add_person(name)
+            except Exception:
+                pass
+        # 已分类片段的 √ 标记语义不受影响，kept 集合无需变更
+        shown = name if name else "已清除分类"
+        msg = f"第 {idx+1} 个片段（{ts:.1f}s）→ {shown}"
+        return None, msg
     elif action in ("mark_keep", "mark_reject"):
         # √/× 仅做标记，不删除片段（列表保持完整，导出集锦只取 √）
         target = "keep" if action == "mark_keep" else "reject"
@@ -971,23 +996,71 @@ def clip_action(action, idx, video_path=None):
     return None, ""
 
 
-def _export_goals(clips, all_goals):
+# 人物筛选哨兵值：仅导出"已分类"（任意人物）的片段，不含未分类片段。
+# 用双下划线包裹降低与真实人名撞车的概率；UI 下拉以 detection.PERSON_FILTER_CLASSIFIED 为键。
+PERSON_FILTER_CLASSIFIED = "__classified__"
+
+
+def _export_goals(clips, all_goals, person=None):
     """导出集锦的进球时间戳筛选：
 
+    person 非空 → 只导出该人物的片段；person 为 PERSON_FILTER_CLASSIFIED
+                  哨兵 → 只导出任意已分类的片段（不含未分类）。筛选后再叠加
+                  √/× 标记规则；
     有 √ 标记 → 只导出 √ 的；
     无 √ 但有 × → 导出未标记的（× 排除在外）；
     完全没标记 → 导出全部（老行为兼容）。
     """
-    keep_ts = [float(c["ts"]) for c in clips if c.get("mark") == "keep"]
+    pool = clips
+    if person == PERSON_FILTER_CLASSIFIED:
+        pool = [c for c in clips if c.get("person")]
+        if not pool:
+            return []
+    elif person:
+        pool = [c for c in clips if c.get("person") == person]
+        if not pool:
+            return []
+    keep_ts = [float(c["ts"]) for c in pool if c.get("mark") == "keep"]
     if keep_ts:
         return sorted(keep_ts)
-    if any(c.get("mark") == "reject" for c in clips):
-        return sorted(float(c["ts"]) for c in clips if c.get("mark") != "reject")
+    if any(c.get("mark") == "reject" for c in pool):
+        return sorted(float(c["ts"]) for c in pool if c.get("mark") != "reject")
+    if person:
+        # 人物/已分类筛选下无任何标记 → 只导筛选池内的
+        return sorted(float(c["ts"]) for c in pool)
     return [float(t) for t in all_goals]
 
 
+def _filter_desc(person_filter):
+    """导出筛选的状态栏描述：「小明」/「已分类」/ ''（全部）。"""
+    if not person_filter:
+        return ""
+    if person_filter == PERSON_FILTER_CLASSIFIED:
+        return "「已分类」"
+    return f"「{person_filter}」"
+
+
+def _person_highlights_path(src_video, person):
+    """按人物导出的输出路径：{视频名}-{人物}-highlights.mp4。
+
+    person 为 PERSON_FILTER_CLASSIFIED 哨兵 → {视频名}-已分类-highlights.mp4
+    （与默认全部导出、各人物导出互不覆盖）。
+    人名做文件名安全化：Windows 非法字符剔除 + 截断 30 字符（防超长人名
+    撑爆路径限制）+ 全非法时回落 "person"。
+    不带人物名的话，多个人物的个人集锦会互相覆盖同一个 {视频名}-highlights.mp4。
+    """
+    _vname = os.path.splitext(os.path.basename(src_video))[0]
+    if person == PERSON_FILTER_CLASSIFIED:
+        _safe = "已分类"
+    else:
+        _safe = "".join(c for c in person if c not in '\\/:*?"<>|').strip()[:30]
+        _safe = _safe or "person"
+    return os.path.join(state.CACHE_ROOT, "demo_output",
+                        f"{_vname}-{_safe}-highlights.mp4")
+
+
 def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
-                        video_path=None, task_token=0):
+                        video_path=None, task_token=0, person_filter=None):
     """生成集锦视频。
 
     video_path=None: 单视频模式，用全局 video_state + last_goals（原逻辑不变）。
@@ -998,6 +1071,7 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
                        对同一视频再次启动集锦，两线程写同一输出文件）
                      - 取消走独立的 hl_cancel_event：批量检测的「取消」不应连带杀死集锦
     task_token: 非零时全局任务锁由本函数持有并在 finally 释放（锁归任务本体）。
+    person_filter: 非空 → 只导出该人物分类的片段（按人物导出集锦）。
     """
     _pipeline = video_path is not None
     try:
@@ -1010,24 +1084,28 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
             if not snap:
                 return None, "❌ 该视频没有检测结果"
             clips = snap["clips"]
-            goals = _export_goals(clips, list(snap["goals"]))
+            goals = _export_goals(clips, list(snap["goals"]), person_filter)
             src = video_path
         else:
             if state.video_state["path"] is None:
                 return None, "❌ 请先加载视频并检测进球"
-            goals = _export_goals(state.last_goal_clips, list(state.last_goals))
+            goals = _export_goals(state.last_goal_clips, list(state.last_goals), person_filter)
             src = state.video_state["path"]
         if not goals:
-            return None, "❌ 没有检测到进球"
+            return None, f"❌ {_filter_desc(person_filter)}没有可导出的进球片段"
+        # 按人物导出：文件名带人物名，多个人物集锦互不覆盖
+        _out_path = _person_highlights_path(src, person_filter) if person_filter else None
         # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
         _cancel = state.hl_cancel_event.is_set if _pipeline else state.cancel_event.is_set
         out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
                              progress_callback=progress_callback,
-                             cancel_check=_cancel)
+                             cancel_check=_cancel,
+                             output_path=_out_path)
         if out_path and os.path.exists(out_path):
-            return out_path, f"集锦已生成（{len(goals)} 个进球片段）\n输出: {out_path}"
+            return out_path, (f"集锦已生成{_filter_desc(person_filter)}"
+                              f"（{len(goals)} 个进球片段）\n输出: {out_path}")
         if _cancel():
             return None, "已取消集锦生成"
         return None, "❌ 集锦生成失败"
@@ -1143,13 +1221,15 @@ def _on_load_history_impl(idx_choice, progress_callback):
     for c in state.last_goal_clips:
         c.pop("mark", None)
         c.pop("mark_source", None)
+        c.pop("person", None)
 
-    # 若历史里已有人工标签（kept=√ / deleted=×），恢复为标记而非清空
+    # 若历史里已有人工标签（kept=√ / deleted=× / persons=人物分类），恢复而非清空
     labels = state.get_labels(video_path)
     deleted_set = set(labels["deleted"]) if labels.get("deleted") else set()
     kept_set = set(labels["kept"]) if labels.get("kept") else set()
+    persons_map = labels.get("persons") or {}
     log.info(f"[LOAD] labels: kept={len(kept_set)} deleted={len(deleted_set)} "
-             f"label_time={labels.get('label_time')}")
+             f"persons={len(persons_map)} label_time={labels.get('label_time')}")
     if deleted_set or kept_set:
         kept_indices = []
         n_match_keep = 0
@@ -1170,6 +1250,16 @@ def _on_load_history_impl(idx_choice, progress_callback):
                  f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject})")
     else:
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+    # 人物分类回填（键为 round(ts,3) 精确匹配，与 mark 回填同一口径）
+    if persons_map:
+        n_person = 0
+        for c in state.last_goal_clips:
+            ts = round(float(c["ts"]), 3)
+            if ts in persons_map:
+                c["person"] = persons_map[ts]
+                n_person += 1
+        if n_person:
+            log.info(f"[LOAD] persons matched: {n_person}")
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
@@ -1240,10 +1330,30 @@ def _on_batch_load_video_impl(selected, progress_callback):
         state.calib["baseline_idx"] = cal["baseline_idx"] if base_frame is not None else -1
         state.calib["clicks"] = []
     else:
-        state.calib["hoop"] = None
-        state.calib["baseline_frame"] = None
-        state.calib["baseline_idx"] = -1
-        state.calib["clicks"] = []
+        # 跨会话复用标定：重启后 batch_calibs 清空，但该视频的历史记录里
+        # 存有 hoop + baseline_idx（上次批量识别时写入）→ 恢复并登记进
+        # batch_calibs（状态行显示「已标定」，且可直接跑批量识别无需重标）
+        rec = None
+        try:
+            rec = state.get_record(video_path)
+        except Exception:
+            rec = None
+        hoop = rec.get("hoop") if rec else None
+        if hoop and len(hoop) == 4:
+            hoop = tuple(int(v) for v in hoop)
+            base_idx = int(rec.get("baseline_idx", 0))
+            state.batch_calibs[video_path] = {"hoop": hoop, "baseline_idx": base_idx}
+            state.calib["hoop"] = hoop
+            base_frame = read_frame(video_path, base_idx, total=0, fps=0)
+            state.calib["baseline_frame"] = base_frame
+            state.calib["baseline_idx"] = base_idx if base_frame is not None else -1
+            state.calib["clicks"] = []
+            log.info(f"[CALIB] {os.path.basename(video_path)} 从历史记录恢复篮筐标定")
+        else:
+            state.calib["hoop"] = None
+            state.calib["baseline_frame"] = None
+            state.calib["baseline_idx"] = -1
+            state.calib["clicks"] = []
     try:
         info = get_video_info(video_path)
     except Exception as e:
@@ -1268,6 +1378,18 @@ def _on_batch_load_video_impl(selected, progress_callback):
         state.last_goals.extend(snap["goals"])
         state.last_goal_clips.extend([dict(c) for c in snap["clips"]])
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
+        # 人物分类回填：快照 clip 缺 person 时从历史 labels 补（快照在批量
+        # 检测刚完成时不含分类，历史里可能已有此前会话保存的分类）
+        try:
+            _persons = state.get_labels(video_path).get("persons") or {}
+            if _persons:
+                for c in state.last_goal_clips:
+                    if not c.get("person"):
+                        p = _persons.get(round(float(c["ts"]), 3))
+                        if p:
+                            c["person"] = p
+        except Exception:
+            pass
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
                   f"进球: {len(snap['goals'])} 个（含人工删减）\n"
@@ -1310,6 +1432,17 @@ def _on_batch_load_video_impl(selected, progress_callback):
         # 加载后全部进球默认保留（筛选结果不持久化）
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
 
+        # 人物分类回填（√/× 标记在该路径不恢复，人物分类与筛选正交，恢复无害）
+        try:
+            _persons = state.get_labels(video_path).get("persons") or {}
+            if _persons:
+                for c in state.last_goal_clips:
+                    p = _persons.get(round(float(c["ts"]), 3))
+                    if p:
+                        c["person"] = p
+        except Exception:
+            pass
+
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
                   f"进球: {len(all_goals)} 个\n"
@@ -1319,6 +1452,46 @@ def _on_batch_load_video_impl(selected, progress_callback):
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
     return preview, info_str, status
+
+
+def backfill_batch_calibs_from_history():
+    """从历史检测记录回填批量标定（跨会话复用篮筐标定）。
+
+    扫描文件夹时 batch_calibs 清空；若该文件夹此前跑过批量识别，历史记录里
+    已存每个视频的 hoop + baseline_idx，直接回填免去重新逐个标定。
+    本次会话已保存的标定优先（不被历史覆盖）；无记录/无 hoop 的视频跳过。
+    返回回填的视频数量。
+    """
+    if not state.batch_files:
+        return 0
+    try:
+        records = state.load_history()
+    except Exception as e:
+        log.warning(f"[CALIB] 历史标定回填失败: {e}")
+        return 0
+    by_path = {}
+    for r in records:
+        v = r.get("video")
+        if v and v not in by_path:
+            by_path[v] = r
+    n = 0
+    for vp in state.batch_files:
+        if vp in state.batch_calibs:
+            continue
+        r = by_path.get(vp)
+        if not r:
+            continue
+        hoop = r.get("hoop")
+        if not hoop or len(hoop) != 4:
+            continue
+        state.batch_calibs[vp] = {
+            "hoop": tuple(int(v) for v in hoop),
+            "baseline_idx": int(r.get("baseline_idx", 0)),
+        }
+        n += 1
+    if n:
+        log.info(f"[CALIB] 从历史记录回填 {n}/{len(state.batch_files)} 个视频的篮筐标定")
+    return n
 
 
 def on_batch_save_calib():

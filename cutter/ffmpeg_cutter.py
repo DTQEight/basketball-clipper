@@ -163,9 +163,10 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
     # 输出路径默认到 cache/demo_output/，文件名带源视频名避免覆盖
     if output_path is None:
         out_dir = os.path.join(_CACHE_ROOT, "demo_output")
-        os.makedirs(out_dir, exist_ok=True)
         _vname = os.path.splitext(os.path.basename(video_path))[0]
         output_path = os.path.join(out_dir, f"{_vname}-highlights.mp4")
+    # 显式传入的 output_path（如按人物导出）同样保证目录存在
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     try:
         # 检测编码器一次（名单 + 真实编码双探测），避免每个片段重复检测

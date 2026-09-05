@@ -177,6 +177,153 @@ class TestHistory:
         assert rec is not None
         assert rec["labels"]["kept"] == [10.2]             # 匹配 1/2 = 50%，保留匹配项
 
+    def test_person_labels_roundtrip(self, state_mod):
+        """人物分类：update_history_labels 增量写入 → get_labels 读回（含清除）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=None, deleted_ts_list=None,
+            person_map={10.0: "小明", 20.0: "小红"})
+        labels = state_mod.get_labels("/a.mp4")
+        assert labels["persons"] == {10.0: "小明", 20.0: "小红"}
+        # 清除一个人的分类，另一个人不受影响
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=None, deleted_ts_list=None,
+            person_map={10.0: ""})
+        labels = state_mod.get_labels("/a.mp4")
+        assert labels["persons"] == {20.0: "小红"}
+        # √/× 标记更新不清人物分类（person_map=None 路径）
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0], deleted_ts_list=None)
+        assert state_mod.get_labels("/a.mp4")["persons"] == {20.0: "小红"}
+
+    def test_persons_remap_on_redetect(self, state_mod):
+        """改参数重跑后人物分类随 kept/deleted 一起按 ±0.5s 容差重映射。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=None, deleted_ts_list=None,
+            person_map={10.0: "小明", 20.0: "小红"})
+        rec = state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.2, 20.3])
+        assert rec is not None
+        # 存盘键为 str(round(ts,3))，重映射后指向新 ts
+        assert rec["labels"]["persons"] == {"10.2": "小明", "20.3": "小红"}
+
+    def test_export_goals_person_filter(self):
+        """按人物导出：只导该人物片段，叠加 √/× 规则；无匹配返回空。"""
+        from services import detection
+        clips = [
+            {"ts": 1.0, "person": "A"},
+            {"ts": 2.0, "person": "B", "mark": "keep"},
+            {"ts": 3.0, "person": "A", "mark": "reject"},
+            {"ts": 4.0},                                   # 未分类
+        ]
+        # A 的池：ts1（无标记）+ ts3（×）→ × 排除，只导未标记的
+        assert detection._export_goals(clips, [1.0, 2.0, 3.0, 4.0], "A") == [1.0]
+        # B 的池有 √ → 只导 √
+        assert detection._export_goals(clips, [1.0, 2.0, 3.0, 4.0], "B") == [2.0]
+        # 无此人 → 空
+        assert detection._export_goals(clips, [1.0, 2.0], "C") == []
+        # 不筛人物 → 老规则：有 √ 只导 √
+        assert detection._export_goals(clips, [1.0, 2.0, 3.0, 4.0]) == [2.0]
+        # 仅已分类（哨兵）：任意已分类片段的池（A+B）→ 有 √ 只导 √
+        assert detection._export_goals(
+            clips, [1.0, 2.0, 3.0, 4.0],
+            detection.PERSON_FILTER_CLASSIFIED) == [2.0]
+        # 仅已分类、无任何标记 → 导出全部已分类的（未分类 ts4 不含）
+        clips2 = [{"ts": 1.0, "person": "A"}, {"ts": 2.0, "person": "B"}, {"ts": 4.0}]
+        assert detection._export_goals(
+            clips2, [1.0, 2.0, 4.0],
+            detection.PERSON_FILTER_CLASSIFIED) == [1.0, 2.0]
+        # 没有任何已分类片段 → 空
+        assert detection._export_goals(
+            [{"ts": 1.0}], [1.0], detection.PERSON_FILTER_CLASSIFIED) == []
+
+    def test_person_highlights_path_naming(self):
+        """按人物导出的文件名：{视频名}-{人物}-highlights.mp4，人名安全化。"""
+        from services import detection
+        # 正常人名：跟随人物命名
+        p = detection._person_highlights_path("/v/2026.09.04-2nd.mp4", "小明")
+        assert os.path.basename(p) == "2026.09.04-2nd-小明-highlights.mp4"
+        # Windows 非法字符剔除、首尾空白剥离
+        p = detection._person_highlights_path("/v/a.mp4", ' 小/明:*? ')
+        assert os.path.basename(p) == "a-小明-highlights.mp4"
+        # 全非法字符 → 回落 "person"
+        p = detection._person_highlights_path("/v/a.mp4", '\\/:*?"<>|')
+        assert os.path.basename(p) == "a-person-highlights.mp4"
+        # 超长人名截断到 30 字符
+        p = detection._person_highlights_path("/v/a.mp4", "很" * 50)
+        assert os.path.basename(p) == f"a-{'很' * 30}-highlights.mp4"
+        # 不同人物不互相覆盖
+        p1 = detection._person_highlights_path("/v/a.mp4", "小明")
+        p2 = detection._person_highlights_path("/v/a.mp4", "小红")
+        assert p1 != p2
+        # 哨兵「仅已分类」→ 文件名用 已分类（与全部/各人物导出互不覆盖）
+        p3 = detection._person_highlights_path("/v/a.mp4", detection.PERSON_FILTER_CLASSIFIED)
+        assert os.path.basename(p3) == "a-已分类-highlights.mp4"
+        assert p3 not in (p1, p2)
+
+
+    def test_get_record_single_video(self, state_mod):
+        """get_record：单视频历史记录直读（无记录返回 None）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0], baseline_idx=7)
+        r = state_mod.get_record("/a.mp4")
+        assert r is not None and r["video"] == "/a.mp4"
+        assert list(r["hoop"]) == [1, 2, 3, 4]
+        assert r["baseline_idx"] == 7
+        assert state_mod.get_record("/nope.mp4") is None
+
+    def test_backfill_batch_calibs_from_history(self, state_mod, monkeypatch):
+        """跨会话复用标定：扫描后 batch_calibs 从历史回填，会话内标定优先。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0], baseline_idx=7)
+        state_mod.add_history("/b.mp4", (5, 6, 7, 8), [2.0], baseline_idx=9)
+        state_mod.batch_files = ["/a.mp4", "/b.mp4", "/c.mp4"]  # /c 无历史记录
+        state_mod.batch_calibs = {}
+        n = detection.backfill_batch_calibs_from_history()
+        assert n == 2
+        assert state_mod.batch_calibs["/a.mp4"] == {"hoop": (1, 2, 3, 4), "baseline_idx": 7}
+        assert state_mod.batch_calibs["/b.mp4"] == {"hoop": (5, 6, 7, 8), "baseline_idx": 9}
+        assert "/c.mp4" not in state_mod.batch_calibs
+        # 本次会话已保存的标定不被历史覆盖
+        state_mod.batch_calibs["/a.mp4"] = {"hoop": (9, 9, 9, 9), "baseline_idx": 1}
+        assert detection.backfill_batch_calibs_from_history() == 0
+        assert state_mod.batch_calibs["/a.mp4"]["hoop"] == (9, 9, 9, 9)
+
+
+    def test_person_roster_cross_video(self, state_mod):
+        """全局人物名单：跨视频复用，登记/去重/最近使用优先/持久化。"""
+        # 空名单
+        assert state_mod.load_persons() == []
+        # 登记三个人物（视频 A 里用过）
+        assert state_mod.add_person("小明")
+        assert state_mod.add_person("小红")
+        assert state_mod.add_person("老王")
+        # 最近使用在前
+        assert state_mod.load_persons() == ["老王", "小红", "小明"]
+        # 重复登记 → 去重并提到队首
+        assert state_mod.add_person("小明")
+        assert state_mod.load_persons() == ["小明", "老王", "小红"]
+        # 空名/空白名不登记
+        assert not state_mod.add_person("")
+        assert not state_mod.add_person("   ")
+        assert state_mod.load_persons() == ["小明", "老王", "小红"]
+        # 持久化：模拟重启后重读（persons.json 在缓存根目录）
+        assert os.path.exists(os.path.join(state_mod.CACHE_ROOT, "persons.json"))
+
+    def test_set_person_registers_roster(self, state_mod, monkeypatch):
+        """set_person 动作自动登记进全局名单（跨视频复用的入口）。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0])
+        state_mod.last_goal_clips.extend(
+            [{"ts": 10.0, "path": "/c.mp4", "idx": 0}])
+        state_mod.video_state.update(path="/a.mp4")
+        detection.clip_action("set_person", 0, person="小明")
+        assert state_mod.load_persons() == ["小明"]
+        # 清除分类不登记空名
+        detection.clip_action("set_person", 0, person="")
+        assert state_mod.load_persons() == ["小明"]
+
 
 class TestClipCache:
     def test_key_order_insensitive(self, state_mod):

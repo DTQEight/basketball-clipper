@@ -42,6 +42,8 @@ HISTORY_FILE = os.path.join(CACHE_ROOT, "detection_history.json")
 CHECKPOINT_DIR = os.path.join(CACHE_ROOT, "checkpoints")
 # 预览片段缓存索引（持久化，重启后可复用上一次生成的片段）
 CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
+# 全局人物名单（跨视频复用）：人物分类时曾使用过的名字，最近使用在前
+PERSONS_FILE = os.path.join(CACHE_ROOT, "persons.json")
 
 DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
@@ -453,6 +455,60 @@ def _atomic_write_json(path, data, indent=None):
                 pass
 
 
+# ============ 全局人物名单（跨视频复用） ============
+
+def load_persons() -> list:
+    """读取全局人物名单（最近使用在前）。
+
+    文件不存在/损坏时返回 []（损坏只告警不清空，下 add_person 成功后自愈）。
+    """
+    try:
+        if os.path.exists(PERSONS_FILE):
+            with open(PERSONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(n) for n in data if n]
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 读取人物名单失败: {e}")
+    return []
+
+
+def add_person(name) -> bool:
+    """登记人物到全局名单（跨视频复用）。
+
+    已存在 → 提到队首（最近使用优先，对话框里排在前面）；
+    新人物 → 插入队首。空名/写入失败返回 False。
+    """
+    name = (str(name) or "").strip()
+    if not name:
+        return False
+    try:
+        persons = load_persons()
+        if name in persons:
+            persons.remove(name)
+        persons.insert(0, name)
+        _atomic_write_json(PERSONS_FILE, persons, indent=2)
+        return True
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 保存人物名单失败: {e}")
+        return False
+
+
+def get_record(video_path: str):
+    """读取单个视频的历史记录（只读该视频对应的 JSON 文件，比 load_history 轻）。
+
+    返回记录 dict / None（无记录或文件损坏）。
+    """
+    fpath = _history_file_for(video_path)
+    try:
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 读取 {video_path} 历史记录失败: {e}")
+    return None
+
+
 def load_history() -> list:
     """加载所有历史记录列表（按检测时间倒序）。
 
@@ -551,10 +607,12 @@ def _find_history_record(records, video_path):
     return None
 
 
-def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
+def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None):
     """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
 
     √ 确认 → kept_ts_list（正样本），× 误报 → deleted_ts_list（负样本）。
+    person_map: {进球ts: 人物名} 增量合并进 labels["persons"]；值为 "" 清除该 ts
+    的分类；None 表示本次不改人物分类。
     找不到对应记录时返回 False；写入磁盘成功返回 True。
     """
     try:
@@ -573,6 +631,17 @@ def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
         labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
     if deleted_ts_list is not None:
         labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+    if person_map is not None:
+        # JSON 对象键只能是字符串：存 str(round(ts,3))，读取方（get_labels）转回 float
+        persons = {str(k): v for k, v in (labels.get("persons") or {}).items()
+                   if v not in (None, "")}
+        for ts, name in person_map.items():
+            key = str(round(float(ts), 3))
+            if name:
+                persons[key] = str(name)
+            else:
+                persons.pop(key, None)
+        labels["persons"] = persons
     labels["label_time"] = now
     target["labels"] = labels
     # 保留记录的"检测时间"（time/timestamp）不动：旧实现覆盖成标记时间会让
@@ -584,7 +653,8 @@ def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
 def get_labels(video_path):
     """读取某视频的已保存标签。
 
-    返回 {"kept": list|None, "deleted": list|None, "label_time": str|None}。
+    返回 {"kept": list|None, "deleted": list|None, "label_time": str|None,
+          "persons": {float ts: 人物名}}。
     找不到记录 / 无标签时返回 None 字段。
 
     瞬态 IO 错误（Windows 文件共享冲突）时额外重试：load_history 内置 3 次
@@ -603,14 +673,22 @@ def get_labels(video_path):
     if records is None:
         logging.getLogger("state").warning(
             f"[WARN] get_labels 读取历史失败（{last_err}），本次不回填标记")
-        return {"kept": None, "deleted": None, "label_time": None}
+        return {"kept": None, "deleted": None, "label_time": None, "persons": {}}
     hit_idx = _find_history_record(records, video_path)
     if hit_idx is None:
-        return {"kept": None, "deleted": None, "label_time": None}
+        return {"kept": None, "deleted": None, "label_time": None, "persons": {}}
     lab = records[hit_idx].get("labels") or {}
+    # persons 键是 JSON 字符串（存盘时 str(round(ts,3))），转回 float 供精确匹配
+    persons = {}
+    for k, v in (lab.get("persons") or {}).items():
+        try:
+            persons[round(float(k), 3)] = str(v)
+        except (TypeError, ValueError):
+            continue
     return {"kept": list(lab["kept"]) if "kept" in lab else None,
             "deleted": list(lab["deleted"]) if "deleted" in lab else None,
-            "label_time": lab.get("label_time")}
+            "label_time": lab.get("label_time"),
+            "persons": persons}
 
 
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
@@ -685,14 +763,20 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
     """
     kept = [float(t) for t in (labels.get("kept") or [])]
     deleted = [float(t) for t in (labels.get("deleted") or [])]
-    total = len(set(kept) | set(deleted))
+    persons = {}
+    for k, v in (labels.get("persons") or {}).items():
+        try:
+            persons[round(float(k), 3)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    total = len(set(kept) | set(deleted)) + len(persons)
     if total == 0:
         # 没有任何时间戳标签（如只有 label_time）：原样保留
         return dict(labels), 0, 0
     goals = sorted(float(g) for g in new_goals)
     # 每个旧 ts 找最近的新球；按距离排序后贪心占位
     pairs = []
-    for ot in sorted(set(kept) | set(deleted)):
+    for ot in sorted(set(kept) | set(deleted) | set(persons)):
         best_g, best_d = None, None
         for g in goals:
             d = abs(g - ot)
@@ -711,6 +795,9 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
     new_labels = dict(labels)
     new_labels["kept"] = sorted(round(mapping[ot], 3) for ot in kept if ot in mapping)
     new_labels["deleted"] = sorted(round(mapping[ot], 3) for ot in deleted if ot in mapping)
+    # 人物分类同样重映射到新 ts（键统一转 str 与存盘格式一致）
+    new_labels["persons"] = {str(round(mapping[ot], 3)): name
+                             for ot, name in persons.items() if ot in mapping}
     return new_labels, len(mapping), total
 
 
