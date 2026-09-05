@@ -20,7 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from . import state
-
+from . import video_utils
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector
@@ -1191,9 +1191,18 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
             if state.hl_busy["on"]:
                 return None, "❌ 集锦正在生成中，请稍候"
             state.hl_busy["on"] = True
-        videos = sorted(v for v in state.batch_files if v)
+        # 视频集合：批量模式 = 扫描过的文件夹；
+        # 单视频模式（batch_files 空）= 回退到当前视频所在文件夹自动发现同场视频
+        # （单视频加载路径会清空 batch_files，用户没扫过文件夹也应能整场导出）
+        if state.batch_files:
+            videos = sorted(v for v in state.batch_files if v)
+        elif state.video_state.get("path"):
+            _folder = os.path.dirname(state.video_state["path"])
+            videos = video_utils.scan_video_files(_folder)
+        else:
+            videos = []
         if not videos:
-            return None, "❌ 请先扫描文件夹（整场导出需要批量视频列表）"
+            return None, "❌ 整场导出需要批量视频列表或已加载视频，请先扫描文件夹/加载视频"
         sources = []
         for v in videos:
             if v in state.batch_results:

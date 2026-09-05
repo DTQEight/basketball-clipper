@@ -1211,17 +1211,16 @@ def main_page():
         else:
             export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
         # 人物筛选下拉选项：'' = 全部 / 仅已分类（存在未分类片段时才有意义）/
-        # 各人物（带计数）/ 全局名单其他场次人物（无计数，供整场合并导出选择）
+        # 各人物（带计数）/ 全局名单其他场次人物（无计数，供整场合并导出选择——
+        # 单视频模式下同场其他节的人物也来自这里）
         try:
             _opts = {'': '全部人物'}
             if person_counts and n_person < len(clips):
                 _opts[detection.PERSON_FILTER_CLASSIFIED] = f'仅已分类（{n_person}）'
             _opts.update({p: f'{p}（{n}）' for p, n in sorted(person_counts.items())})
-            if state.batch_files:
-                # 批量模式下并入全局名单：整场导出可选其他场次的人物
-                for p in state.load_persons():
-                    if p and p not in _opts:
-                        _opts[p] = p
+            for p in state.load_persons():
+                if p and p not in _opts:
+                    _opts[p] = p
             _cur = hl_person_select.value
             if _cur not in _opts:
                 hl_person_select.set_value('')
@@ -1407,9 +1406,13 @@ def main_page():
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
     async def _on_fullgame_highlights():
-        """整场集锦：合并批量文件夹内全部视频（四节），按当前人物筛选导出。"""
-        if not state.batch_files:
-            _set_status('❌ 整场导出需要批量视频列表，请先扫描文件夹', 'err')
+        """整场集锦：合并同场全部视频（四节），按当前人物筛选导出。
+
+        批量模式 = 扫描过的文件夹；单视频模式 = 自动发现当前视频所在文件夹
+        的同场视频（detection.generate_highlights_fullgame 内回退）。
+        """
+        if not state.batch_files and not state.video_state.get("path"):
+            _set_status('❌ 整场导出需要视频：请先加载视频或扫描文件夹', 'err')
             return
         # 流水线分支：批量检测运行中（与单视频流水线集锦共用 hl_busy 小锁）
         if state.current_task() == 'batch':

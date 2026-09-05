@@ -315,6 +315,49 @@ class TestHistory:
         path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
         assert path is None and "扫描文件夹" in msg
 
+    def test_fullgame_fallback_single_video_folder(self, state_mod, monkeypatch, tmp_path):
+        """单视频模式回退：batch_files 空 + 已加载视频 → 扫描其所在文件夹。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        base = tmp_path / "2026.09.05"
+        base.mkdir()
+        v1 = str(base / "1st.mp4")
+        v2 = str(base / "2nd.mp4")
+        # 磁盘上要有真实文件（scan_video_files 按扩展名扫描目录）
+        for v in (v1, v2):
+            with open(v, "wb") as f:
+                f.write(b"x")
+        state_mod.add_history(v1, (1, 2, 3, 4), [10.0])
+        state_mod.update_history_labels(v1, None, None, person_map={10.0: "小明"})
+        state_mod.add_history(v2, (1, 2, 3, 4), [20.0])
+        state_mod.update_history_labels(v2, None, None, person_map={20.0: "小明"})
+        # 单视频模式：batch_files 为空，只加载了 v2
+        state_mod.batch_files = []
+        state_mod.video_state.update(path=v2)
+
+        captured = {}
+
+        def _fake_cut(sources, *args, **kw):
+            captured["sources"] = sources
+            captured["output"] = kw.get("output_path")
+            os.makedirs(os.path.dirname(kw["output_path"]), exist_ok=True)
+            with open(kw["output_path"], "w") as f:
+                f.write("x")
+            return kw.get("output_path")
+
+        monkeypatch.setattr(detection, "cut_clips", _fake_cut)
+        path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
+        assert path is not None
+        # 文件夹内两个视频都被发现（自然顺序 1st 在前），各自贡献 1 个片段
+        assert [os.path.basename(v) for v, _ in captured["sources"]] == ["1st.mp4", "2nd.mp4"]
+        assert captured["sources"][0][1] == [10.0]
+        assert captured["sources"][1][1] == [20.0]
+        assert os.path.basename(captured["output"]) == "2026.09.05-小明-highlights.mp4"
+        # batch_files 空 + 未加载视频 → 明确报错
+        state_mod.video_state.update(path=None)
+        path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
+        assert path is None and "加载视频" in msg
+
     def test_person_highlights_path_naming(self):
         """按人物导出的文件名：{视频名}-{人物}-highlights.mp4，人名安全化。"""
         from services import detection
