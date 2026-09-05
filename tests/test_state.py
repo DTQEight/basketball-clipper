@@ -614,6 +614,24 @@ class TestHistory:
 
 
 class TestMultiSourceCut:
+    def test_merge_segments_statistics(self):
+        """merge_segments 口径：相邻过近合并、跨源不合并、空输入；
+        导出消息/进度/实际剪切共用该函数保证段数一致。"""
+        from cutter.ffmpeg_cutter import merge_segments
+        # 单源：ts0/4/9/50，pre=post=5, min_gap=8 → [0,14] 与 [45,55] 两段
+        segs = merge_segments("/v.mp4", [0.0, 4.0, 9.0, 50.0], 5, 5, 8)
+        assert len(segs) == 2
+        assert segs[0][1:] == [0.0, 14.0] and segs[1][1:] == [45.0, 55.0]
+        # 多源：同源合并、跨源即使间隔极小也各成一段
+        m = merge_segments([("/a.mp4", [0.5, 2.0]), ("/b.mp4", [3.0])], None, 1, 1, 60)
+        assert len(m) == 2 and m[0][0] == "/a.mp4" and m[1][0] == "/b.mp4"
+        # 空时间戳 / 空列表
+        assert merge_segments("/v.mp4", [], 5, 5, 8) == []
+        assert merge_segments([], None, 5, 5, 8) == []
+        # 多源某源空 ts → 跳过该源
+        m = merge_segments([("/a.mp4", []), ("/b.mp4", [1.0])], None, 1, 1, 8)
+        assert len(m) == 1 and m[0][0] == "/b.mp4"
+
     def test_cut_clips_multi_video_concat(self, tmp_path):
         """多源切片端到端：两个视频的片段合并成一个集锦，按源顺序拼接。"""
         cv2 = pytest.importorskip("cv2")

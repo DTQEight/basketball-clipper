@@ -24,7 +24,7 @@ from . import video_utils
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector
-from cutter.ffmpeg_cutter import cut_clips, build_encode_args
+from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments
 
 log = logging.getLogger("detection")
 
@@ -1097,6 +1097,11 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
         _out_path = _person_highlights_path(src, person_filter) if person_filter else None
         # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
         _cancel = state.hl_cancel_event.is_set if _pipeline else state.cancel_event.is_set
+        # 实际剪切段数：相邻过近的进球按 min_gap 合并成一段（与 cut_clips 同算法），
+        # 界面/进度与结果消息统一展示"N 球 → M 段"，避免误以为漏切
+        _seg_n = len(merge_segments(src, goals,
+                                    pre_roll=int(pre_roll), post_roll=int(post_roll),
+                                    min_gap=int(min_gap)))
         out_path = cut_clips(src, goals,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
@@ -1104,8 +1109,13 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
                              cancel_check=_cancel,
                              output_path=_out_path)
         if out_path and os.path.exists(out_path):
-            return out_path, (f"集锦已生成{_filter_desc(person_filter)}"
-                              f"（{len(goals)} 个进球片段）\n输出: {out_path}")
+            _merged = len(goals) - _seg_n
+            _detail = f"（{len(goals)} 个进球 → {_seg_n} 段"
+            if _merged > 0:
+                _detail += f"，{_merged} 处相邻已合并）"
+            else:
+                _detail += "）"
+            return out_path, (f"集锦已生成{_filter_desc(person_filter)}{_detail}\n输出: {out_path}")
         if _cancel():
             return None, "已取消集锦生成"
         return None, "❌ 集锦生成失败"
@@ -1232,6 +1242,10 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
         # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
         _cancel = state.hl_cancel_event.is_set if _pipeline else state.cancel_event.is_set
         _n_goals = sum(len(t) for _, t in sources)
+        # 实际剪切段数：跨源各节独立按 min_gap 合并（与 cut_clips 同算法）
+        _seg_n = len(merge_segments(sources, None,
+                                    pre_roll=int(pre_roll), post_roll=int(post_roll),
+                                    min_gap=int(min_gap)))
         out_path = cut_clips(sources, None,
                              pre_roll=int(pre_roll), post_roll=int(post_roll),
                              min_gap=int(min_gap),
@@ -1239,8 +1253,13 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
                              cancel_check=_cancel,
                              output_path=_out_path)
         if out_path and os.path.exists(out_path):
-            return out_path, (f"整场集锦已生成{_filter_desc(person_filter)}"
-                              f"（{len(sources)} 个视频，{_n_goals} 个进球片段）\n"
+            _merged = _n_goals - _seg_n
+            _detail = f"（{len(sources)} 个视频 · {_n_goals} 个进球 → {_seg_n} 段"
+            if _merged > 0:
+                _detail += f"，{_merged} 处相邻已合并）"
+            else:
+                _detail += "）"
+            return out_path, (f"整场集锦已生成{_filter_desc(person_filter)}{_detail}\n"
                               f"输出: {out_path}")
         if _cancel():
             return None, "已取消集锦生成"

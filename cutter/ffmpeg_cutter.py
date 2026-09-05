@@ -112,6 +112,41 @@ def _cleanup_tmp(clip_files, list_path, tmp_dir=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def merge_segments(video_path, timestamps, pre_roll, post_roll, min_gap):
+    """把进球时刻按 min_gap 合并为实际剪切段 [(src, start, end)]。
+
+    video_path 为列表时视为多源 [(视频路径, [ts,...])] —— 整场四节导出，
+    各源独立合并相邻片段（不同视频时间轴不连续，禁止跨源合并），按列表
+    顺序输出；否则按单源处理（timestamps 列表，src 统一为 video_path）。
+    预览片段按进球逐个生成，导出却会合并相邻过近的进球，因此"进球数"
+    与"实际剪切段数"不同——本函数供剪辑器内部与集锦消息共用同一算法，
+    避免两处统计口径漂移。
+    """
+    multi = isinstance(video_path, list)
+    segments = []
+    if multi:
+        for src, ts_list in video_path:
+            if not ts_list:
+                continue
+            for ts in sorted(float(t) for t in ts_list):
+                start = max(0.0, ts - pre_roll)
+                end = ts + post_roll
+                if segments and segments[-1][0] == src \
+                        and start - segments[-1][2] < min_gap:
+                    segments[-1][2] = end
+                else:
+                    segments.append([src, start, end])
+    else:
+        for ts in sorted(float(t) for t in (timestamps or [])):
+            start = max(0.0, ts - pre_roll)
+            end = ts + post_roll
+            if segments and start - segments[-1][2] < min_gap:
+                segments[-1][2] = end
+            else:
+                segments.append([video_path, start, end])
+    return segments
+
+
 def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
               min_gap: int = 8, output_path=None, ffmpeg_path: str = "",
               progress_callback=None, cancel_check=None):
@@ -153,30 +188,12 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
 
     ffmpeg = ffmpeg_path or _DEFAULT_FFMPEG
 
-    # 合并过近的片段：segments = [src, start, end]（多源时 src 各段不同）
-    segments = []
-    if multi:
-        for src, ts_list in video_path:
-            if not ts_list:
-                continue
-            for ts in sorted(float(t) for t in ts_list):
-                start = max(0.0, ts - pre_roll)
-                end = ts + post_roll
-                if segments and segments[-1][0] == src \
-                        and start - segments[-1][2] < min_gap:
-                    segments[-1][2] = end
-                else:
-                    segments.append([src, start, end])
-    else:
-        for ts in sorted([float(t) for t in timestamps]):
-            start = max(0.0, ts - pre_roll)
-            end = ts + post_roll
-            if segments and start - segments[-1][2] < min_gap:
-                segments[-1][2] = end
-            else:
-                segments.append([video_path, start, end])
+    # 合并过近的片段（多源各源独立合并；与集锦消息共用 merge_segments 同一算法）
+    segments = merge_segments(video_path,
+                              timestamps if not multi else None,
+                              pre_roll, post_roll, min_gap)
     if not segments:
-        _log.info("没有可剪辑的片段（多源时间戳全空），跳过")
+        _log.info("没有可剪辑的片段（时间戳为空），跳过")
         return None
 
     # 临时目录：cache/clips 下每次运行独立子目录（tempfile.mkdtemp），
