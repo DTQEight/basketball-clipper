@@ -1,0 +1,214 @@
+================================================================
+代码审核报告 — 断点续识别 / 历史记录功能
+审核日期：2026-09-05
+审核范围：services/state.py、services/detection.py、tracker.py、demo_nicegui.py
+（最近新增功能：按视频分文件历史记录、无条数上限、断点续识别、标记保留）
+================================================================
+
+【高危】共 4 个
+----------------------------------------------------------------
+
+H1. 断点恢复后，恢复点之前的进球片段被静默丢弃
+    位置：services/detection.py:426-428（start 被覆盖）
+          services/detection.py:653-657（生成预览片段传参）
+          services/detection.py:206-209（_cut_one 边界钳制）
+    描述：恢复时 start = _cp_frame 直接覆盖了用户设定的原始起始帧，
+          且原始值之后不再保留。生成预览片段 _generate_preview_clips
+          用的是恢复后的 start，而 _cut_one 中：
+            seg_start = max(start, gframe - clip_half)
+            if seg_end <= seg_start: return None
+          - 恢复前已检测到的进球，若距恢复点超过 3 秒
+            （gframe + clip_half <= start），片段直接 return None
+            被静默丢弃——进球卡片无预览、集锦缺球
+          - 距恢复点 3 秒内的进球，片段左边界被截断到恢复点，时长不足
+          - 不完整的 clips 列表被 put_clip_cache 持久化，历史回读也缺
+    触发条件：断点前有进球且距恢复点 >3 秒（长视频断点续跑几乎必现）
+    建议修复：恢复前保存 _orig_start = start（line 426 之前），
+             _generate_preview_clips 调用处改传 _orig_start；
+             video_dur_min 等统计口径也应使用完整区间（同 L2）
+
+H2. 预热阶段取消 → 续跑时自适应阈值静默失效
+    位置：services/detection.py:351（if bool(auto_threshold) and not _resuming）
+          services/detection.py:415-424（恢复逻辑）
+    描述：若用户在预热 pass（前 30 秒，auto_threshold=True 默认开启）
+          进行中点取消：主循环第一帧即 break，取消路径会保存一个
+          current_frame ≈ start、_auto_threshold_value = None 的
+          checkpoint。
+          下次续跑时：not _resuming 为 False → 跳过预热 pass；
+          恢复逻辑中 _cp_auto_thr is None → _effective_diff_threshold
+          保持用户固定值。结果：整个视频用固定阈值跑完，而同参数
+          从头跑会完成预热并使用自适应阈值，二者结果不同，且 UI 上
+          自适应开关仍显示开启，用户完全无感知。
+    建议修复：恢复逻辑中判断 bool(auto_threshold) 且
+             _cp_det_state.get("_auto_threshold_value") is None 时，
+             视为无效断点（delete_checkpoint 后按非恢复路径从头跑，
+             重跑预热）；或取消时若预热未完成则不保存 checkpoint
+
+H3. 断点对话框可被点外关闭 → 检测按钮 handler 永久挂死
+    位置：demo_nicegui.py:948-959
+    描述：ui.dialog() 未设 persistent，用户点击遮罩/按 ESC 关闭后，
+          _resume_choice["val"] 永远是 None，
+          while _resume_choice["val"] is None: await asyncio.sleep(0.1)
+          无限轮询，检测按钮的 async handler 挂死直到刷新页面
+          （期间无法再启动任何检测）。
+    建议修复：对话框加 .props('persistent')；或给 dlg 绑定
+             on_hide 回调兜底置 _resume_choice["val"] = False
+
+H4. save_history 会误删"读取失败的历史文件"（数据丢失）
+    位置：services/state.py:533-541（删除不在列表中的旧文件）
+          services/state.py:495-501（load_history 跳过读取失败的文件）
+    描述：save_history 尾部的"删除不在列表中的旧文件"循环：
+          两个调用方（add_history / update_history_labels）都传全量
+          列表，该循环唯一实际触发场景就是 load_history 中 3 次重试
+          仍读取失败（Windows 文件共享冲突）被跳过的文件——
+          瞬态 IO 错误 → 记录被永久删除。
+          当前无任何功能需要这个删除逻辑（"移除历史记录"功能不存在）。
+    建议修复：直接删除该清理循环；或仅在显式调用
+             "删除某条历史" API 时按文件名精确删除
+
+【中危】共 4 个
+----------------------------------------------------------------
+
+M1. checkpoint off-by-one：恢复起始帧被重复 feed 一次
+    位置：services/detection.py:575-582（保存 fidx）
+          services/detection.py:425-428（恢复 start = _cp_frame）
+          services/state.py:291（docstring 语义自相矛盾）
+    描述：主循环中 detector.feed(...) 执行完毕后才在
+          processed % 300 == 0 时保存 current_frame = fidx，
+          即该帧已处理；而 iter_frames 是 [start, end) 半开区间且
+          包含 start。恢复时 start = _cp_frame → 保存时已 feed 的
+          那一帧会被再次 feed。取消路径（line 671）与异常路径
+          （line 846）保存的同样是已处理帧，同一语义。
+          同一帧二次进入状态机的系统性污染：
+          - blob_in_hoop_frames 对同一帧 +1 两次——若恢复点恰逢球进筐
+            第 1 帧，min_in_hoop_frames=2 的判定可被单帧误满足，
+            产生误报进球
+          - blob_history 追加两条相同 (frame_idx, cy)，
+            _check_downward_trend 的首尾位移检查失真
+          - blob_persistent_frames 多计 1
+    建议修复：保存时统一传 fidx + 1（三处保存点：line 581、671、848），
+             并将 save_checkpoint 的 docstring 改为"下一帧帧号"
+
+M2. 检测成功只删当前参数指纹的 checkpoint → 残留断点导致弹窗死循环
+    位置：services/detection.py:694（delete_checkpoint(video_path, _cp_params)）
+          demo_nicegui.py:922-962（弹窗逻辑）
+    描述：成功路径只删除与当前参数指纹匹配的一个文件。若用户曾用
+          参数 A 跑到一半取消（checkpoint A 残留），后改参数 B 完成
+          检测（checkpoint B 被删，A 仍在）：此后每次点"开始识别"，
+          has_checkpoint(vp) 恒为 True → 每次都弹"发现未完成检测"
+          对话框；弹窗展示的是参数 A 的断点（帧号/球数），用户点
+          "继续识别"，但 run_detect 内部按参数 B 指纹找不到匹配 →
+          实际从头跑，checkpoint A 继续残留，下次再弹。
+          UI 承诺与实际行为不一致 + 循环打扰。
+    建议修复：成功路径改为 state.delete_checkpoint(video_path)
+             （params=None，清掉该视频全部断点——检测已成功，
+             任何参数组合的旧断点均已无意义）
+
+M3. 重新检测无条件保留旧标记 + 进球时间戳偏移 → 集锦静默缩水
+    位置：services/state.py:693-698（add_history 保留 labels）
+          services/detection.py:1094-1109（加载历史时按 kept 匹配）
+    描述：add_history 中"保留旧记录人工标记"逻辑无条件保留 labels；
+          加载历史时只有 ts 匹配 kept 集合的进球才进
+          kept_goal_indices。改参数重跑后进球时间戳偏移
+          （±0.2s 以上），旧 labels 的 ts 不再匹配 → 时间戳偏移的
+          进球全部被排除出默认集锦，且未匹配的球不显示任何标记，
+          用户需手动逐个重新确认。
+    建议修复：保留 labels 时增加"时间戳近似匹配"容差
+             （如 ±0.5s 内算同球），或在新 goals 与旧 labels 的
+             匹配率过低（<50%）时丢弃旧 labels 并提示
+
+M4. 滚动基准帧候选状态未序列化 → 恢复后首次基准更新质量退化
+    位置：tracker.py:630-655（get_state 字段清单）
+          tracker.py:121-123（_baseline_candidate_* 定义）
+          tracker.py:425-447（消费逻辑）
+    描述：_baseline_candidate_frame / _baseline_candidate_diff /
+          _baseline_candidate_idx（过去 60 秒窗口内"运动量最小帧"
+          的候选）不在 get_state 导出，也不在 set_state 恢复。
+          恢复后候选被重置为 None/inf/-1，但 last_baseline_frame_idx
+          和 blob_persistent_frames 都被恢复了——触发时机不变，
+          候选池却从恢复点清零重积。
+          后果：恢复后第一次滚动更新只能从 [恢复点, 触发点] 的帧里
+          选基准；若恢复的 blob_persistent_frames 已超过 5 秒阈值
+          且首帧仍有 blob，persistent_trigger 当帧即触发，基准帧
+          直接取恢复后第一帧。若该时段篮下持续有球员，新基准帧含
+          球员 → 该区域 diff≈0 形成检测盲区（漏检），最长持续到
+          下一个 60s 窗口才自愈。
+    建议修复：get_state 序列化 _baseline_candidate_diff（float）和
+             _baseline_candidate_idx（int），
+             _baseline_candidate_frame 与 baseline_gray 同法
+             PNG+base64；set_state 对应恢复（候选帧解码失败时只恢复
+             标量并置候选为空）
+
+【低危】共 4 个
+----------------------------------------------------------------
+
+L1. iter_frames 零产出时取消路径引用未定义的 fidx → NameError
+    位置：services/detection.py:671
+    描述：取消路径在 if state.cancel_event.is_set() 分支里直接引用
+          fidx。若 [start, end) 区间无可解码帧（视频损坏/被替换）
+          导致 for 循环一次都没执行，fidx 未定义 → NameError →
+          落入外层 except（line 837），返回
+          "❌ 检测失败: name 'fidx' is not defined"，而非"已取消"。
+          异常路径（line 846）用 'fidx' in dir() 防了这一手，
+          取消路径没防。
+    建议修复：主循环前初始化 fidx = start
+
+L2. 恢复后统计口径只算剩余段 → 历史记录字段口径不一致
+    位置：services/detection.py:473-475
+    描述：恢复后 processed 从 0 重计、n_frames = end - start、
+          video_dur_min 只算剩余段，导致写入历史的
+          processed_frames / video_duration_sec / speed_vs_realtime /
+          proc_fps 是"剩余段口径"，与从头跑的同字段不可比。
+          功能不受影响，属数据口径问题。
+    建议修复：恢复时把原始 start 存入 _orig_start（与 H1 一并处理），
+             统计与历史写入用完整区间
+
+L3. tracker 序列化契约缺口：diff_threshold / _warmup_p95s 未保存
+    位置：tracker.py:406（预热完成时改写 self.diff_threshold）
+          tracker.py:630-655 / 663-703（均未处理该字段）
+    描述：自适应阈值完成时 diff_threshold 被改写（clamp [8,50]），
+          get_state/set_state 均不保存/恢复；_warmup_p95s 样本列表
+          同样未保存。
+          当前部署流不会触发（正式检测器以 auto_threshold=False
+          构建，diff_threshold 运行时不变；预热 pass 的
+          _warmup_detector 是局部对象从不 get_state），但单独使用
+          GoalDetector（auto_threshold=True 内部预热）+ 断点续跑的
+          场景会踩坑：恢复后 _find_moving_blob 用构造阈值、
+          has_motion_near_hoop 用恢复的自适应阈值，两条阈值路径分裂。
+    建议修复：get_state 增加
+              "diff_threshold": int(self.diff_threshold) 和
+              "_warmup_p95s": list(self._warmup_p95s)，
+              set_state 在键存在时恢复
+
+L4. update_history_labels 把记录的"检测时间"改成"标记时间"
+    位置：services/state.py:588-589
+    描述：打标记时 target["time"] = now / target["timestamp"] =
+          time.time()，把"最近检测时间"覆盖为"最近标记时间"。
+          历史列表按此排序：刚标记过的旧记录会浮到顶部，用户看到的
+          "检测时间"实际是标记时间，语义混淆。
+    建议修复：标记时保留原 time/timestamp 不动（排序上浮仍可通过
+             save_history 的列表顺序实现，或单独加 labeled_at 字段）
+
+================================================================
+确认无问题的审查项
+----------------------------------------------------------------
+- baseline_gray 的 PNG 编解码（imencode/imdecode，shape/dtype 由
+  文件头决定，无手动 reshape 错误）
+- blob_history / ball_pos_history 的 JSON tuple→list 兼容
+  （全部消费点只做索引和解包，无 dict key / == tuple 比较）
+- diag 计数器的导出/恢复完整性（16 键全量）
+- 批量检测的 checkpoint 隔离（每视频独立文件）与锁释放顺序
+  （run_detect(task_token=0) 时 _release_lock 为 no-op，
+  锁由 run_batch_detect 的 finally 统一释放，无竞态）
+- params 指纹的类型稳定性（UI slider 类型稳定，list/tuple 统一转
+  tuple，int/float 已归一化）
+- add_history 调用字段与 _HISTORY_FIELD_CASTS 表逐字段匹配
+- 历史记录排序 bug（str/float 混排 TypeError）已在前次修复
+- add_history 覆盖时保留 labels（保留逻辑本身正确，M3 是其副作用）
+
+================================================================
+修复优先级建议
+----------------------------------------------------------------
+第一批（用户可直接踩到）：H1 H2 H3 H4 M1 M2 M3
+第二批（质量/口径/前瞻性）：M4 L1 L2 L3 L4
+================================================================

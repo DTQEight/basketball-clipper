@@ -21,6 +21,7 @@
 """
 import os
 import sys
+import asyncio
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -288,6 +289,10 @@ def main_page():
                     # 开始识别
                     detect_btn = ui.button('开始识别', on_click=lambda: _on_detect()).classes(
                         'w-full font-bold text-sm').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
+
+                    # 断点续识别提示（有未完成检测时显示）
+                    resume_hint = ui.label('').classes('text-xs text-center w-full').style('color: var(--accent)')
+                    resume_hint.visible = False
 
                     # 文件夹批量模式面板（加载文件夹后显示）
                     batch_panel = ui.column().classes('w-full gap-1 hidden')
@@ -630,6 +635,18 @@ def main_page():
             _refresh_result_cards()
         info_text.set_text(info)
         calib_status.set_text('拖动滑块选择帧，点击画面 2 个点标定篮筐' if frame is not None else info)
+        # 更新断点续识别提示
+        if frame is not None and state.video_state["path"]:
+            _cp = state.load_checkpoint(state.video_state["path"])
+            if _cp is not None:
+                _cf = _cp.get("current_frame", 0)
+                _ng = len(_cp.get("detector_state", {}).get("goals", []))
+                resume_hint.set_text(f"💡 发现未完成检测（帧 {_cf}，{_ng} 球），点击识别可从断点继续")
+                resume_hint.visible = True
+            else:
+                resume_hint.visible = False
+        else:
+            resume_hint.visible = False
 
     def _refresh_batch_list():
         """刷新批量下拉框：三态标记（☑已完成n球 / ✓已标定 / ○未标定），保留当前选中。"""
@@ -737,6 +754,18 @@ def main_page():
             calib_status.set_text(status)
             # 刷新结果卡片（已检测过的视频会显示进球列表）
             _refresh_result_cards()
+            # 更新断点续识别提示
+            if frame is not None and state.video_state["path"]:
+                _cp = state.load_checkpoint(state.video_state["path"])
+                if _cp is not None:
+                    _cf = _cp.get("current_frame", 0)
+                    _ng = len(_cp.get("detector_state", {}).get("goals", []))
+                    resume_hint.set_text(f"💡 发现未完成检测（帧 {_cf}，{_ng} 球），点击识别可从断点继续")
+                    resume_hint.visible = True
+                else:
+                    resume_hint.visible = False
+            else:
+                resume_hint.visible = False
         finally:
             # 锁已下沉到 on_batch_load_video 内部 finally（锁归任务本体）：
             # 未命中片段缓存时后台会跑 ffmpeg 数十秒，页面刷新取消 UI 协程后
@@ -889,6 +918,60 @@ def main_page():
             detect_btn.set_text('正在取消...')
             detect_btn.disable()
             return
+
+        # ===== 断点续识别：检查是否有未完成的检测 =====
+        vp = state.video_state["path"]
+        if vp and state.has_checkpoint(vp):
+            cp = state.load_checkpoint(vp)  # params=None 取最新
+            if cp is not None:
+                cf = cp.get("current_frame", 0)
+                goals = cp.get("detector_state", {}).get("goals", [])
+                saved_at = cp.get("saved_at", "")
+                msg = (f"发现未完成检测\n"
+                       f"  已处理到帧 {cf}\n"
+                       f"  已检测 {len(goals)} 个进球\n"
+                       f"  保存于 {saved_at}\n\n"
+                       f"是否从断点继续？\n"
+                       f"（点「取消」将丢弃断点并从头开始）")
+                # NiceGUI 对话框
+                from nicegui import ui
+                _resume_choice = {"val": None}
+
+                async def _on_yes():
+                    _resume_choice["val"] = True
+                    dlg.close()
+
+                async def _on_no():
+                    _resume_choice["val"] = False
+                    dlg.close()
+
+                with ui.dialog() as dlg, ui.card().classes('p-4 gap-3'):
+                    ui.label('断点续识别').classes('text-lg font-bold')
+                    ui.label(msg).classes('text-sm whitespace-pre-line')
+                    with ui.row().classes('w-full justify-end gap-2'):
+                        ui.button('从头开始', on_click=_on_no).props('ripple').style(
+                            'background: var(--bg-elevated); color: var(--text-secondary)')
+                        ui.button('继续识别', on_click=_on_yes).props('ripple').style(
+                            'background: var(--accent); color: var(--bg-canvas)')
+                # persistent：禁止点遮罩/ESC 关闭。对话框被外因关闭后无人写
+                # _resume_choice，下方 while 轮询会把检测按钮的 async handler
+                # 永久挂死（期间无法再启动任何检测，直到刷新页面）
+                dlg.props('persistent')
+
+                def _on_dlg_hide():
+                    # 兜底：对话框以任何其他方式关闭且未做选择时按"从头开始"处理，
+                    # 保证 while 轮询必然退出
+                    if _resume_choice["val"] is None:
+                        _resume_choice["val"] = False
+                dlg.on_hide(_on_dlg_hide)
+                dlg.open()
+                # 等待用户选择
+                while _resume_choice["val"] is None:
+                    await asyncio.sleep(0.1)
+                if not _resume_choice["val"]:
+                    # 用户选择从头开始：删除该视频所有 checkpoint
+                    state.delete_checkpoint(vp)
+
         token = _try_acquire('detect')
         if not token:
             return

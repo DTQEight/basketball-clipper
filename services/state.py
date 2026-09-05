@@ -4,7 +4,9 @@
 访问/修改状态，避免全局变量散落各处。
 """
 import os
+import re
 import json
+import hashlib
 import shutil
 import time
 import threading
@@ -32,16 +34,20 @@ os.environ["TMPDIR"] = _tmp_root
 os.environ["TEMP"] = _tmp_root
 os.environ["TMP"] = _tmp_root
 
-# 历史记录文件
+# 历史记录目录：每个视频一个独立 JSON 文件（<safe_basename>__<md5_8>.json）
+HISTORY_DIR = os.path.join(CACHE_ROOT, "history")
+# 旧版单文件历史记录路径（迁移用）
 HISTORY_FILE = os.path.join(CACHE_ROOT, "detection_history.json")
+# 断点续识别目录：每个视频+参数组合一个 checkpoint 文件
+CHECKPOINT_DIR = os.path.join(CACHE_ROOT, "checkpoints")
 # 预览片段缓存索引（持久化，重启后可复用上一次生成的片段）
 CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
 
 DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
 
-# 历史记录上限（防止 detection_history.json 无限增长）
-MAX_HISTORY_RECORDS = 50
+# 历史记录不再设上限：每个视频独立文件，互不影响
+MAX_HISTORY_RECORDS = None
 
 # 预览片段缓存最大条目数（超出按插入顺序驱逐最旧）
 CLIP_CACHE_MAX_ENTRIES = 20
@@ -213,6 +219,210 @@ nvenc_semaphore = threading.Semaphore(2)
 
 
 # ============ 历史记录 ============
+def _safe_filename_component(name: str) -> str:
+    """将文件名中的路径不安全字符替换为下划线。"""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+
+
+def _history_file_for(video_path: str) -> str:
+    """根据视频路径生成独立历史记录文件路径。
+
+    格式: <safe_basename>__<md5_8>.json
+    - safe_basename: 视频文件名（不安全字符替换为下划线）
+    - md5_8: 视频完整路径的 MD5 前 8 位（区分不同目录下同名视频）
+    """
+    base = os.path.basename(video_path) or "unknown"
+    safe = _safe_filename_component(base)
+    h = hashlib.md5(video_path.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(HISTORY_DIR, f"{safe}__{h}.json")
+
+
+# ============ 断点续识别 ============
+# 影响检测结果的关键参数（用于 checkpoint 指纹，参数变化则 checkpoint 失效）
+_CHECKPOINT_PARAM_KEYS = (
+    "hoop", "baseline_idx", "fps",
+    "start_frame", "end_frame",
+    "ball_conf", "min_gap_sec", "diff_threshold",
+    "min_circularity", "min_in_hoop_frames", "min_blob_area", "search_margin",
+    "auto_threshold", "yolo_step", "skip_yolo_no_motion",
+)
+
+
+def _checkpoint_params_fingerprint(params: dict) -> str:
+    """计算检测参数的指纹（用于隔离不同参数下的 checkpoint）。
+
+    只纳入影响检测结果的关键参数；UI 展示性参数不计入。
+    """
+    items = []
+    for k in _CHECKPOINT_PARAM_KEYS:
+        v = params.get(k)
+        if isinstance(v, (list, tuple)):
+            v = tuple(v)  # list 不可 hash，转 tuple
+        items.append((k, v))
+    raw = repr(items)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _checkpoint_file_for(video_path: str, params: dict = None) -> str:
+    """根据视频路径 + 参数指纹生成 checkpoint 文件路径。
+
+    格式: <safe_basename>__<video_md5_8>__<params_fp_12>.json
+    - video_md5_8: 区分不同目录下同名视频
+    - params_fp_12: 区分不同检测参数（参数变化则 checkpoint 失效）
+    """
+    base = os.path.basename(video_path) or "unknown"
+    safe = _safe_filename_component(base)
+    vh = hashlib.md5(video_path.encode("utf-8")).hexdigest()[:8]
+    if params:
+        ph = _checkpoint_params_fingerprint(params)
+    else:
+        ph = "any"
+    return os.path.join(CHECKPOINT_DIR, f"{safe}__{vh}__{ph}.json")
+
+
+def save_checkpoint(video_path: str, params: dict, current_frame: int,
+                    detector_state: dict, extra: dict = None) -> bool:
+    """保存断点续识别 checkpoint。
+
+    Args:
+        video_path: 视频完整路径
+        params: 检测参数字典（用于指纹 + 记录）
+        current_frame: 下一帧帧号（= 已处理完的最后一帧 + 1，恢复时从此帧继续）
+        detector_state: GoalDetector.get_state() 的返回值
+        extra: 附加信息（如统计计数器、开始时间等）
+    Returns:
+        True 保存成功，False 失败（不抛出异常，避免打断检测）
+    """
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        data = {
+            "video_path": video_path,
+            "params": params,
+            "current_frame": int(current_frame),
+            "detector_state": detector_state,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "saved_ts": time.time(),
+        }
+        if extra:
+            data["extra"] = extra
+        path = _checkpoint_file_for(video_path, params)
+        _atomic_write_json(path, data, indent=None)
+        return True
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] checkpoint 保存失败: {e}")
+        return False
+
+
+def load_checkpoint(video_path: str, params: dict = None) -> dict | None:
+    """加载断点续识别 checkpoint。
+
+    - params 非空: 只加载参数指纹匹配的 checkpoint（参数变化则视为无断点）
+    - params 为空: 加载该视频最新的 checkpoint（用于 UI 提示"是否继续"）
+
+    Returns:
+        checkpoint 字典或 None
+    """
+    try:
+        if not os.path.isdir(CHECKPOINT_DIR):
+            return None
+        if params is not None:
+            path = _checkpoint_file_for(video_path, params)
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        # params=None: 找该视频所有 checkpoint，返回最新的
+        vh = hashlib.md5(video_path.encode("utf-8")).hexdigest()[:8]
+        best = None
+        best_ts = 0
+        for fname in os.listdir(CHECKPOINT_DIR):
+            if not fname.endswith(".json"):
+                continue
+            # 文件名格式: <safe>__<vh>__<ph>.json
+            parts = fname.rsplit("__", 2)
+            if len(parts) == 3 and parts[1] == vh:
+                fpath = os.path.join(CHECKPOINT_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        cp = json.load(f)
+                    ts = cp.get("saved_ts", 0)
+                    if ts > best_ts:
+                        best_ts = ts
+                        best = cp
+                except Exception:
+                    continue
+        return best
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] checkpoint 加载失败: {e}")
+        return None
+
+
+def delete_checkpoint(video_path: str, params: dict = None) -> None:
+    """删除 checkpoint。
+
+    - params 非空: 删除参数指纹匹配的 checkpoint
+    - params 为空: 删除该视频所有 checkpoint（检测成功后清理）
+    """
+    try:
+        if not os.path.isdir(CHECKPOINT_DIR):
+            return
+        if params is not None:
+            path = _checkpoint_file_for(video_path, params)
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        vh = hashlib.md5(video_path.encode("utf-8")).hexdigest()[:8]
+        for fname in os.listdir(CHECKPOINT_DIR):
+            if not fname.endswith(".json"):
+                continue
+            parts = fname.rsplit("__", 2)
+            if len(parts) == 3 and parts[1] == vh:
+                try:
+                    os.remove(os.path.join(CHECKPOINT_DIR, fname))
+                except OSError:
+                    pass
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] checkpoint 删除失败: {e}")
+
+
+def has_checkpoint(video_path: str) -> bool:
+    """检查某视频是否存在任何 checkpoint（用于 UI 提示）。"""
+    if not os.path.isdir(CHECKPOINT_DIR):
+        return False
+    vh = hashlib.md5(video_path.encode("utf-8")).hexdigest()[:8]
+    for fname in os.listdir(CHECKPOINT_DIR):
+        if not fname.endswith(".json"):
+            continue
+        parts = fname.rsplit("__", 2)
+        if len(parts) == 3 and parts[1] == vh:
+            return True
+    return False
+
+
+def _migrate_old_history() -> None:
+    """若存在旧版单文件 detection_history.json，拆分为按视频存储的独立文件。
+
+    迁移成功后将旧文件重命名为 .migrated-<时间戳>.bak（不直接删除，便于回滚）。
+    """
+    if not os.path.exists(HISTORY_FILE):
+        return
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        for r in records:
+            video = r.get("video")
+            if not video:
+                continue
+            _atomic_write_json(_history_file_for(video), r, indent=2)
+        bak = f"{HISTORY_FILE}.migrated-{time.strftime('%Y%m%d%H%M%S')}.bak"
+        os.replace(HISTORY_FILE, bak)
+        logging.getLogger("state").info(
+            f"[MIGRATE] 旧历史记录已拆分为按视频存储（{len(records)} 条），原文件备份为 {bak}")
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 历史记录迁移失败: {e}")
+
+
 def _atomic_write_json(path, data, indent=None):
     """原子写 JSON：先写临时文件再 os.replace，失败清理残留临时文件。
 
@@ -244,55 +454,81 @@ def _atomic_write_json(path, data, indent=None):
 
 
 def load_history() -> list:
-    """加载历史记录列表。
+    """加载所有历史记录列表（按检测时间倒序）。
 
-    - JSON 解析失败（真实损坏）：先改名备份为 .corrupt-<时间戳>.bak 再返回空列表，
-      避免下一次 add_history 用空列表覆盖写丢失全部历史。
-    - IO 异常（如 Windows 共享冲突，文件恰好被写入方替换中）：短重试后抛出 OSError，
-      **不动原文件** —— 旧实现把这类瞬态错误也当损坏改名，完好的历史会被误"清空"。
-      调用方需捕获 OSError（add_history 内部已处理：读取失败时放弃写入，不覆盖）。
+    每个视频独立存储为 cache/history/<name>__<hash>.json。
+    损坏的单个文件会被备份为 .corrupt-<时间戳>.bak，不影响其他视频的记录。
     """
-    if not os.path.exists(HISTORY_FILE):
+    _migrate_old_history()
+    if not os.path.isdir(HISTORY_DIR):
         return []
-    last_err = None
-    for attempt in range(3):
+    records = []
+    for fname in os.listdir(HISTORY_DIR):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(HISTORY_DIR, fname)
+        last_err = None
+        for attempt in range(3):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    r = json.load(f)
+                records.append(r)
+                break
+            except json.JSONDecodeError as e:
+                bak = f"{fpath}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+                try:
+                    os.replace(fpath, bak)
+                except OSError:
+                    pass
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录 {fname} 解析失败（{e}），已备份到 {bak}")
+                break
+            except UnicodeDecodeError as e:
+                bak = f"{fpath}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
+                try:
+                    os.replace(fpath, bak)
+                except OSError:
+                    pass
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史记录 {fname} 编码错误（{e}），已备份到 {bak}")
+                break
+            except OSError as e:
+                last_err = e
+                time.sleep(0.05 * (attempt + 1))
+        else:
+            # 三次 IO 重试都失败：跳过该文件，不影响其他记录
+            logging.getLogger("state").warning(
+                f"[WARN] 历史记录 {fname} 读取失败（{last_err}），已跳过")
+    # 按检测时间倒序：优先用高精度 timestamp（旧记录无此字段则从 time 字符串解析，解析失败用 0）
+    def _sort_key(r):
+        ts = r.get("timestamp")
+        if ts is not None:
+            return float(ts)
+        # 旧记录只有 time 字符串，解析为时间戳用于排序
+        tstr = r.get("time", "")
         try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
-            try:
-                os.replace(HISTORY_FILE, bak)
-                logging.getLogger("state").warning(
-                    f"[WARN] 历史记录解析失败（{e}），原文件已备份到 {bak}，将以空记录重新开始")
-            except OSError:
-                logging.getLogger("state").warning(
-                    f"[WARN] 历史记录解析失败（{e}），且备份失败: {bak}")
-            return []
-        except UnicodeDecodeError as e:
-            # 文件被外部工具以 GBK/ANSI 保存等编码错误：同样按损坏备份处理
-            # （ValueError 子类，不并入 OSError 分支会被 add_history 漏接，
-            #  把检测成功的结果整体报成失败）
-            bak = f"{HISTORY_FILE}.corrupt-{time.strftime('%Y%m%d%H%M%S')}.bak"
-            try:
-                os.replace(HISTORY_FILE, bak)
-                logging.getLogger("state").warning(
-                    f"[WARN] 历史记录编码错误（{e}），原文件已备份到 {bak}，将以空记录重新开始")
-            except OSError:
-                logging.getLogger("state").warning(
-                    f"[WARN] 历史记录编码错误（{e}），且备份失败: {bak}")
-            return []
-        except OSError as e:
-            last_err = e
-            time.sleep(0.05 * (attempt + 1))
-    raise last_err
+            return time.mktime(time.strptime(tstr, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return 0.0
+    records.sort(key=_sort_key, reverse=True)
+    return records
 
 
 def save_history(records) -> bool:
-    """保存历史记录到磁盘（原子写）。返回是否成功。"""
+    """保存历史记录：每条记录写入对应视频的独立文件。返回是否成功。
+
+    注意：不做"删除列表外旧文件"的清理——当前没有任何移除历史记录的功能，
+    该清理唯一实际触发的场景是 load_history 因瞬态 IO 错误（Windows 文件
+    共享冲突）3 次重试仍失败而跳过了某个文件，此时清理会把这条记录
+    永久删除（数据丢失）。跳过的文件保留在磁盘上，下次自然恢复。
+    """
     try:
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        _atomic_write_json(HISTORY_FILE, records, indent=2)
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        for r in records:
+            video = r.get("video")
+            if not video:
+                continue
+            _atomic_write_json(_history_file_for(video), r, indent=2)
         return True
     except Exception as e:
         logging.getLogger("state").warning(f"[WARN] 保存历史记录失败: {e}")
@@ -323,7 +559,9 @@ def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
     """
     try:
         records = load_history()
-    except OSError:
+    except Exception as e:
+        logging.getLogger("state").warning(
+            f"[WARN] update_history_labels 读取历史失败，标记未保存: {e}")
         return False
     hit_idx = _find_history_record(records, video_path)
     if hit_idx is None:
@@ -337,10 +575,10 @@ def update_history_labels(video_path, kept_ts_list, deleted_ts_list):
         labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
     labels["label_time"] = now
     target["labels"] = labels
-    target["time"] = now
-    # 上浮到顶部（最近更新优先），保持其他条目顺序
-    final = [target] + records[:hit_idx] + records[hit_idx + 1:]
-    return save_history(final)
+    # 保留记录的"检测时间"（time/timestamp）不动：旧实现覆盖成标记时间会让
+    # 历史列表按标记时间排序/显示（刚标记的旧记录浮到顶部），"检测时间"
+    # 字段语义混淆。标记时间已单独记录在 labels.label_time
+    return save_history(records)
 
 
 def get_labels(video_path):
@@ -425,6 +663,57 @@ _HISTORY_FIELD_CASTS = {
 }
 
 
+# 标签时间戳重匹配容差（秒）：改参数重跑后进球时间戳整体小幅偏移，
+# ±容差内的旧标签 ts 视为同一球
+_LABEL_REMAP_TOL_SEC = 0.5
+# 旧标签与新进球的匹配率低于该值时，判定两次检测结果差异过大，丢弃旧标签
+_LABEL_MIN_MATCH_RATE = 0.5
+
+
+def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
+    """把旧人工标签的时间戳近似匹配到新一次检测的进球时间戳。
+
+    重新检测（尤其改参数）后进球时间戳会整体偏移（±0.2s 以上），直接沿用
+    旧 ts 会在加载历史时精确匹配失败 → 时间戳偏移的进球全部被排除出默认
+    集锦且不显示任何标记，用户需手动逐个重新确认。±tol 内的旧 ts 重映射
+    为新 ts（贪心最近邻：距离近的旧 ts 优先占用新球，避免远者抢占）。
+
+    Returns:
+        (remapped_labels, matched, total)：
+        - remapped_labels: kept/deleted 已换成新 ts 的 labels（原样保留其他键）
+        - matched/total: 匹配到新进球的旧标签数 / 旧标签总数（调用方按匹配率决策）
+    """
+    kept = [float(t) for t in (labels.get("kept") or [])]
+    deleted = [float(t) for t in (labels.get("deleted") or [])]
+    total = len(set(kept) | set(deleted))
+    if total == 0:
+        # 没有任何时间戳标签（如只有 label_time）：原样保留
+        return dict(labels), 0, 0
+    goals = sorted(float(g) for g in new_goals)
+    # 每个旧 ts 找最近的新球；按距离排序后贪心占位
+    pairs = []
+    for ot in sorted(set(kept) | set(deleted)):
+        best_g, best_d = None, None
+        for g in goals:
+            d = abs(g - ot)
+            if best_d is None or d < best_d:
+                best_g, best_d = g, d
+        if best_g is not None and best_d <= _LABEL_REMAP_TOL_SEC:
+            pairs.append((best_d, ot, best_g))
+    pairs.sort()
+    used = set()
+    mapping = {}
+    for _, ot, g in pairs:
+        if g in used:
+            continue
+        used.add(g)
+        mapping[ot] = g
+    new_labels = dict(labels)
+    new_labels["kept"] = sorted(round(mapping[ot], 3) for ot in kept if ot in mapping)
+    new_labels["deleted"] = sorted(round(mapping[ot], 3) for ot in deleted if ot in mapping)
+    return new_labels, len(mapping), total
+
+
 def add_history(video_path, hoop, goals, baseline_idx=-1,
                 diff_threshold=None, **fields):
     """添加一条历史记录（同视频会覆盖旧记录）。
@@ -437,10 +726,19 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         raise TypeError(f"add_history 收到未知字段: {sorted(unknown)}")
     try:
         records = load_history()
-    except OSError as e:
+    except Exception as e:
         logging.getLogger("state").warning(
             f"[WARN] 历史记录读取失败，本次结果未写入（避免空列表覆盖旧数据）: {e}")
         return None
+    # 保留旧记录的人工标记（kept/deleted）：重新检测不应丢失已做的标记。
+    # 但旧 ts 必须先按容差重映射到本次检测的进球时间戳——改参数重跑后进球
+    # 时间戳会偏移，直接沿用旧 ts 会导致加载历史时精确匹配失败，被标记过的
+    # 球掉出默认集锦；匹配率过低说明两次检测结果差异过大，旧标签已无意义。
+    old_labels = None
+    for r in records:
+        if r.get("video") == video_path and r.get("labels"):
+            old_labels = r.get("labels")
+            break
     records = [r for r in records if r.get("video") != video_path]
     rec = {
         "video": video_path,
@@ -450,7 +748,20 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
         "goals": [float(t) for t in goals],
         "total": len(goals),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": time.time(),
     }
+    if old_labels is not None:
+        remapped, matched, total = _remap_labels_to_goals(old_labels, goals)
+        if total == 0 or matched >= total * _LABEL_MIN_MATCH_RATE:
+            rec["labels"] = remapped
+            if 0 < matched < total:
+                logging.getLogger("state").warning(
+                    f"[WARN] 历史标记部分未匹配上新进球（{matched}/{total}），"
+                    f"未匹配的标记已丢弃: {video_path}")
+        else:
+            logging.getLogger("state").warning(
+                f"[WARN] 历史标记与新检测结果匹配率过低（{matched}/{total}），"
+                f"已丢弃旧标记: {video_path}")
     if diff_threshold is not None:
         rec["diff_threshold"] = diff_threshold  # 可能为 int 或 str 'auto'
     for name, value in fields.items():
@@ -462,7 +773,7 @@ def add_history(video_path, hoop, goals, baseline_idx=-1,
             value = round(value, ndigits)
         rec[name] = value
     records.insert(0, rec)
-    records = records[:MAX_HISTORY_RECORDS]
+    # 不再限制历史记录条数：每个视频独立文件，互不影响
     if not save_history(records):
         return None
     return rec

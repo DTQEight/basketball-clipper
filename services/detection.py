@@ -306,6 +306,20 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _release_lock()
         return "❌ 结束帧必须大于起始帧", False
 
+    # ===== 断点续识别辅助量（必须在恢复逻辑改写 start 之前确定）=====
+    # _orig_start: 完整检测区间的原始起始帧。断点恢复会把 start 改写为断点帧，
+    #   但预览片段边界（恢复点之前的进球也要有片段）和统计口径
+    #   （video_duration_sec / processed_frames 等）都必须用完整区间，不能被恢复点截断
+    # _resume_frame: 下一帧待处理帧号。feed 完一帧后更新为 fidx+1，
+    #   三处 checkpoint 保存点统一存它：存"已 feed 的帧号"会导致恢复时该帧被
+    #   二次 feed（blob_in_hoop_frames 同帧 +2 等状态机污染）
+    # _prev_elapsed: 断点之前的累计检测耗时（秒），恢复后 proc_fps /
+    #   speed_vs_realtime / elapsed_sec 用全程口径，与从头跑可比
+    _orig_start = start
+    _resume_frame = start
+    _prev_elapsed = 0.0
+    processed = 0
+
     # ===== 入口一次性快照本次检测的全部输入（P1） =====
     # 旧实现生命周期内 4 次读取 state.video_state["path"]（预热 reader / 正式 reader /
     # 预览片段 / 写历史），批量检测运行数十分钟，期间 UI 切换视频会改写全局 path，
@@ -315,6 +329,31 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     baseline_idx = state.calib["baseline_idx"]
     video_width = state.video_state.get("width")
     video_height = state.video_state.get("height")
+
+    # ===== 断点续识别：构建参数指纹 + 检查已有 checkpoint =====
+    _cp_params = {
+        "hoop": hoop, "baseline_idx": baseline_idx, "fps": fps,
+        "start_frame": start, "end_frame": end,
+        "ball_conf": ball_conf, "min_gap_sec": min_gap_sec,
+        "diff_threshold": int(diff_threshold),
+        "min_circularity": float(min_circularity),
+        "min_in_hoop_frames": int(min_in_hoop_frames),
+        "min_blob_area": int(min_blob_area), "search_margin": int(search_margin),
+        "auto_threshold": bool(auto_threshold),
+        "yolo_step": int(yolo_step), "skip_yolo_no_motion": bool(skip_yolo_no_motion),
+    }
+    _checkpoint = state.load_checkpoint(video_path, _cp_params)
+    _resuming = _checkpoint is not None
+    # H2: 预热未完成的断点视为无效。自适应阈值开启但断点里没有算出的阈值
+    # （典型：预热阶段点取消 → 主循环第一帧即 break，保存了 current_frame≈start、
+    # _auto_threshold_value=None 的空断点）。若照常续跑：预热 pass 被跳过、
+    # 恢复逻辑又拿不到自适应阈值 → 整个视频静默退化成固定阈值，与同参数
+    # 从头跑结果不一致且 UI 上自适应开关仍显示开启。删除断点按从头跑（重跑预热）。
+    if _resuming and bool(auto_threshold) \
+            and _checkpoint.get("detector_state", {}).get("_auto_threshold_value") is None:
+        state.delete_checkpoint(video_path, _cp_params)
+        _checkpoint = None
+        _resuming = False
 
     _report(5, '初始化检测器...')
     try:
@@ -333,7 +372,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # ============================================================
         _warmup_info = None   # 保存预热阶段诊断（auto_threshold_value / median / samples）
         _effective_diff_threshold = int(diff_threshold)
-        if bool(auto_threshold):
+        if bool(auto_threshold) and not _resuming:
             _report(6, '预热：收集前30s帧噪声水平...')
             _warmup_detector = GoalDetector(
                 hoop, baseline_frame=baseline_frame,
@@ -396,6 +435,31 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 }
             del _warmup_detector
 
+        # ===== 断点续识别：从 checkpoint 恢复阈值/预热信息 =====
+        if _resuming:
+            _cp_det_state = _checkpoint.get("detector_state", {})
+            _cp_auto_thr = _cp_det_state.get("_auto_threshold_value")
+            if _cp_auto_thr is not None:
+                _effective_diff_threshold = int(_cp_auto_thr)
+            _warmup_info = {
+                "auto_threshold_value": _cp_det_state.get("_auto_threshold_value"),
+                "warmup_p95_median": _cp_det_state.get("_warmup_p95_median"),
+                "warmup_sample_count": _cp_det_state.get("_warmup_sample_count", 0),
+            }
+            # 起始帧 = checkpoint 的下一帧帧号（从该帧继续，不重复 feed 已处理帧）；
+            # 原始起始帧保留在 _orig_start：预览片段边界与统计口径仍用完整区间
+            _cp_frame = int(_checkpoint.get("current_frame", start))
+            if _cp_frame > start:
+                start = _cp_frame
+            _resume_frame = start
+            # 断点前的累计检测耗时（checkpoint extra.elapsed）：
+            # 恢复后的 proc_fps / speed_vs_realtime / elapsed_sec 用全程口径
+            try:
+                _prev_elapsed = float((_checkpoint.get("extra") or {}).get("elapsed") or 0.0)
+            except (TypeError, ValueError):
+                _prev_elapsed = 0.0
+            log.info(f"[RESUME] 从断点恢复: 帧 {start}, 已检测进球 {len(_cp_det_state.get('goals', []))} 个")
+
         # 步骤B：正式检测器。
         # - auto_threshold=False：使用预热得到的 _effective_diff_threshold 作为固定阈值
         # - 从 start 帧完整检测，前30s不会再跳过进球
@@ -418,6 +482,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             detector._warmup_sample_count = _warmup_info["warmup_sample_count"]
             detector.auto_threshold = bool(auto_threshold)   # 保留用户原始意图用于诊断显示/历史写入
 
+        # ===== 断点续识别：恢复检测器状态机（goals/帧号/斑块状态/基准帧等）=====
+        if _resuming:
+            detector.set_state(_cp_det_state)
+
         _report(10, '加载 YOLO 模型...')
         model, _weights_path = get_ball_model()
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
@@ -434,16 +502,19 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         t0 = time.time()
         t0_str = time.strftime('%H:%M:%S', time.localtime(t0))
-        processed = 0
+        # 统计口径：n_frames 为本次运行待处理帧数（ETA/瞬时速率）；
+        # _total_frames 为完整区间帧数（进度/历史记录），断点续跑与从头跑可比
         n_frames = end - start
-        video_dur_min = n_frames / max(fps, 1) / 60.0
+        _done_before = start - _orig_start      # 断点前已处理帧数（从头跑为 0）
+        _total_frames = end - _orig_start       # 完整区间帧数（进度/历史统计口径）
+        video_dur_min = _total_frames / max(fps, 1) / 60.0
 
         # ============ DEBUG: 开始信息 ============
         log.info("\n" + "=" * 68)
         log.info(f"[DETECT START] {t0_str}")
         log.info(f"  Video       : {video_path}")
         log.info(f"  Resolution  : {video_width}x{video_height}  @ {fps:.1f} fps")
-        log.info(f"  Frames      : {start}-{end-1}  ({n_frames} total, {video_dur_min:.1f} min)")
+        log.info(f"  Frames      : {_orig_start}-{end-1}  ({_total_frames} total, {video_dur_min:.1f} min)")
         if bool(auto_threshold):
             # 如实区分预热成功 / 预热失败回退，避免 ABORT 后仍显示"已预热"误导排查
             _warmup_ok = (_warmup_info is not None
@@ -539,9 +610,24 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 detector.feed(ball_pos, fidx, fps, frame=frame,
                               ball_frame=ball_frame, frame_roi=_pending_roi)
                 processed += 1
+                # 该帧已完整 feed：恢复点 = 下一帧（存 fidx 会让恢复时重复 feed 此帧）
+                _resume_frame = fidx + 1
+                # ===== 断点续识别：每 300 帧保存一次 checkpoint =====
+                # 存 _resume_frame（下一帧帧号，而非 processed 计数）
+                if processed % 300 == 0:
+                    state.save_checkpoint(
+                        video_path, _cp_params, _resume_frame,
+                        detector.get_state(),
+                        extra={
+                            "processed": processed,
+                            "yolo_called": _stat_yolo_called,
+                            "yolo_skipped": _stat_yolo_skipped,
+                            "yolo_failed": _stat_yolo_failed,
+                            "elapsed": _prev_elapsed + (time.time() - t0),
+                        })
                 # 每 10 帧更新一次进度
                 if processed % 10 == 0:
-                    pct = 15 + 60 * processed / n_frames
+                    pct = 15 + 60 * (_done_before + processed) / _total_frames
                     if need_yolo:
                         phase = '检测'
                     elif _yolo_skipped:
@@ -551,8 +637,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                     # 预计剩余时间：按当前处理速率线性外推（跳过/跳帧比例稳定时准确）
                     _eta_min = ((n_frames - processed) / max(processed, 1)
                                 * max(time.time() - t0, 0.001)) / 60.0
-                    _report(pct, f'{phase}帧 {processed}/{n_frames} '
-                                 f'({processed*100//n_frames}%) | 预计剩余 {_eta_min:.1f} 分钟')
+                    _report(pct, f'{phase}帧 {_done_before + processed}/{_total_frames} '
+                                 f'({(_done_before + processed) * 100 // _total_frames}%) | '
+                                 f'预计剩余 {_eta_min:.1f} 分钟')
                 # 定期释放 CUDA 缓存：每 500 帧一次（100 帧太频繁，empty_cache 本身会同步阻塞）
                 if processed % 500 == 0:
                     try:
@@ -603,7 +690,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         _stamp = int(time.time())
         state.last_goal_clips.extend(
-            _generate_preview_clips(video_path, goals, start, end,
+            # 片段边界用完整区间 _orig_start（而非恢复后的 start）：
+            # 恢复点之前检测到的进球若距恢复点超过 3 秒，片段会被
+            # _cut_one 的边界钳制直接丢弃（进球卡片无预览、集锦缺球）
+            _generate_preview_clips(video_path, goals, _orig_start, end,
                                     fps, total, _stamp, progress_callback=_report,
                                     cancel_check=state.cancel_event.is_set)
         )
@@ -619,6 +709,24 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
+            # ===== 断点续识别：取消时保存最终 checkpoint（用户可从此处继续）=====
+            # 仅在本次确有帧已 feed（processed > 0）时保存：预热阶段取消
+            # （主循环第一帧即 break）或视频无可解码帧时没有可恢复的进度，
+            # 保存"空断点"只会让下次启动弹出无意义的续跑提示、且续跑后
+            # 拿不到自适应阈值（H2）
+            if processed > 0:
+                state.save_checkpoint(
+                    video_path, _cp_params, _resume_frame,
+                    detector.get_state(),
+                    extra={
+                        "processed": processed,
+                        "yolo_called": _stat_yolo_called,
+                        "yolo_skipped": _stat_yolo_skipped,
+                        "yolo_failed": _stat_yolo_failed,
+                        "elapsed": _prev_elapsed + _detect_elapsed,
+                    })
+                log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出（可断点续跑）")
+                return f"已取消 | 已处理 {processed} 帧（可断点续跑）", False
             log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出")
             return f"已取消 | 已处理 {processed} 帧", False
 
@@ -632,6 +740,11 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _missing_previews = len(goals) - len(state.last_goal_clips)
 
         _report(100, '完成！')
+        # ===== 断点续识别：检测成功，清理该视频全部 checkpoint =====
+        # 不只删当前参数指纹的一个：残留其他参数的旧断点会让"发现未完成检测"
+        # 弹窗每次必现，且用户点"继续"后因指纹不匹配实际从头跑（UI 承诺与
+        # 行为不一致）。检测已成功，任何参数组合的旧断点都已无意义
+        state.delete_checkpoint(video_path)
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
         state.last_goals.clear()
         state.last_goals.extend(detector.goals)
@@ -641,17 +754,19 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         confirm_rate = d['yolo_confirmed'] / max(total_yolo, 1) * 100
 
         _t2 = time.time()
-        _total_elapsed = _t2 - t0
+        # 全程口径：断点续跑时叠加断点前累计耗时，与从头跑同字段可比（L2）
+        _total_elapsed = _prev_elapsed + (_t2 - t0)
         _preview_elapsed = _t2 - _t1
-        _proc_fps = processed / max(_detect_elapsed, 0.001)
+        _detect_total = _prev_elapsed + _detect_elapsed
+        _proc_fps = (_done_before + processed) / max(_detect_total, 0.001)
         _end_str = time.strftime('%H:%M:%S', time.localtime(_t2))
 
         # ============ DEBUG: 结束统计 ============
         log.info("")
         log.info("=" * 68)
         log.info(f"[DETECT  END] {_end_str}")
-        log.info(f"  Timing      : detect {_detect_elapsed/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
-        log.info(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_elapsed/60:.1f} min = {video_dur_min/max(_detect_elapsed/60,0.001):.2f}x vs realtime)")
+        log.info(f"  Timing      : detect {_detect_total/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
+        log.info(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_total/60:.1f} min = {video_dur_min/max(_detect_total/60,0.001):.2f}x vs realtime)")
         log.info(f"  Goals       : {len(goals)} detected")
         if goals:
             _timestamps_str = ", ".join(f"{g:.1f}s" for g in goals[:8]) + ("..." if len(goals) > 8 else "")
@@ -723,8 +838,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # YOLO 确认/否决统计
         _total_yolo_path = d['yolo_confirmed'] + d['yolo_rejected']
         _confirm_rate_pct = d['yolo_confirmed'] / max(_total_yolo_path, 1) * 100
-        # 速度 vs 实时倍数
-        _speed_vs_realtime = video_dur_min / max(_detect_elapsed / 60.0, 0.001)
+        # 速度 vs 实时倍数（全程口径：视频时长与检测耗时都含断点前部分）
+        _speed_vs_realtime = video_dur_min / max(_detect_total / 60.0, 0.001)
 
         _saved_record = state.add_history(video_path, hoop, detector.goals,
                           baseline_idx=baseline_idx,
@@ -749,8 +864,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           video_height=video_height,
                           video_total_frames=total,
                           video_duration_sec=video_dur_min * 60.0,
-                          # ===== 处理速度指标 =====
-                          processed_frames=processed,
+                          # ===== 处理速度指标（全程口径，断点续跑与从头跑可比）=====
+                          processed_frames=_done_before + processed,
                           proc_fps=_proc_fps,
                           speed_vs_realtime=_speed_vs_realtime,
                           # ===== YOLO 跳过统计 =====
@@ -781,6 +896,19 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         state.last_goal_clips.clear()
         state.kept_goal_indices.clear()
         state.last_goals.clear()
+        # ===== 断点续识别：异常时尽量保存 checkpoint（若已进入主循环）=====
+        # processed 提前初始化为 0：异常发生在主循环前（模型加载/构建检测器）
+        # 时 processed == 0，不保存无进度的空断点；_resume_frame 同理已初始化，
+        # 此处不会再因 fidx 未定义抛 NameError（旧实现的 'fidx' in dir() 防了一半）
+        try:
+            if 'detector' in dir() and processed > 0:
+                state.save_checkpoint(
+                    video_path, _cp_params, _resume_frame,
+                    detector.get_state(),
+                    extra={"processed": processed,
+                           "elapsed": _prev_elapsed + (time.time() - t0)})
+        except Exception:
+            pass
         return f"❌ 检测失败: {e}\n{traceback.format_exc()}", False
     finally:
         # 锁归任务本体：无论成功/失败/取消，线程真正结束时才释放。

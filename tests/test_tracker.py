@@ -345,6 +345,104 @@ class TestDequeHistory:
         assert det.ball_pos_history[0][0] >= cutoff
 
 
+class TestStateSerialization:
+    """断点续识别状态序列化回归（M4/L3 防护）。"""
+
+    def test_state_roundtrip_core_fields(self):
+        """get_state → 新检测器 set_state：进球/轨迹/冷却/诊断计数完整恢复。"""
+        det = _detector()
+        _feed_seq(det, [40, 40, 100, 100])                   # 进球 @ idx 3
+        _feed_seq(det, [140, 140], start_idx=5)              # 补充轨迹历史
+        state = det.get_state()
+
+        det2 = _detector()                                   # 同参数重建
+        det2.set_state(state)
+        assert det2.goals == det.goals
+        assert det2.last_goal_frame == det.last_goal_frame   # 冷却状态恢复
+        assert list(det2.blob_history) == list(det.blob_history)
+        assert det2.diag == det.diag
+        # 恢复后继续喂帧：冷却期内（idx=6 与 idx=3 差 0.1s）不重复进球
+        g = det2.feed(_ball_pos(100), 6, FPS, frame=_frame_with_ball(100))
+        assert g is None and len(det2.goals) == 1
+
+    def test_state_preserves_adaptive_threshold(self):
+        """L3: 预热完成改写的 diff_threshold 必须随状态保存/恢复。
+
+        旧实现不序列化 diff_threshold → 恢复后回落到构造值（如 15），
+        与断点前已生效的自适应值（如 18）分裂，前后半段灵敏度不一致。
+        """
+        det = _detector(auto_threshold=True, diff_threshold=15)
+        noisy = np.full((240, 320, 3), 110, dtype=np.uint8)
+        for i in range(int(WARMUP_TARGET_SEC * FPS) + 2):
+            det.feed(None, i, FPS, frame=noisy)
+        assert det._warmup_done and det.diff_threshold == 18
+
+        state = det.get_state()
+        assert state["diff_threshold"] == 18
+        det2 = _detector(auto_threshold=True, diff_threshold=15)
+        det2.set_state(state)
+        assert det2.diff_threshold == 18                      # 不回落到 15
+        assert det2._warmup_done                              # 不重新预热
+
+    def test_state_preserves_warmup_samples_mid_warmup(self):
+        """L3: 预热中途断点 → 样本列表恢复后继续累计，而非从恢复点重新收集。
+
+        旧实现不序列化 _warmup_p95s：前 15 秒样本丢失，恢复后再收集 30 秒
+        才完成预热，且阈值只基于后半段样本（分布不均时阈值偏差）。
+        """
+        det = _detector(auto_threshold=True, diff_threshold=15)
+        noisy = np.full((240, 320, 3), 110, dtype=np.uint8)
+        half = int(WARMUP_TARGET_SEC * FPS) // 2
+        for i in range(half):
+            det.feed(None, i, FPS, frame=noisy)
+        assert not det._warmup_done
+
+        state = det.get_state()
+        assert len(state["_warmup_p95s"]) == half
+        det2 = _detector(auto_threshold=True, diff_threshold=15)
+        det2.set_state(state)
+        assert len(det2._warmup_p95s) == half                 # 样本已恢复
+        # 继续喂后半段 → 预热基于完整 30s 样本完成，阈值 = median(10)+8 = 18
+        for i in range(half, int(WARMUP_TARGET_SEC * FPS) + 2):
+            det2.feed(None, i, FPS, frame=noisy)
+        assert det2._warmup_done
+        assert det2._auto_threshold_value == 18
+        assert det2._warmup_sample_count == int(WARMUP_TARGET_SEC * FPS)
+
+    def test_state_preserves_baseline_candidate(self):
+        """M4: 滚动基准帧候选（帧/最小diff/帧号）必须随状态保存/恢复。
+
+        旧实现不序列化候选 → 恢复后候选池清零重积，若恢复点篮下有
+        球员常驻触发基准更新，只能取恢复后第一帧当基准 → 检测盲区。
+        """
+        det = _detector(rolling_baseline_sec=60.0)
+        det.feed(_ball_pos(100), 0, FPS, frame=_frame_with_ball(100))
+        assert det._baseline_candidate_frame is not None      # 候选已积累
+        assert det._baseline_candidate_diff == pytest.approx(det.last_diff_ratio)
+        assert det._baseline_candidate_diff > 0
+        assert det._baseline_candidate_idx == 0
+
+        state = det.get_state()
+        assert state["_baseline_candidate_frame_b64"] is not None
+        det2 = _detector(rolling_baseline_sec=60.0)
+        det2.set_state(state)
+        assert det2._baseline_candidate_frame is not None
+        assert det2._baseline_candidate_frame.shape == det._baseline_candidate_frame.shape
+        assert det2._baseline_candidate_diff == pytest.approx(det._baseline_candidate_diff)
+        assert det2._baseline_candidate_idx == 0
+
+    def test_state_inf_candidate_diff_roundtrips_to_none(self):
+        """候选 diff 为 inf（无候选）时序列化为 None，恢复回 inf 而非崩溃。"""
+        det = _detector(rolling_baseline_sec=60.0)
+        state = det.get_state()
+        assert state["_baseline_candidate_frame_b64"] is None
+        assert state["_baseline_candidate_diff"] is None
+        det2 = _detector(rolling_baseline_sec=60.0)
+        det2.set_state(state)
+        assert det2._baseline_candidate_diff == float("inf")
+        assert det2._baseline_candidate_idx == -1
+
+
 class TestEndToEndVideo:
     """合成小视频 → VideoReader 解码 → GoalDetector 检测的集成回归。
 

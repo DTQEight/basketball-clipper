@@ -18,6 +18,7 @@
 import cv2
 import numpy as np
 from collections import deque
+import base64
 
 # 自适应阈值预热时长（秒）：前 N 秒逐帧收集 diff P95 统计量
 WARMUP_TARGET_SEC = 30.0
@@ -617,3 +618,129 @@ class GoalDetector:
             for (_, bx, by) in self.ball_pos_history
         )
         return has_ball, "confirmed" if has_ball else "rejected"
+
+    # ============ 断点续识别：状态序列化 ============
+
+    def get_state(self) -> dict:
+        """导出检测器动态状态（用于断点续识别）。
+
+        仅保存运行时会变化的状态；构造参数（hoop 等）由 run_detect 用相同
+        参数重建检测器后传入 set_state 恢复。例外：diff_threshold 在自适应
+        预热完成时会被改写，必须随之保存（否则恢复后两条阈值路径分裂）。
+        """
+        state = {
+            # ---- 进球状态机 ----
+            "goals": list(self.goals),
+            "last_goal_frame": self.last_goal_frame,
+            "blob_above_hoop": self.blob_above_hoop,
+            "blob_in_hoop": self.blob_in_hoop,
+            "blob_in_hoop_frames": self.blob_in_hoop_frames,
+            "blob_persistent_frames": self.blob_persistent_frames,
+            "blob_history": list(self.blob_history),       # deque → list
+            "last_blob_box": list(self.last_blob_box) if self.last_blob_box is not None else None,
+            "last_above_frame": self.last_above_frame,
+            "last_in_hoop_frame": self.last_in_hoop_frame,
+            "last_diff_ratio": self.last_diff_ratio,
+            # ---- YOLO 球位置历史 ----
+            "ball_pos_history": list(self.ball_pos_history),  # deque → list
+            # ---- 基准帧（滚动基准帧可能已偏离初始标定帧，必须保存）----
+            "baseline_gray_b64": None,
+            "last_baseline_frame_idx": self.last_baseline_frame_idx,
+            # ---- 滚动基准帧候选（60s 窗口内运动量最小帧）----
+            # 候选不序列化的话，恢复后候选池从恢复点清零重积：恢复的
+            # blob_persistent_frames 已超 5s 阈值时首次触发只能取恢复后第一帧
+            # 当基准，若该帧篮下有球员 → 该区域 diff≈0 形成检测盲区（漏检）
+            "_baseline_candidate_frame_b64": None,
+            "_baseline_candidate_diff": (None if self._baseline_candidate_diff == float("inf")
+                                         else self._baseline_candidate_diff),
+            "_baseline_candidate_idx": self._baseline_candidate_idx,
+            # ---- 自适应阈值 / 预热 ----
+            "_warmup_done": self._warmup_done,
+            "_auto_threshold_value": self._auto_threshold_value,
+            "_warmup_p95_median": self._warmup_p95_median,
+            "_warmup_sample_count": self._warmup_sample_count,
+            # diff_threshold：预热完成时被改写为 clamp 后的自适应值，必须保存；
+            # _warmup_p95s：预热中途断点续跑需要样本列表继续累计（半开区间未
+            # 完成预热的场景，恢复后不重新收集导致阈值计算偏差）
+            "diff_threshold": int(self.diff_threshold),
+            "_warmup_p95s": list(self._warmup_p95s),
+            # ---- 诊断计数器 ----
+            "diag": dict(self.diag),
+        }
+        if self.baseline_gray is not None:
+            # ROI 灰度图 ~40KB，PNG 编码后更小；base64 便于 JSON 存储
+            ok, buf = cv2.imencode(".png", self.baseline_gray)
+            if ok:
+                state["baseline_gray_b64"] = base64.b64encode(buf.tobytes()).decode("ascii")
+        if self._baseline_candidate_frame is not None:
+            ok, buf = cv2.imencode(".png", self._baseline_candidate_frame)
+            if ok:
+                state["_baseline_candidate_frame_b64"] = base64.b64encode(buf.tobytes()).decode("ascii")
+        return state
+
+    def set_state(self, state: dict) -> None:
+        """从 get_state() 导出的字典恢复检测器动态状态。"""
+        if not state:
+            return
+        # ---- 进球状态机 ----
+        self.goals = list(state.get("goals", []))
+        self.last_goal_frame = int(state.get("last_goal_frame", -1))
+        self.blob_above_hoop = bool(state.get("blob_above_hoop", False))
+        self.blob_in_hoop = bool(state.get("blob_in_hoop", False))
+        self.blob_in_hoop_frames = int(state.get("blob_in_hoop_frames", 0))
+        self.blob_persistent_frames = int(state.get("blob_persistent_frames", 0))
+        bh = state.get("blob_history", [])
+        self.blob_history = deque(bh, maxlen=30) if bh else deque(maxlen=30)
+        lbb = state.get("last_blob_box")
+        self.last_blob_box = tuple(lbb) if lbb is not None else None
+        self.last_above_frame = int(state.get("last_above_frame", -999))
+        self.last_in_hoop_frame = int(state.get("last_in_hoop_frame", -999))
+        self.last_diff_ratio = float(state.get("last_diff_ratio", 0.0))
+        # ---- YOLO 球位置历史 ----
+        bph = state.get("ball_pos_history", [])
+        self.ball_pos_history = deque(bph) if bph else deque()
+        # ---- 基准帧 ----
+        b64 = state.get("baseline_gray_b64")
+        if b64:
+            try:
+                raw = base64.b64decode(b64)
+                arr = np.frombuffer(raw, dtype=np.uint8)
+                self.baseline_gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                self.baseline_gray = None  # 解码失败：由 feed 首帧重建
+        self.last_baseline_frame_idx = int(state.get("last_baseline_frame_idx", -1))
+        # ---- 滚动基准帧候选 ----
+        cand_b64 = state.get("_baseline_candidate_frame_b64")
+        if cand_b64:
+            try:
+                raw = base64.b64decode(cand_b64)
+                arr = np.frombuffer(raw, dtype=np.uint8)
+                cand = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+                if cand is None:
+                    raise ValueError("candidate frame decode failed")
+                self._baseline_candidate_frame = cand
+            except Exception:
+                # 候选帧解码失败：只恢复标量，候选置空
+                # （下次触发基准更新时回退用当帧，候选重新累积）
+                self._baseline_candidate_frame = None
+        else:
+            self._baseline_candidate_frame = None
+        cand_diff = state.get("_baseline_candidate_diff")
+        self._baseline_candidate_diff = float(cand_diff) if cand_diff is not None else float("inf")
+        self._baseline_candidate_idx = int(state.get("_baseline_candidate_idx", -1))
+        # ---- 自适应阈值 / 预热 ----
+        self._warmup_done = bool(state.get("_warmup_done", not self.auto_threshold))
+        self._auto_threshold_value = state.get("_auto_threshold_value")
+        self._warmup_p95_median = state.get("_warmup_p95_median")
+        self._warmup_sample_count = int(state.get("_warmup_sample_count", 0))
+        # ---- 阈值 / 预热样本（旧格式断点无这些键时保持构造值，向后兼容）----
+        if "diff_threshold" in state:
+            self.diff_threshold = int(state["diff_threshold"])
+        _p95s = state.get("_warmup_p95s")
+        if _p95s is not None:
+            self._warmup_p95s = [float(v) for v in _p95s]
+        # ---- 诊断计数器 ----
+        saved_diag = state.get("diag", {})
+        for k in self.diag:
+            if k in saved_diag:
+                self.diag[k] = int(saved_diag[k])
