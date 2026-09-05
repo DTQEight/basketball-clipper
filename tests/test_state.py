@@ -207,6 +207,24 @@ class TestHistory:
         # 存盘键为 str(round(ts,3))，重映射后指向新 ts
         assert rec["labels"]["persons"] == {"10.2": "小明", "20.3": "小红"}
 
+    def test_remap_total_dedup_overlapping_keep_person(self, state_mod):
+        """回归：同一进球同时 √ + 人物分类时，total 按去重 ts 计，
+        单个进球消失（真实匹配率 75%）不应整体丢弃其余标签。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0, 30.0, 40.0])
+        state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0, 20.0, 30.0, 40.0], deleted_ts_list=None,
+            person_map={10.0: "智", 20.0: "智", 30.0: "浩", 40.0: "浩"})
+        # 重跑后 40.0 那个进球消失（改参数/阈值），其余 3 球时间戳轻微偏移
+        rec = state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.05, 20.1, 30.2])
+        assert rec is not None and "labels" in rec
+        assert len(rec["labels"]["kept"]) == 3
+        assert rec["labels"]["persons"] == {"10.05": "智", "20.1": "智", "30.2": "浩"}
+        # 直接单测 _remap：旧实现 kept(4)+persons(4)=8 → 3/8 误丢；
+        # 去重后 3/4=75% 通过阈值
+        old = {"kept": [1.0, 2.0, 3.0], "persons": {"1.0": "A", "2.0": "B", "3.0": "C"}}
+        _l, matched, total = state_mod._remap_labels_to_goals(old, [1.0, 2.0])
+        assert total == 3 and matched == 2
+
     def test_export_goals_person_filter(self):
         """按人物导出：只导该人物片段，叠加 √/× 规则；无匹配返回空。"""
         from services import detection
@@ -357,6 +375,50 @@ class TestHistory:
         state_mod.video_state.update(path=None)
         path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
         assert path is None and "加载视频" in msg
+
+    def test_fullgame_history_beats_stale_snapshot(self, state_mod, monkeypatch, tmp_path):
+        """回归：整场导出数据源历史优先——快照是检测刚完成时的原始列表、
+        不含历史里已存的跨会话人物分类；若优先快照，按人物导出会静默漏球。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        base = str(tmp_path / "2026.09.05")
+        v1, v2 = base + r"\1st.mp4", base + r"\2nd.mp4"
+        state_mod.add_history(v1, (1, 2, 3, 4), [10.0, 20.0])
+        state_mod.update_history_labels(v1, None, None,
+                                        person_map={10.0: "智", 20.0: "浩"})
+        # 快照：只有无分类的原始 clips + goals（模拟批量刚跑完，历史里的人物
+        # 还没同步进快照）；batch_results 残留使旧实现优先命中快照
+        state_mod.batch_results[v1] = {
+            "goals": [10.0, 20.0],
+            "clips": [{"ts": 10.0, "mark": None, "person": None},
+                      {"ts": 20.0, "mark": None, "person": None}],
+            "kept": set(),
+        }
+        state_mod.batch_files = [v1, v2]
+        captured = {}
+
+        def _fake_cut(sources, *args, **kw):
+            captured["sources"] = sources
+            os.makedirs(os.path.dirname(kw["output_path"]), exist_ok=True)
+            with open(kw["output_path"], "w") as f:
+                f.write("x")
+            return kw["output_path"]
+
+        monkeypatch.setattr(detection, "cut_clips", _fake_cut)
+        # v2 无历史无快照 → 跳过；v1 历史里有「智」
+        path, msg = detection.generate_highlights_fullgame("智", 5, 5, 8)
+        assert path is not None
+        assert [os.path.basename(v) for v, _ in captured["sources"]] == ["1st.mp4"]
+        assert captured["sources"][0][1] == [10.0]
+        # 历史缺失时回退快照：v2 补一条只有快照的记录
+        state_mod.batch_results[v2] = {
+            "goals": [5.0],
+            "clips": [{"ts": 5.0, "mark": None, "person": "智"}],
+            "kept": set(),
+        }
+        path, msg = detection.generate_highlights_fullgame("智", 5, 5, 8)
+        assert path is not None
+        assert [os.path.basename(v) for v, _ in captured["sources"]] == ["1st.mp4", "2nd.mp4"]
 
     def test_person_highlights_path_naming(self):
         """按人物导出的文件名：{视频名}-{人物}-highlights.mp4，人名安全化。"""
@@ -524,11 +586,14 @@ class TestMultiSourceCut:
         assert 2.0 < info2["total"] / info2["fps"] < 4.5
 
     def test_cut_clips_multi_empty(self):
-        """多源空列表 / 空时间戳源 → 跳过或返回 None，不崩溃。"""
+        """多源空列表 / 空时间戳源 → 返回 None，不崩溃（含无 output_path）。"""
         import shutil
         from cutter import ffmpeg_cutter as fc
         from cutter.ffmpeg_cutter import cut_clips
         assert cut_clips([], None) is None  # 空列表在 ffmpeg 探测前早退
+        # 回归：多源时间戳全空 + 无 output_path → 不应 IndexError
+        # （旧实现在默认命名取 segments[0] 时越界；守卫在 segments 构建后早退）
+        assert cut_clips([("/nonexistent.mp4", [])], None) is None
         if not (os.path.exists(fc._DEFAULT_FFMPEG)
                 or shutil.which(fc._DEFAULT_FFMPEG)):
             pytest.skip("无可用 ffmpeg（当前解释器未装 imageio_ffmpeg 且 PATH 无 ffmpeg）")

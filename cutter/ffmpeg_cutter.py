@@ -175,6 +175,9 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                 segments[-1][2] = end
             else:
                 segments.append([video_path, start, end])
+    if not segments:
+        _log.info("没有可剪辑的片段（多源时间戳全空），跳过")
+        return None
 
     # 临时目录：cache/clips 下每次运行独立子目录（tempfile.mkdtemp），
     # 旧实现固定命名 clip_000.mp4，第二个实例/流水线集锦并发时会互相覆盖、误删对方文件

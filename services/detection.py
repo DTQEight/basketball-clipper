@@ -1180,8 +1180,9 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
     """整场（四节合并）集锦导出：跨批量文件夹内全部视频。
 
     视频集合 = state.batch_files（当前扫描的文件夹，按文件名排序 = 第1节→第4节）。
-    每个视频的片段来源：流水线快照（batch_results，批量运行中优先，最新）
-    或历史记录（labels 含 √/× 与人物分类）。同一人物筛选规则与单视频一致
+    每个视频的片段来源：历史记录优先（labels 含跨会话人物分类 + √/× 标记，
+    每个视频检测完成时已重映射合并旧标签），历史缺失时回退流水线快照。
+    同一人物筛选规则与单视频一致
     （有√只导√ → 无√排除× → 无标记导筛选池全部）。
     输出：{文件夹名}-{人物}-highlights.mp4（与各单节导出互不覆盖）。
     """
@@ -1205,15 +1206,21 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
             return None, "❌ 整场导出需要批量视频列表或已加载视频，请先扫描文件夹/加载视频"
         sources = []
         for v in videos:
-            if v in state.batch_results:
-                snap = state.batch_results[v]
-                clips, goals = snap["clips"], list(snap["goals"])
-            else:
-                r = state.get_record(v)
-                if not r:
-                    continue  # 该视频无快照也无历史 → 跳过（如某节漏检测）
+            # 数据源：历史记录优先（含跨会话人物分类 + √/× 标记，add_history 已在
+            # 每个视频完成时重映射合并旧标签）；历史缺失（如本轮 add_history 因
+            # IO 失败返回 None）才回退到流水线快照。旧实现优先快照 → 快照 clips
+            # 是检测刚完成时的原始列表，不含此前会话分类的人物，导致整场按人物
+            # 导出静默漏掉历史里已有的分类进球。
+            r = state.get_record(v)
+            if r and r.get("goals"):
                 clips = _clips_from_record(r)
                 goals = [float(t) for t in r.get("goals", [])]
+            else:
+                snap = state.batch_results.get(v)
+                if not snap:
+                    continue  # 该视频无历史也无快照 → 跳过（如某节漏检测）
+                clips = snap["clips"]
+                goals = list(snap["goals"])
             if not clips:
                 continue
             ts_list = _export_goals(clips, goals, person_filter)

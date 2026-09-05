@@ -805,7 +805,10 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
             persons[round(float(k), 3)] = str(v)
         except (TypeError, ValueError):
             continue
-    total = len(set(kept) | set(deleted)) + len(persons)
+    # 分母 = 去重后的时间戳数（用户常对同一进球同时 √ + 人物分类，
+    # 若 kept/deleted 与 persons 各自计数会把同一 ts 计两次，total 虚高、
+    # 真实匹配率被低估到阈值以下 → 一个进球消失就整体丢弃全部标签）
+    total = len(set(kept) | set(deleted) | set(persons))
     if total == 0:
         # 没有任何时间戳标签（如只有 label_time）：原样保留
         return dict(labels), 0, 0
