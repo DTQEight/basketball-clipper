@@ -237,6 +237,84 @@ class TestHistory:
         assert detection._export_goals(
             [{"ts": 1.0}], [1.0], detection.PERSON_FILTER_CLASSIFIED) == []
 
+    def test_game_highlights_path_naming(self):
+        """整场导出文件名：{文件夹名}-[人物]-highlights.mp4，与单节导出互不覆盖。"""
+        from services import detection
+        videos = [r"E:\games\2026.09.04\1st.mp4", r"E:\games\2026.09.04\2nd.mp4"]
+        # 不筛人物 → {文件夹名}-highlights.mp4
+        p = detection._game_highlights_path(videos, None)
+        assert os.path.basename(p) == "2026.09.04-highlights.mp4"
+        # 人物 → {文件夹名}-{人物}-highlights.mp4
+        p = detection._game_highlights_path(videos, "小明")
+        assert os.path.basename(p) == "2026.09.04-小明-highlights.mp4"
+        # 哨兵「仅已分类」
+        p = detection._game_highlights_path(videos, detection.PERSON_FILTER_CLASSIFIED)
+        assert os.path.basename(p) == "2026.09.04-已分类-highlights.mp4"
+        # 与单节导出不互相覆盖
+        single = detection._person_highlights_path(videos[0], "小明")
+        assert p != single and single != detection._game_highlights_path(videos, "小明")
+        # 无公共目录（跨盘符）→ 回落首视频名-game
+        p = detection._game_highlights_path([r"C:\a\1st.mp4", r"D:\b\2nd.mp4"], "小明")
+        assert os.path.basename(p) == "1st-game-小明-highlights.mp4"
+
+    def test_clips_from_record_rebuild(self):
+        """从历史记录轻量重建片段视图：mark/person 不需要预览文件。"""
+        from services import detection
+        # goals 全精度 vs 标签键 round(3)：必须舍入匹配（31.2789 ↔ "31.279"）
+        r = {"goals": [10.00008, 20.00004, 30.0],
+             "labels": {"kept": [10.0], "deleted": [20.0],
+                        "persons": {"30.0": "小明"}}}
+        clips = detection._clips_from_record(r)
+        assert [c["ts"] for c in clips] == [10.0, 20.0, 30.0]
+        assert clips[0]["mark"] == "keep"
+        assert clips[1]["mark"] == "reject"
+        assert clips[2]["mark"] is None
+        assert clips[2]["person"] == "小明"
+        # 空 labels → 全部无标记
+        clips = detection._clips_from_record({"goals": [5.0]})
+        assert clips == [{"ts": 5.0, "mark": None, "person": None}]
+
+    def test_fullgame_collects_sources_across_videos(self, state_mod, monkeypatch, tmp_path):
+        """整场导出：跨视频收集同一人物片段，按文件名顺序传给剪辑器。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        # 三个"视频"：1st 有小明+小红，2nd 只有小明，3rd 无记录（跳过）
+        base = str(tmp_path / "2026.09.04")
+        v1, v2, v3 = base + r"\1st.mp4", base + r"\2nd.mp4", base + r"\3rd.mp4"
+        state_mod.add_history(v1, (1, 2, 3, 4), [10.0, 20.0])
+        state_mod.update_history_labels(v1, None, None,
+                                        person_map={10.0: "小明", 20.0: "小红"})
+        state_mod.add_history(v2, (1, 2, 3, 4), [15.0])
+        state_mod.update_history_labels(v2, None, None, person_map={15.0: "小明"})
+        state_mod.batch_files = [v2, v3, v1]  # 乱序传入，函数内应排序
+
+        captured = {}
+
+        def _fake_cut(sources, *args, **kw):
+            captured["sources"] = sources
+            captured["output"] = kw.get("output_path")
+            os.makedirs(os.path.dirname(kw["output_path"]), exist_ok=True)
+            with open(kw["output_path"], "w") as f:  # 模拟生成产物
+                f.write("x")
+            return kw.get("output_path")
+
+        monkeypatch.setattr(detection, "cut_clips", _fake_cut)
+        path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
+        assert path is not None
+        # 按文件名排序：1st 在前，3rd 无记录被跳过
+        assert [os.path.basename(v) for v, _ in captured["sources"]] == ["1st.mp4", "2nd.mp4"]
+        assert captured["sources"][0][1] == [10.0]
+        assert captured["sources"][1][1] == [15.0]
+        # 输出路径带文件夹名 + 人物
+        assert os.path.basename(captured["output"]) == "2026.09.04-小明-highlights.mp4"
+        # 该人物整场无片段 → 明确报错
+        path, msg = detection.generate_highlights_fullgame("不存在的人", 5, 5, 8)
+        assert path is None and "没有可导出" in msg
+        # 未扫描文件夹 → 提示
+        state_mod.batch_files = []
+        path, msg = detection.generate_highlights_fullgame("小明", 5, 5, 8)
+        assert path is None and "扫描文件夹" in msg
+
     def test_person_highlights_path_naming(self):
         """按人物导出的文件名：{视频名}-{人物}-highlights.mp4，人名安全化。"""
         from services import detection
@@ -356,6 +434,64 @@ class TestHistory:
             assert not os.path.exists(monkey)
         finally:
             state_mod.load_history = orig_load
+
+
+class TestMultiSourceCut:
+    def test_cut_clips_multi_video_concat(self, tmp_path):
+        """多源切片端到端：两个视频的片段合并成一个集锦，按源顺序拼接。"""
+        cv2 = pytest.importorskip("cv2")
+        import shutil
+        from cutter import ffmpeg_cutter as fc
+        if not (os.path.exists(fc._DEFAULT_FFMPEG)
+                or shutil.which(fc._DEFAULT_FFMPEG)):
+            pytest.skip("无可用 ffmpeg（当前解释器未装 imageio_ffmpeg 且 PATH 无 ffmpeg）")
+        import numpy as np
+        from cutter.ffmpeg_cutter import cut_clips
+
+        def _make(path, n=150):
+            """150 帧 @30fps = 5s 合成视频。"""
+            w = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (320, 240))
+            if not w.isOpened():
+                pytest.skip("cv2 无 mp4v 编码器")
+            for i in range(n):
+                f = np.full((240, 320, 3), 100, dtype=np.uint8)
+                cv2.circle(f, (160, 120), 8 + (i % 5), (255, 255, 255), -1)
+                w.write(f)
+            w.release()
+            return str(path)
+
+        v1 = _make(tmp_path / "1st.mp4")
+        v2 = _make(tmp_path / "2nd.mp4")
+        out = str(tmp_path / "game.mp4")
+        # 每源两个靠近的 ts（min_gap=8 合并为一段）→ 每源 1 段，共 2 段
+        # v1: [0,4]+[2,6] → [0,6]；v2: [0,3]+[1,5] → [0,5] → 总时长 ≈ 11s
+        result = cut_clips([(v1, [2.0, 4.0]), (v2, [1.0, 3.0])], None,
+                           pre_roll=2, post_roll=2, min_gap=8, output_path=out)
+        assert result == out and os.path.exists(out) and os.path.getsize(out) > 0
+        from video_io import get_video_info
+        info = get_video_info(out)
+        assert 9.5 < info["total"] / info["fps"] < 12.5
+        # 跨源不合并：min_gap=60 也只应在源内生效，两段分别 [3,5] 与 [0,1.2]
+        out2 = str(tmp_path / "game2.mp4")
+        result = cut_clips([(v1, [4.0]), (v2, [0.2])], None,
+                           pre_roll=1, post_roll=1, min_gap=60, output_path=out2)
+        assert result == out2
+        info2 = get_video_info(out2)
+        # 两段 ≈ 3.2s；若错误跨源合并会变成单段 [0,5] = 5s
+        assert 2.0 < info2["total"] / info2["fps"] < 4.5
+
+    def test_cut_clips_multi_empty(self):
+        """多源空列表 / 空时间戳源 → 跳过或返回 None，不崩溃。"""
+        import shutil
+        from cutter import ffmpeg_cutter as fc
+        from cutter.ffmpeg_cutter import cut_clips
+        assert cut_clips([], None) is None  # 空列表在 ffmpeg 探测前早退
+        if not (os.path.exists(fc._DEFAULT_FFMPEG)
+                or shutil.which(fc._DEFAULT_FFMPEG)):
+            pytest.skip("无可用 ffmpeg（当前解释器未装 imageio_ffmpeg 且 PATH 无 ffmpeg）")
+        # 源列表里某个源时间戳为空 → 该源被跳过（整体仍可工作）
+        assert cut_clips([("/nonexistent.mp4", [])], None,
+                         output_path="/tmp/x.mp4") is None
 
 
 class TestClipCache:

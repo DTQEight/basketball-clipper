@@ -1119,6 +1119,126 @@ def generate_highlights(pre_roll, post_roll, min_gap, progress_callback=None,
             state.release_task(task_token)
 
 
+def _clips_from_record(r):
+    """从历史记录轻量重建 (ts, mark, person) 片段视图（不生成预览）。
+
+    整场导出只需要进球时间戳 + 标记 + 人物分类，不需要预览片段文件；
+    直接从记录的 goals + labels 重建，避免逐视频跑 ffmpeg。
+    """
+    labels = r.get("labels") or {}
+    kept = {float(t) for t in (labels.get("kept") or [])}
+    deleted = {float(t) for t in (labels.get("deleted") or [])}
+    persons = {}
+    for k, v in (labels.get("persons") or {}).items():
+        try:
+            persons[float(k)] = v
+        except (TypeError, ValueError):
+            continue
+    clips = []
+    for t in r.get("goals", []):
+        # 标签键（kept/deleted/persons）统一存 round(ts,3)，goals 是全精度：
+        # 与 _on_load_history_impl 相同的舍入匹配，否则 31.2789 对不上 31.279
+        ts = round(float(t), 3)
+        clips.append({"ts": ts,
+                      "mark": "keep" if ts in kept else
+                              ("reject" if ts in deleted else None),
+                      "person": persons.get(ts)})
+    return clips
+
+
+def _game_highlights_path(videos, person):
+    """整场（多视频合并）集锦输出路径：{文件夹名}-[人物]-highlights.mp4。
+
+    文件夹名取全部视频的公共父目录名（如 2026.09.04）；
+    无公共目录（跨盘符等）回落首视频名 + "-game"。
+    人物名安全化规则与单视频导出一致。
+    """
+    folder = ""
+    try:
+        dirs = {os.path.dirname(os.path.abspath(v)) for v in videos}
+        if len(dirs) == 1:
+            folder = os.path.basename(dirs.pop())
+    except Exception:
+        folder = ""
+    if not folder:
+        folder = os.path.splitext(os.path.basename(videos[0]))[0] + "-game"
+    _safe_folder = "".join(c for c in folder if c not in '\\/:*?"<>|').strip()[:40]
+    _safe_folder = _safe_folder or "game"
+    if person == PERSON_FILTER_CLASSIFIED:
+        _safe = "已分类"
+    elif person:
+        _safe = "".join(c for c in person if c not in '\\/:*?"<>|').strip()[:30]
+        _safe = _safe or "person"
+    else:
+        _safe = ""
+    suffix = f"-{_safe}-highlights.mp4" if _safe else "-highlights.mp4"
+    return os.path.join(state.CACHE_ROOT, "demo_output", f"{_safe_folder}{suffix}")
+
+
+def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
+                                 progress_callback=None, task_token=0):
+    """整场（四节合并）集锦导出：跨批量文件夹内全部视频。
+
+    视频集合 = state.batch_files（当前扫描的文件夹，按文件名排序 = 第1节→第4节）。
+    每个视频的片段来源：流水线快照（batch_results，批量运行中优先，最新）
+    或历史记录（labels 含 √/× 与人物分类）。同一人物筛选规则与单视频一致
+    （有√只导√ → 无√排除× → 无标记导筛选池全部）。
+    输出：{文件夹名}-{人物}-highlights.mp4（与各单节导出互不覆盖）。
+    """
+    _pipeline = state.current_task() == 'batch'
+    try:
+        if _pipeline:
+            if state.hl_busy["on"]:
+                return None, "❌ 集锦正在生成中，请稍候"
+            state.hl_busy["on"] = True
+        videos = sorted(v for v in state.batch_files if v)
+        if not videos:
+            return None, "❌ 请先扫描文件夹（整场导出需要批量视频列表）"
+        sources = []
+        for v in videos:
+            if v in state.batch_results:
+                snap = state.batch_results[v]
+                clips, goals = snap["clips"], list(snap["goals"])
+            else:
+                r = state.get_record(v)
+                if not r:
+                    continue  # 该视频无快照也无历史 → 跳过（如某节漏检测）
+                clips = _clips_from_record(r)
+                goals = [float(t) for t in r.get("goals", [])]
+            if not clips:
+                continue
+            ts_list = _export_goals(clips, goals, person_filter)
+            if ts_list:
+                sources.append((v, ts_list))
+        if not sources:
+            return None, f"❌ {_filter_desc(person_filter)}整场没有可导出的进球片段"
+        _out_path = _game_highlights_path([v for v, _ in sources], person_filter)
+        # 流水线模式取消走独立事件：批量「取消」不连带杀死集锦
+        _cancel = state.hl_cancel_event.is_set if _pipeline else state.cancel_event.is_set
+        _n_goals = sum(len(t) for _, t in sources)
+        out_path = cut_clips(sources, None,
+                             pre_roll=int(pre_roll), post_roll=int(post_roll),
+                             min_gap=int(min_gap),
+                             progress_callback=progress_callback,
+                             cancel_check=_cancel,
+                             output_path=_out_path)
+        if out_path and os.path.exists(out_path):
+            return out_path, (f"整场集锦已生成{_filter_desc(person_filter)}"
+                              f"（{len(sources)} 个视频，{_n_goals} 个进球片段）\n"
+                              f"输出: {out_path}")
+        if _cancel():
+            return None, "已取消集锦生成"
+        return None, "❌ 集锦生成失败"
+    except Exception as e:
+        import traceback
+        return None, f"❌ 剪辑失败: {e}\n{traceback.format_exc()}"
+    finally:
+        if _pipeline:
+            state.hl_busy["on"] = False
+        if task_token:
+            state.release_task(task_token)
+
+
 def on_load_history(idx_choice, progress_callback=None, task_token=0):
     """从历史记录加载。
 

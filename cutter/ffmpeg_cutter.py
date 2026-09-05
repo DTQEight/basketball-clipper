@@ -117,9 +117,15 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
               progress_callback=None, cancel_check=None):
     """根据进球时间戳剪辑集锦（GPU 硬编加速）。
 
-    timestamps: 进球时刻列表（秒，浮点）
+    video_path: 单源模式传路径字符串；
+                多源模式传 [(视频路径, [ts,...]), ...] 列表 —— 整场四节合并导出，
+                各源独立合并相邻片段（不同视频的时间戳互不相关，不能跨源合并），
+                按列表顺序拼接（调用方保证第1节→第4节排序）。
+    timestamps: 单源模式的进球时刻列表（秒，浮点）；多源模式下忽略（各源
+                时间戳在 video_path 列表里）。
     min_gap: 两个片段间隔小于此值则合并，避免连续得分重复切。
     output_path: 输出文件路径，None 则默认到 cache/demo_output/{源视频名}-highlights.mp4
+                 （多源模式必须显式传入）。
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
     progress_callback: 可选进度回调 (pct, msg)，0-100。
     cancel_check: 可选取消检查函数（返回 True 时中止并清理临时文件）。
@@ -136,22 +142,39 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
     def _cancelled():
         return bool(cancel_check and cancel_check())
 
-    if not timestamps:
+    multi = isinstance(video_path, list)
+    if multi:
+        if not video_path:
+            _log.info("多源剪辑列表为空，跳过")
+            return None
+    elif not timestamps:
         _log.info("没有进球时间戳，跳过剪辑")
         return None
 
     ffmpeg = ffmpeg_path or _DEFAULT_FFMPEG
-    timestamps = sorted([float(t) for t in timestamps])
 
-    # 合并过近的片段
+    # 合并过近的片段：segments = [src, start, end]（多源时 src 各段不同）
     segments = []
-    for ts in timestamps:
-        start = max(0.0, ts - pre_roll)
-        end = ts + post_roll
-        if segments and start - segments[-1][1] < min_gap:
-            segments[-1][1] = end
-        else:
-            segments.append([start, end])
+    if multi:
+        for src, ts_list in video_path:
+            if not ts_list:
+                continue
+            for ts in sorted(float(t) for t in ts_list):
+                start = max(0.0, ts - pre_roll)
+                end = ts + post_roll
+                if segments and segments[-1][0] == src \
+                        and start - segments[-1][2] < min_gap:
+                    segments[-1][2] = end
+                else:
+                    segments.append([src, start, end])
+    else:
+        for ts in sorted([float(t) for t in timestamps]):
+            start = max(0.0, ts - pre_roll)
+            end = ts + post_roll
+            if segments and start - segments[-1][2] < min_gap:
+                segments[-1][2] = end
+            else:
+                segments.append([video_path, start, end])
 
     # 临时目录：cache/clips 下每次运行独立子目录（tempfile.mkdtemp），
     # 旧实现固定命名 clip_000.mp4，第二个实例/流水线集锦并发时会互相覆盖、误删对方文件
@@ -163,7 +186,9 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
     # 输出路径默认到 cache/demo_output/，文件名带源视频名避免覆盖
     if output_path is None:
         out_dir = os.path.join(_CACHE_ROOT, "demo_output")
-        _vname = os.path.splitext(os.path.basename(video_path))[0]
+        _vname = os.path.splitext(os.path.basename(segments[0][0]))[0]
+        if multi:
+            _vname += "-game"  # 多源兜底命名（正常应由调用方显式传入）
         output_path = os.path.join(out_dir, f"{_vname}-highlights.mp4")
     # 显式传入的 output_path（如按人物导出）同样保证目录存在
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -182,7 +207,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
         # ⚠️ use_nvenc 复用已探测结果，避免 build_encode_args 内部再开子进程
         encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=use_nvenc)
         failed_segments = 0
-        for i, (start, end) in enumerate(segments):
+        for i, (src, start, end) in enumerate(segments):
             if _cancelled():
                 _log.info("[剪辑] 已取消，清理临时文件")
                 return None
@@ -193,7 +218,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             def _build_cmd(e_args):
                 return [
                     ffmpeg, "-y", "-loglevel", "error",
-                    "-ss", f"{start:.3f}", "-i", video_path,
+                    "-ss", f"{start:.3f}", "-i", src,
                     "-t", f"{duration:.3f}",
                 ] + e_args + [
                     "-c:a", "aac", "-b:a", "128k",
@@ -354,7 +379,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
         # FileNotFoundError/磁盘满等异常会跳过全部清理，hl-* 目录永久残留）
         _cleanup_tmp(clip_files, os.path.join(tmp_dir, "concat.txt"), tmp_dir)
 
-    total_dur = sum(e - s for s, e in segments)
+    total_dur = sum(e - s for _src, s, e in segments)
     skip_info = f" | 跳过 {failed_segments} 段失败" if failed_segments > 0 else ""
     _log.info(f"集锦已生成: {output_path}（{encode_tag} | 共 {len(clip_files)}/{len(segments)} 段{skip_info} | 时长 {total_dur:.0f}s）")
     return output_path

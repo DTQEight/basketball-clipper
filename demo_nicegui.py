@@ -436,13 +436,19 @@ def main_page():
                     hl_mini_text = ui.label('集锦生成中').classes('text-xs flex-shrink-0').style('color: var(--text-secondary)')
 
                 # 导出集锦按钮（固定在列表上方，仅列表有内容时显示）
-                # 人物筛选下拉：全部人物 / 已分类的各个人物（按人物导出集锦）
+                # 人物筛选下拉：全部人物 / 已分类的各个人物（按人物导出集锦）；
+                # 全局名单里的其他场次人物也可选（用于整场合并导出，无计数后缀）
                 with ui.row().classes('w-full px-3 pt-2 flex-shrink-0 hidden items-center gap-2') as export_row:
                     hl_person_select = ui.select(
                         {'': '全部人物'}, value='').props('dense outlined standout dark'
-                        ).classes('text-xs flex-1').style('max-width: 60%')
+                        ).classes('text-xs flex-1').style('max-width: 55%')
                     ui.button('导出集锦', on_click=lambda: _on_highlights()).classes(
                         'flex-1 text-sm font-bold').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
+                    ui.button('整场集锦', on_click=lambda: _on_fullgame_highlights()).classes(
+                        'flex-1 text-xs font-bold').props('ripple').style(
+                        'background: var(--bg-elevated); color: var(--accent); '
+                        'border: 1px solid var(--accent)').tooltip(
+                        '合并文件夹内全部视频（四节）导出：按当前人物筛选，输出 {文件夹名}-{人物}-highlights.mp4')
 
                 # 进球列表区域（独立滚动）
                 with ui.column().classes('w-full p-2 gap-1 overflow-y-auto flex-1').style('min-height: 0'):
@@ -1204,12 +1210,18 @@ def main_page():
             export_hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
         else:
             export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
-        # 人物筛选下拉选项：'' = 全部 / 仅已分类（存在未分类片段时才有意义）/ 各人物（带计数）
+        # 人物筛选下拉选项：'' = 全部 / 仅已分类（存在未分类片段时才有意义）/
+        # 各人物（带计数）/ 全局名单其他场次人物（无计数，供整场合并导出选择）
         try:
             _opts = {'': '全部人物'}
             if person_counts and n_person < len(clips):
                 _opts[detection.PERSON_FILTER_CLASSIFIED] = f'仅已分类（{n_person}）'
             _opts.update({p: f'{p}（{n}）' for p, n in sorted(person_counts.items())})
+            if state.batch_files:
+                # 批量模式下并入全局名单：整场导出可选其他场次的人物
+                for p in state.load_persons():
+                    if p and p not in _opts:
+                        _opts[p] = p
             _cur = hl_person_select.value
             if _cur not in _opts:
                 hl_person_select.set_value('')
@@ -1385,6 +1397,83 @@ def main_page():
             path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
         # 正常路径锁由 generate_highlights 内部 finally 释放（锁归任务本体）
+
+        if path and os.path.exists(path):
+            ui.download(path)
+            highlights_video_el.set_source(path)
+            _show_right_pane('highlights')
+        else:
+            _show_right_pane('preview')
+        _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
+
+    async def _on_fullgame_highlights():
+        """整场集锦：合并批量文件夹内全部视频（四节），按当前人物筛选导出。"""
+        if not state.batch_files:
+            _set_status('❌ 整场导出需要批量视频列表，请先扫描文件夹', 'err')
+            return
+        # 流水线分支：批量检测运行中（与单视频流水线集锦共用 hl_busy 小锁）
+        if state.current_task() == 'batch':
+            if state.hl_busy["on"]:
+                state.hl_cancel_event.set()
+                hl_mini_text.set_text('正在取消集锦...')
+                return
+            from nicegui import run
+            state.hl_cancel_event.clear()
+            hl_progress_strip.classes(remove='hidden')
+            hl_mini_bar.set_value(0)
+            hl_mini_text.set_text('整场集锦生成中')
+
+            def _hl_progress(pct, msg):
+                try:
+                    hl_mini_bar.set_value(pct / 100)
+                    hl_mini_text.set_text(f'整场集锦 {pct:.0f}%')
+                except Exception:
+                    pass
+
+            _set_status('正在生成整场集锦（后台检测不受影响）...', 'busy')
+            try:
+                path, status = await run.io_bound(
+                    detection.generate_highlights_fullgame,
+                    (hl_person_select.value or None),
+                    hl_pre_roll.value, hl_post_roll.value, hl_min_gap.value,
+                    _hl_progress)
+            except Exception as _e:
+                import traceback
+                path, status = None, f"❌ 整场集锦生成异常: {_e}\n{traceback.format_exc()}"
+            finally:
+                hl_progress_strip.classes(add='hidden')
+            if path and os.path.exists(path):
+                ui.download(path)
+            _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
+            return
+        token = _try_acquire('highlights')
+        if not token:
+            return
+        from nicegui import run
+        _show_right_pane('progress')
+        progress_bar.set_value(0)
+        progress_text.set_text('正在生成整场集锦...')
+        progress_detail.set_text('')
+
+        def _progress_callback(pct, msg):
+            try:
+                progress_bar.set_value(pct / 100)
+                progress_text.set_text('正在生成整场集锦...')
+                progress_detail.set_text(msg)
+            except Exception:
+                pass
+
+        _set_status('正在生成整场集锦...', 'busy')
+        try:
+            path, status = await run.io_bound(
+                detection.generate_highlights_fullgame,
+                (hl_person_select.value or None),
+                hl_pre_roll.value, hl_post_roll.value, hl_min_gap.value,
+                _progress_callback, token)
+        except Exception as _e:
+            import traceback
+            path, status = None, f"❌ 整场集锦生成异常: {_e}\n{traceback.format_exc()}"
+            state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
 
         if path and os.path.exists(path):
             ui.download(path)
