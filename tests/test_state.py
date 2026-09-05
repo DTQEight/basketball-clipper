@@ -225,6 +225,78 @@ class TestHistory:
         _l, matched, total = state_mod._remap_labels_to_goals(old, [1.0, 2.0])
         assert total == 3 and matched == 2
 
+    def test_batch_load_restores_marks_snapshot(self, state_mod, monkeypatch, tmp_path):
+        """回归：批量快照水合路径恢复历史 √/× 与人物（此前只回填人物，
+        导致批量重跑后之前 × 误报的片段被当未标记展示/导出）。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.batch_files = [vp]
+        # 历史：ts1 √ + 小明，ts2 ×
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0, 2.0])
+        state_mod.update_history_labels(vp, kept_ts_list=[1.0], deleted_ts_list=[2.0],
+                                        person_map={1.0: "小明"})
+        # 快照：原始 clips 无 mark/person（模拟批量刚跑完）
+        state_mod.batch_results[vp] = {
+            "goals": [1.0, 2.0],
+            "clips": [{"ts": 1.0, "path": "/x1.mp4"},
+                      {"ts": 2.0, "path": "/x2.mp4"}],
+            "kept": set(),
+        }
+        # 避开真实 IO：get_video_info / read_frame 打桩
+        monkeypatch.setattr(detection, "get_video_info",
+                            lambda v: {"total": 100, "fps": 30.0, "codec": "h264",
+                                       "width": 320, "height": 240})
+        monkeypatch.setattr(detection, "read_frame", lambda *a, **k: None)
+        _preview, _info, status = detection._on_batch_load_video_impl(vp, None)
+        clips = state_mod.last_goal_clips
+        assert len(clips) == 2
+        assert clips[0]["mark"] == "keep" and clips[0]["person"] == "小明"
+        assert clips[1]["mark"] == "reject"
+        assert state_mod.kept_goal_indices == {0}
+
+    def test_batch_load_restores_marks_history(self, state_mod, monkeypatch, tmp_path):
+        """回归：批量历史记录路径恢复 √/×（无快照时走历史；生成预览打桩）。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "2nd.mp4")
+        state_mod.batch_files = [vp]
+        state_mod.add_history(vp, (1, 2, 3, 4), [3.0, 4.0])
+        state_mod.update_history_labels(vp, kept_ts_list=[3.0], deleted_ts_list=[4.0],
+                                        person_map={3.0: "智"})
+        monkeypatch.setattr(detection, "get_video_info",
+                            lambda v: {"total": 100, "fps": 30.0, "codec": "h264",
+                                       "width": 320, "height": 240})
+        monkeypatch.setattr(detection, "read_frame", lambda *a, **k: None)
+        monkeypatch.setattr(detection, "_generate_preview_clips",
+                            lambda *a, **k: [{"ts": 3.0, "path": "/y1.mp4"},
+                                             {"ts": 4.0, "path": "/y2.mp4"}])
+        _preview, _info, status = detection._on_batch_load_video_impl(vp, None)
+        clips = state_mod.last_goal_clips
+        assert len(clips) == 2
+        assert clips[0]["mark"] == "keep" and clips[0]["person"] == "智"
+        assert clips[1]["mark"] == "reject"
+        assert state_mod.kept_goal_indices == {0}
+
+    def test_restore_labels_preserves_pipeline_manual(self, state_mod, tmp_path):
+        """helper：keep_existing_manual 保留本会话流水线人工标记（历史缺失兜底）。"""
+        from services import detection
+        vp = str(tmp_path / "3rd.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [5.0, 6.0])
+        # 历史无任何标记（模拟极端：流水线打的标记写入历史失败）
+        clips = [{"ts": 5.0, "path": "/a.mp4", "mark": "keep", "mark_source": "manual"},
+                 {"ts": 6.0, "path": "/b.mp4"}]
+        kept, has_marks = detection._restore_labels_to_clips(
+            clips, vp, keep_existing_manual=True)
+        assert kept == {0} and has_marks is True
+        assert clips[0]["mark"] == "keep"   # 保留会话内 √
+        assert clips[1].get("mark") is None  # 无历史 → 不误标
+        # 不保留模式：历史无标记 → 全部清空、kept 全量语义
+        clips = [{"ts": 5.0, "mark": "keep", "mark_source": "manual"}]
+        kept, has_marks = detection._restore_labels_to_clips(clips, vp)
+        assert kept == set() and has_marks is False
+        assert clips[0].get("mark") is None
+
     def test_export_goals_person_filter(self):
         """按人物导出：只导该人物片段，叠加 √/× 规则；无匹配返回空。"""
         from services import detection

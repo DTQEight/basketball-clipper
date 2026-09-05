@@ -1417,6 +1417,54 @@ def _on_load_history_impl(idx_choice, progress_callback):
 
 # ============ 文件夹批量模式 ============
 
+def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
+    """把历史人工标签（kept=√ / deleted=× / persons=人物）回填到 clips。
+
+    与单视频历史加载（_on_load_history_impl）同一口径：mark/mark_source
+    先清掉再按历史 labels 覆盖（防缓存共享引用携带残留标记），人物分类
+    独立回填（已有分类保留、缺失才补）。
+    keep_existing_manual=True：快照水合路径保留 clip 上本会话流水线已打的
+    人工标记（其值也已同步进历史，通常一致；可兜底历史写入失败的极端情况），
+    未打标记的 clip 仍按历史回填。
+    返回 (kept 索引集合, has_marks)：has_marks = 历史存在任何 √/× 或保留的
+    人工标记（调用方据此决定 kept 集合语义，对齐单视频路径）。
+    """
+    try:
+        labels = state.get_labels(video_path)
+    except Exception:
+        labels = None
+    deleted_set = set()
+    kept_set = set()
+    persons_map = {}
+    if labels:
+        deleted_set = {float(t) for t in (labels.get("deleted") or [])}
+        kept_set = {float(t) for t in (labels.get("kept") or [])}
+        persons_map = labels.get("persons") or {}
+    kept_idx = []
+    has_marks = bool(deleted_set or kept_set)
+    for idx, c in enumerate(clips):
+        ts = round(float(c["ts"]), 3)
+        manual = c.get("mark_source") == "manual" and c.get("mark") in ("keep", "reject")
+        if keep_existing_manual and manual:
+            if c.get("mark") == "keep":
+                kept_idx.append(idx)
+            has_marks = True
+        else:
+            c["mark"] = None
+            c["mark_source"] = None
+            if ts in deleted_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "manual"
+            elif ts in kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "manual"
+                kept_idx.append(idx)
+        # 人物分类独立回填：已有保留、缺失才补历史值
+        if not c.get("person") and persons_map.get(ts):
+            c["person"] = persons_map[ts]
+    return set(kept_idx), has_marks
+
+
 def on_batch_load_video(selected, progress_callback=None, task_token=0):
     """批量模式：加载选中的视频，应用该视频已保存的标定。
 
@@ -1513,19 +1561,14 @@ def _on_batch_load_video_impl(selected, progress_callback):
     if snap and snap.get("clips"):
         state.last_goals.extend(snap["goals"])
         state.last_goal_clips.extend([dict(c) for c in snap["clips"]])
-        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
-        # 人物分类回填：快照 clip 缺 person 时从历史 labels 补（快照在批量
-        # 检测刚完成时不含分类，历史里可能已有此前会话保存的分类）
-        try:
-            _persons = state.get_labels(video_path).get("persons") or {}
-            if _persons:
-                for c in state.last_goal_clips:
-                    if not c.get("person"):
-                        p = _persons.get(round(float(c["ts"]), 3))
-                        if p:
-                            c["person"] = p
-        except Exception:
-            pass
+        # 与单视频历史加载对齐：回填历史 √/× 与人物分类。
+        # 快照是检测刚完成时的原始 clips，不含跨会话的 kept/deleted/persons；
+        # 只补人物会导致之前 × 误报的片段被当未标记展示/导出。
+        # keep_existing_manual=True：保留快照上本会话流水线已打的人工标记
+        _restored_kept, _has_marks = _restore_labels_to_clips(
+            state.last_goal_clips, video_path, keep_existing_manual=True)
+        state.kept_goal_indices = (_restored_kept if _has_marks
+                                   else set(range(len(state.last_goal_clips))))
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
                   f"进球: {len(snap['goals'])} 个（含人工删减）\n"
@@ -1565,19 +1608,12 @@ def _on_batch_load_video_impl(selected, progress_callback):
             if state.last_goal_clips:
                 state.put_clip_cache(cache_key, state.last_goal_clips)
 
-        # 加载后全部进球默认保留（筛选结果不持久化）
-        state.kept_goal_indices = set(range(len(state.last_goal_clips)))
-
-        # 人物分类回填（√/× 标记在该路径不恢复，人物分类与筛选正交，恢复无害）
-        try:
-            _persons = state.get_labels(video_path).get("persons") or {}
-            if _persons:
-                for c in state.last_goal_clips:
-                    p = _persons.get(round(float(c["ts"]), 3))
-                    if p:
-                        c["person"] = p
-        except Exception:
-            pass
+        # 与单视频历史加载对齐：回填历史 √/× 与人物分类（此前该路径只回填
+        # 人物、不恢复 √/×，导致批量重跑后之前 × 误报的片段被当未标记导出）
+        _restored_kept, _has_marks = _restore_labels_to_clips(
+            state.last_goal_clips, video_path)
+        state.kept_goal_indices = (_restored_kept if _has_marks
+                                   else set(range(len(state.last_goal_clips))))
 
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
