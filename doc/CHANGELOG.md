@@ -2,6 +2,24 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.05 缺陷修复（第三轮 B1-B9：pts 尺度 / 解码告警 / 断点竞态 / YOLO 报错等）
+
+审查复盘的 B1-B9 九项全部修复，测试 89→100 项全通过（新增 11 项回归）。
+
+| 编号 | 问题 | 修复 |
+|------|------|------|
+| B1 | `_stream_start_pts` 忽略偏移阈值写死 0.5 **秒**，半秒内真实偏移（如 0.4s≈12 帧@30fps）漏修 → seek 整体错位、开头截尾、帧号平移 | 阈值改为**帧尺度**（半帧以下才忽略），fps 参与换算；`round` 替代 `int` 防浮点截断 |
+| B2 | 解码异常逐包静默跳过：全程无帧可解时主循环空转，以"检测完成/0 进球"收尾并写空历史；部分坏 NAL 无留痕 | `VideoReader.decode_errors` 计数损坏 packet；`run_detect` 全程 0 帧（非取消）返回明确解码失败错误；有帧但跳过损坏块写 WARN 日志 |
+| B3 | 任务运行中（如后台批量正写 checkpoint）仍弹"从断点继续？"对话框，选"从头"会删掉后台正在保存的断点 | 弹框前先拒绝 busy；对话框等待期间二次校验无任务运行才删断点 |
+| B4 | YOLO 加载/`m.to(device)` 失败只 log warning，模型驻留 cpu 而 `get_device()` 声称 cuda → 推理每帧失败空跑数十分钟才熔断 | 加载/设备迁移失败显式抛带权重的 `RuntimeError`，自检横幅与检测入口直接呈现明确错误 |
+| B5 | 模型加载失败后每次调用重复执行秒~分钟级慢加载/联网下载 | 失败记入负缓存（`_model_fail_cache`），同进程内后续调用直接重抛首次异常 |
+| B6 | `frame_to_base64` 对坏帧/异常 dtype 无兜底，异常穿透 UI 回调；`imencode` 失败时返回空 data URI 破图 | 整体 try/except + `imencode` 返回值检查，失败统一返回 `None` |
+| B7 | 预览生成阶段才取消 → 把已跑完的检测结果整体删除并另存"已处理到末尾"假断点（白删成果）；取消 checkpoint 无剩余帧约束 → 续跑 0 帧空跑 | 区分主循环取消与预览阶段取消（后者保留结果/片段按完成收尾）；取消/异常/周期 checkpoint 仅在 `_resume_frame < end` 时保存；拒绝加载已到末尾的旧断点 |
+| B8 | 旧版 checkpoint 缺 `_warmup_done` 键时 `set_state` 默认成 False → 恢复后正式检测器把前 ~30s 当预热期跳过判定并重算阈值（双重重预热、与断点漂移） | 缺键默认按"预热已完成"处理（能走到 `set_state` 的断点要么固定阈值、要么阈值已持久化）；显式 `_warmup_done=False` 仍被尊重 |
+| B9 | `diag["in_hoop"]` 不管水平位置是否进框都 +1，把垂直恰好穿过筐带的无关斑块也计成"筐内"，与 `blob_in_hoop_frames`/判定路径口径不一致 | "筐内"与 `blob_in_hoop_frames` 同口径（仅 `in_x` 时累加），注释与 FAQ 语义对齐 |
+
+涉及文件：`video_io.py` / `services/detection.py` / `services/state.py` / `tracker.py` / `app.py` / `services/video_utils.py` / `demo_nicegui.py` / `doc/FAQ.md`；测试新增：帧尺度阈值 4 项、`decode_errors` 1 项、0 帧解码告警 1 项、`_warmup_done` 兼容 2 项、进框口径 1 项、YOLO 失败负缓存 2 项。
+
 ### 2026.09.05 整场集锦导出（四节合并）
 
 个人集锦不再局限于单节——跨视频合并同一人物整场片段。

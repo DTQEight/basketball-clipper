@@ -37,16 +37,23 @@ def _stream_start_pts(stream, fps: float) -> int:
 
     .ts/.flv 等容器的首帧 pts 常从非零开始（录制起点偏移），
     不减去起始偏移会导致所有帧号/进球时间戳整体平移。
-    小于 0.5s 的偏移忽略：mp4 常带微小头部偏移（如半帧），
-    换算会引入帧级抖动，得不偿失。
+
+    忽略阈值必须以**帧**为尺度（旧实现按 0.5 秒，会漏修半秒内的
+    真实偏移）：0.4s 的偏移在 30fps 下就是 12 帧——不修则 seek
+    整体错位、开头 12 帧读不到（截尾）且帧号平移。只有不足半帧的
+    微头部偏移（如 mp4 的半个 pts tick）才忽略，避免换算取整抖动
+    把目标帧算偏 1 帧。fps 参与换算：同样的 0.02s 在 15fps 视频
+    上不足半帧、在 60fps 视频上已超过 1 帧。
     """
     try:
         if stream.start_time is not None and stream.time_base:
             tb = float(stream.time_base)
             if tb > 0:
                 start_sec = float(stream.start_time) * tb
-                if start_sec > 0.5:
-                    return int(start_sec / tb)
+                # 起始 pts 为负/0 不需要修正；换算成帧后 <0.5 帧的偏移忽略
+                if start_sec > 0 and start_sec * max(float(fps) or 1.0, 1.0) >= 0.5:
+                    # round 而非 int：float 除法可能把整数 pts 算成 x.9999，截断丢 1
+                    return int(round(start_sec / tb))
     except Exception:
         pass
     return 0
@@ -172,6 +179,11 @@ class VideoReader:
             self.tb = float(self.stream.time_base) if self.stream.time_base else 1.0 / self.fps
             # 起始 pts 偏移（.ts/.flv 非零起始），帧号换算需减去
             self.start_pts = _stream_start_pts(self.stream, self.fps)
+            # 容错解码跳过的损坏 packet/帧计数：为 0 表示零丢帧；
+            # >0 表示视频存在坏 NAL（decode 层已跳过）。调用方可在
+            # 迭代结束后读取——processed==0 且此处>0 即可判定"全程解码失败"，
+            # 而不是把空结果当"正常检测完成"（B2）
+            self.decode_errors = 0
         except Exception:
             # 构造中途失败（无视频流等）也要释放容器，避免句柄泄漏锁文件
             self.close()
@@ -211,6 +223,9 @@ class VideoReader:
                         continue
                     yield fidx, f.to_ndarray(format="bgr24")
             except Exception:
+                # 跳过损坏 NAL（兼容开头损坏但后续数据完好的视频）。
+                # 计数暴露给调用方：全程 0 帧 + 全量错误 → 判定解码失败
+                self.decode_errors += 1
                 continue
 
     def close(self):

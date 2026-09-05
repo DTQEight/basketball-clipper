@@ -39,24 +39,40 @@ def get_device() -> str:
 
 # ============ 全局状态 ============
 _model_cache = {}
+# 负缓存（B5）：某权重加载/初始化失败后，同一进程内后续调用直接重抛，
+# 不再反复执行 YOLO(weights) 的慢加载/联网下载——错误不会自行消失，
+# 每次重试都在浪费数秒~数分钟并刷屏日志
+_model_fail_cache = {}
 _model_lock = threading.Lock()  # 懒加载锁：双线程同时未命中会重复加载模型
 
 
 def get_model(weights: str):
+    """加载（或取缓存）YOLO 模型；失败时抛带上下文信息的 RuntimeError。
+
+    B4：加载/设备迁移失败必须显式报错——旧实现迁移失败只 log warning，
+    模型实际留在 cpu，而 get_device() 声称 cuda，随后 predict 每帧失败、
+    空跑数分钟才被 YOLO 熔断拦下，用户无从定位根因。调用方（自检横幅/
+    检测入口）会把异常转成用户可见的明确错误。
+    """
     from ultralytics import YOLO
     with _model_lock:
-        if weights not in _model_cache:
+        if weights in _model_cache:
+            return _model_cache[weights]
+        if weights in _model_fail_cache:
+            raise _model_fail_cache[weights]   # 复用首次异常（含完整上下文）
+        try:
             m = YOLO(weights)
-            # 加载后立即搬到推理设备（与 get_device() 对齐），避免首次推理在 CPU 上跑
-            try:
-                dev = get_device()
-                if dev != "cpu":
-                    m.to(dev)
-            except Exception as e:
-                # 静默 pass 会让 get_device() 结论与模型真实驻地不一致，至少留痕
-                _log.warning(f"[WARN] 模型搬运到 {get_device()} 失败，将由推理端自愈: {e}")
+            dev = get_device()
+            if dev != "cpu":
+                # 搬运失败抛错而不是吞掉：模型驻地与 get_device() 结论分裂时，
+                # 尽早报错比等检测空跑数十分钟后熔断更容易定位
+                m.to(dev)
             _model_cache[weights] = m
-        return _model_cache[weights]
+            return m
+        except Exception as e:
+            err = RuntimeError(f"YOLO 模型加载失败（{weights}）: {e}")
+            _model_fail_cache[weights] = err
+            raise err
 
 
 # 球类精确名集合：自定义权重通常为 'basketball'，COCO 预训练为 'sports ball'。

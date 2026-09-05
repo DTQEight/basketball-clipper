@@ -35,6 +35,13 @@ def _frame_with_ball(cy, radius=6):
     return f
 
 
+def _frame_with_ball_at(cx, cy, radius=6):
+    """在指定 (cx, cy) 画球：用于水平偏离篮筐（in_x=False）的进框诊断测试。"""
+    f = _base_frame()
+    cv2.circle(f, (int(cx), int(cy)), radius, (255, 255, 255), -1)
+    return f
+
+
 def _frame_with_bar(cy, w=56, h=4):
     """细长条形斑块：模糊+形态学处理后圆形度仍 ~0.2，低于 0.35 阈值。"""
     f = _base_frame()
@@ -467,6 +474,58 @@ class TestStateSerialization:
         det2.set_state(state)
         assert det2._baseline_candidate_diff == float("inf")
         assert det2._baseline_candidate_idx == -1
+
+    def test_legacy_checkpoint_missing_warmup_done_no_rewarm(self):
+        """B8: 旧版断点缺 _warmup_done 键 → 视为预热已完成，不触发内部重预热。
+
+        当前流水线的预热由 run_detect 独立前置 pass 完成并持久化阈值；旧断点
+        缺该键时若默认成 not auto_threshold=False，恢复后检测器会把恢复点起的
+        ~30s 当成预热期跳过进球判定、并用新样本重算阈值覆盖断点阈值
+        （双重重预热、结果与断点漂移）。
+        """
+        # auto_threshold=True：模拟 run_detect 恢复时把用户意图挂到正式检测器后
+        det = _detector(auto_threshold=True, diff_threshold=15)
+        legacy = {"goals": [], "diff_threshold": 18,
+                  "_auto_threshold_value": 18}   # 旧版（预热完成后保存）断点，无 _warmup_done
+        det.set_state(legacy)
+        assert det._warmup_done is True           # 缺键默认"已完成"
+        assert det.diff_threshold == 18           # 断点阈值不被覆盖
+        noisy = np.full((240, 320, 3), 110, dtype=np.uint8)
+        det.feed(None, 0, FPS, frame=noisy)
+        # 若误触发内部预热，_warmup_p95s 会开始收集样本；正确行为是不收集
+        assert det._warmup_p95s == []
+        assert det._warmup_sample_count == 0
+
+    def test_legacy_checkpoint_explicit_warmup_false_honored(self):
+        """B8: 显式 _warmup_done=False（预热中断点）仍须被尊重。"""
+        det = _detector(auto_threshold=True, diff_threshold=15)
+        det.set_state({"_warmup_done": False, "_warmup_p95s": [1.0, 2.0]})
+        assert det._warmup_done is False
+        assert det._warmup_p95s == [1.0, 2.0]
+
+
+class TestInHoopDiag:
+    def test_in_hoop_diag_gated_to_horizontal_in_box(self):
+        """B9: diag['in_hoop'] 只统计水平也进框（in_x）的帧，与 blob_in_hoop_frames 同口径。
+
+        旧实现：中心 y 在筐带内、x 距篮筐很远（in_x=False）的无关斑块也计入
+        '筐内'，诊断次数相对真实进框信号虚高，无法与 loose/side 判定路径对应。
+        """
+        det = _detector()
+        # 斑块在搜索区内但 x=90 落在篮筐 x 范围（118..182）外，y=100 在筐带内
+        for i in range(5):
+            f = _frame_with_ball_at(90, 100)
+            det.feed(_ball_pos(100), i, FPS, frame=f)
+        assert det.diag["in_hoop"] == 0
+        assert det.blob_in_hoop_frames == 0
+        assert det.goals == []
+        # 对照：x 真正进框（in_x=True）时同一分支计数（min=6 不触发 loose 进球）
+        det = _detector(min_in_hoop_frames=6)
+        for i in range(2):
+            det.feed(_ball_pos(100), 10 + i, FPS, frame=_frame_with_ball(100))
+        assert det.diag["in_hoop"] == 2
+        assert det.blob_in_hoop_frames == 2
+        assert det.goals == []
 
 
 class TestEndToEndVideo:

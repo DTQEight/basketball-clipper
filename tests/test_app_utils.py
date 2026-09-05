@@ -1,6 +1,11 @@
 """app.get_ball_class_ids 与 video_utils.scan_video_files 单元测试。"""
+import sys
+import types
+
+import pytest
+
 from services import video_utils
-from app import get_ball_class_ids
+from app import get_ball_class_ids, get_model, _model_cache, _model_fail_cache
 
 
 class _FakeModel:
@@ -49,3 +54,65 @@ class TestNaturalSort:
     def test_scan_invalid_folder(self):
         assert video_utils.scan_video_files("/nonexistent-folder-xyz") == []
         assert video_utils.scan_video_files("") == []
+
+
+def _fake_ultralytics(YOLO_cls):
+    """向 sys.modules 注入假 ultralytics 模块（app.get_model 内 import）。"""
+    mod = types.ModuleType("ultralytics")
+    mod.YOLO = YOLO_cls
+    return mod
+
+
+class TestGetModel:
+    """B4+B5: 模型加载/设备迁移失败显式报错 + 失败负缓存。"""
+
+    def test_load_failure_raises_and_negative_cached(self, monkeypatch):
+        """加载失败抛带权重的明确 RuntimeError；第二次调用不再重复加载（负缓存）。"""
+        import app
+        calls = {"n": 0}
+
+        class _FakeYOLO:
+            def __init__(self, weights):
+                calls["n"] += 1
+                raise RuntimeError("weights corrupt")
+
+        monkeypatch.setitem(sys.modules, "ultralytics", _fake_ultralytics(_FakeYOLO))
+        _model_cache.clear()
+        _model_fail_cache.clear()
+        try:
+            with pytest.raises(RuntimeError) as ei:
+                get_model("bad.pt")
+            assert "YOLO 模型加载失败" in str(ei.value)
+            assert "bad.pt" in str(ei.value)
+            with pytest.raises(RuntimeError):
+                get_model("bad.pt")
+            assert calls["n"] == 1          # 负缓存命中，未再次慢加载
+        finally:
+            _model_cache.clear()
+            _model_fail_cache.clear()
+
+    def test_device_migration_failure_raises(self, monkeypatch):
+        """B4: m.to(device) 失败必须抛错，不能只 log warning 后让推理端每次失败。"""
+        import app
+        calls = {"n": 0}
+
+        class _FakeYOLO:
+            def __init__(self, weights):
+                calls["n"] += 1
+
+            def to(self, dev):
+                raise RuntimeError("cuda oom")
+
+        monkeypatch.setitem(sys.modules, "ultralytics", _fake_ultralytics(_FakeYOLO))
+        monkeypatch.setattr(app, "get_device", lambda: "cuda:0")
+        _model_cache.clear()
+        _model_fail_cache.clear()
+        try:
+            with pytest.raises(RuntimeError) as ei:
+                get_model("mig.pt")
+            assert "YOLO 模型加载失败" in str(ei.value)
+            # 失败未进正缓存：清负缓存后重试仍会重新尝试（失败可被恢复）
+            assert "mig.pt" not in _model_cache
+        finally:
+            _model_cache.clear()
+            _model_fail_cache.clear()

@@ -978,6 +978,12 @@ def main_page():
             return
 
         # ===== 断点续识别：检查是否有未完成的检测 =====
+        # B3：弹断点框前先拒绝 busy——后台任务（批量识别/加载/集锦）运行时
+        # 可能正在为同一视频写 checkpoint，此刻弹"从断点继续？"并允许删断点，
+        # 会与后台写 checkpoint 竞态（删掉后台正在保存的进度）。
+        # 检测自身的取消已在上方 current_task()=='detect' 分支处理，此处无需再放行。
+        if _refuse_if_busy():
+            return
         vp = state.video_state["path"]
         if vp and state.has_checkpoint(vp):
             cp = state.load_checkpoint(vp)  # params=None 取最新
@@ -1027,6 +1033,12 @@ def main_page():
                 while _resume_choice["val"] is None:
                     await asyncio.sleep(0.1)
                 if not _resume_choice["val"]:
+                    # B3：对话框等待期间（用户在思考）可能有其他任务启动并在后台
+                    # 写该视频的 checkpoint，此刻删断点会与后台写竞态。删之前
+                    # 二次确认无任务运行（该检查与下方删除/占锁之间无 await，
+                    # 事件循环不会插入其他 handler，判断是原子的）
+                    if _refuse_if_busy():
+                        return
                     # 用户选择从头开始：删除该视频所有 checkpoint
                     state.delete_checkpoint(vp)
 

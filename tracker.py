@@ -482,10 +482,15 @@ class GoalDetector:
             self.diag["cross_above"] += 1
             self.blob_in_hoop_frames = 0
 
-        # 斑块在篮筐框内
+        # 斑块在篮筐框内（中心 y 位于框带内）
         elif self.hoop_top <= cy <= self.hoop_bot:
-            self.diag["in_hoop"] += 1
+            # 仅当水平位置也进框（in_x，含 ±30% 框宽余量）才算"进框"：
+            # diag["in_hoop"] 与 blob_in_hoop_frames 同一口径累加（B9）——
+            # 旧实现不管 in_x 都 +1，把垂直恰好穿过筐带但水平离框很远的
+            # 无关斑块（如球员躯干经过筐下）也计成"筐内"，诊断日志/FAQ 的
+            # "筐内次数"相对真实进框信号虚高，无法与 loose/side 判定路径对应
             if in_x:
+                self.diag["in_hoop"] += 1
                 self.blob_in_hoop_frames += 1
                 self.last_in_hoop_frame = frame_idx
 
@@ -735,7 +740,14 @@ class GoalDetector:
         self._baseline_candidate_diff = float(cand_diff) if cand_diff is not None else float("inf")
         self._baseline_candidate_idx = int(state.get("_baseline_candidate_idx", -1))
         # ---- 自适应阈值 / 预热 ----
-        self._warmup_done = bool(state.get("_warmup_done", not self.auto_threshold))
+        # 旧版断点（_warmup_done 键尚不存在时生成）一律视为"预热已完成"（B8）：
+        # 当前流水线里预热由 run_detect 的独立前置 pass 完成，能走到 set_state
+        # 的 checkpoint 要么 auto_threshold=False（无预热概念）、要么已带
+        # _auto_threshold_value（预热值已持久化，缺 _warmup_done 的旧断点正是
+        # 预热完成后保存的）。若把缺失键默认成 not auto_threshold=False，
+        # 恢复后的正式检测器会把恢复点起前 ~30s 当成预热期跳过进球判定、
+        # 并用新样本重算阈值覆盖断点阈值 → 双重重预热、结果与断点漂移。
+        self._warmup_done = bool(state.get("_warmup_done", True))
         self._auto_threshold_value = state.get("_auto_threshold_value")
         self._warmup_p95_median = state.get("_warmup_p95_median")
         self._warmup_sample_count = int(state.get("_warmup_sample_count", 0))

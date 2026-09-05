@@ -17,15 +17,24 @@ def frame_to_base64(frame) -> "str | None":
     JPEG q85 替代 PNG 无损：标定预览不需要无损，1080p 下
     体积/编码耗时降一个数量级（~5MB/数百 ms → ~300KB/几十 ms），
     不影响 image_x/y 坐标换算（坐标基于元素尺寸，与压缩无关）。
+    编码失败/输入非法返回 None（B6）：坏帧不应让调用方抛裸异常或
+    把空的 data URI 塞给 <img> 导致前端破图。
     """
     if frame is None:
         return None
-    if len(frame.shape) == 3 and frame.shape[2] == 3:
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    _, buf = cv2.imencode('.jpg', frame,
-                          [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    b64 = base64.b64encode(buf).decode('utf-8')
-    return f'data:image/jpeg;base64,{b64}'
+    try:
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode('.jpg', frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok or buf is None or len(buf) == 0:
+            return None
+        b64 = base64.b64encode(buf).decode('utf-8')
+        return f'data:image/jpeg;base64,{b64}'
+    except Exception:
+        # cv2 对非 uint8/异常 dtype 或不完整数组可能抛错；
+        # 统一按"无法编码"返回 None，不让异常穿透到 UI 回调
+        return None
 
 
 def scan_video_files(folder) -> list:

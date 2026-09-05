@@ -350,6 +350,16 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     }
     _checkpoint = state.load_checkpoint(video_path, _cp_params)
     _resuming = _checkpoint is not None
+    # B7：断点已到/越过本次区间末尾（旧版在"恰好处理完最后一帧才取消"时误存的
+    # "已处理到末尾"断点）→ 没有任何可续内容。若照常续跑，start 被改写为 end，
+    # 主循环 0 帧空跑后还误写一条重复历史。删除断点按从头跑。
+    if _resuming and _checkpoint.get("current_frame") is not None \
+            and int(_checkpoint["current_frame"]) >= end:
+        log.info(f"[CHECKPOINT] 断点已到区间末尾（帧 {_checkpoint['current_frame']} >= {end}），"
+                 f"无可续内容，删除并从头开始")
+        state.delete_checkpoint(video_path, _cp_params)
+        _checkpoint = None
+        _resuming = False
     # H2: 预热未完成的断点视为无效。自适应阈值开启但断点里没有算出的阈值
     # （典型：预热阶段点取消 → 主循环第一帧即 break，保存了 current_frame≈start、
     # _auto_threshold_value=None 的空断点）。若照常续跑：预热 pass 被跳过、
@@ -547,6 +557,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         log.info("=" * 68)
         _debug_last_print_time = t0
         _debug_last_processed = 0
+        # B7：主循环是否因取消而未跑完。区分"检测中取消"（保存断点、丢弃结果）
+        # 与"预览生成阶段才取消"（主检测已跑完，结果应当保留）
+        _cancelled_in_loop = False
 
         _report(15, f'开始检测 {n_frames} 帧...')
         reader = VideoReader(video_path)
@@ -562,6 +575,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         try:
             for fidx, frame in reader.iter_frames(start=start, end=end, batch=1):
                 if state.cancel_event.is_set():
+                    _cancelled_in_loop = True  # 主循环未跑完即取消
                     break
                 ball_pos = None
                 ball_frame = None    # ball_pos 对应的真实检测帧号
@@ -628,7 +642,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 _resume_frame = fidx + 1
                 # ===== 断点续识别：每 300 帧保存一次 checkpoint =====
                 # 存 _resume_frame（下一帧帧号，而非 processed 计数）
-                if processed % 300 == 0:
+                # 已到区间末尾（_resume_frame == end）不必存：恢复后 0 帧空跑
+                if processed % 300 == 0 and _resume_frame < end:
                     state.save_checkpoint(
                         video_path, _cp_params, _resume_frame,
                         detector.get_state(),
@@ -695,54 +710,90 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         _t1 = time.time()
         _detect_elapsed = _t1 - t0
-        _report(80, '生成预览片段...')
 
-        # 生成预览片段
-        goals = sorted(detector.goals)
-        state.last_goal_clips.clear()
-        state.kept_goal_indices.clear()
-
-        _stamp = int(time.time())
-        state.last_goal_clips.extend(
-            # 片段边界用完整区间 _orig_start（而非恢复后的 start）：
-            # 恢复点之前检测到的进球若距恢复点超过 3 秒，片段会被
-            # _cut_one 的边界钳制直接丢弃（进球卡片无预览、集锦缺球）
-            _generate_preview_clips(video_path, goals, _orig_start, end,
-                                    fps, total, _stamp, progress_callback=_report,
-                                    cancel_check=state.cancel_event.is_set)
-        )
-
-        if state.cancel_event.is_set():
-            # 用户取消：删除本次已生成的片段文件，清空内存列表，不写入历史
-            _t2 = time.time()
-            for _c in list(state.last_goal_clips):
-                try:
-                    os.remove(_c["path"])
-                except OSError:
-                    pass
+        # ===== 解码告警：全程 0 帧 =====
+        # iter_frames 对损坏 NAL 是逐包容错跳过；若整个区间没有一帧可解码
+        # （容器损坏/编码器不支持），主循环空转结束 processed==0，旧实现会
+        # 以"检测完成/0 进球"收尾并写一条空历史，把解码失败伪装成正常空结果。
+        # 用户主动取消的情况不在此列（走下方取消分支）。
+        if processed == 0 and not state.cancel_event.is_set():
             state.last_goal_clips.clear()
             state.kept_goal_indices.clear()
             state.last_goals.clear()
-            # ===== 断点续识别：取消时保存最终 checkpoint（用户可从此处继续）=====
-            # 仅在本次确有帧已 feed（processed > 0）时保存：预热阶段取消
-            # （主循环第一帧即 break）或视频无可解码帧时没有可恢复的进度，
-            # 保存"空断点"只会让下次启动弹出无意义的续跑提示、且续跑后
-            # 拿不到自适应阈值（H2）
-            if processed > 0:
-                state.save_checkpoint(
-                    video_path, _cp_params, _resume_frame,
-                    detector.get_state(),
-                    extra={
-                        "processed": processed,
-                        "yolo_called": _stat_yolo_called,
-                        "yolo_skipped": _stat_yolo_skipped,
-                        "yolo_failed": _stat_yolo_failed,
-                        "elapsed": _prev_elapsed + _detect_elapsed,
-                    })
-                log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出（可断点续跑）")
-                return f"已取消 | 已处理 {processed} 帧（可断点续跑）", False
-            log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出")
-            return f"已取消 | 已处理 {processed} 帧", False
+            log.error(f"[DECODE FAIL] {video_path} 区间 {_orig_start}-{end} 未解码到任何帧"
+                      f"（decode_errors={getattr(reader, 'decode_errors', 0)}）")
+            return ("❌ 视频区间内未解码到任何帧（容器损坏或编码不受支持），"
+                    "本次结果未持久化，请检查视频后重试", False)
+        # 有帧但跳过部分损坏数据块：留痕便于排查漏检（不影响结果有效性）
+        if processed > 0 and getattr(reader, "decode_errors", 0) > 0:
+            log.warning(f"[WARN] 解码跳过 {reader.decode_errors} 个损坏数据块"
+                        f"（已容错继续，正常处理 {processed} 帧）")
+
+        goals = sorted(detector.goals)
+
+        # ===== 预览片段生成（B7 取消语义）=====
+        # 主循环被取消（_cancelled_in_loop）时不再花数分钟生成预览片段——
+        # 生成完也会在下方取消分支被全部删除，纯属浪费，直接走取消收尾。
+        # 主循环跑完、取消发生在预览阶段时才生成：cancel_check 会停止
+        # 后续尚未开始的切片，已完成的片段保留。
+        if not _cancelled_in_loop:
+            _report(80, '生成预览片段...')
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+
+            _stamp = int(time.time())
+            state.last_goal_clips.extend(
+                # 片段边界用完整区间 _orig_start（而非恢复后的 start）：
+                # 恢复点之前检测到的进球若距恢复点超过 3 秒，片段会被
+                # _cut_one 的边界钳制直接丢弃（进球卡片无预览、集锦缺球）
+                _generate_preview_clips(video_path, goals, _orig_start, end,
+                                        fps, total, _stamp, progress_callback=_report,
+                                        cancel_check=state.cancel_event.is_set)
+            )
+        else:
+            # 主循环被取消：不生成预览，列表保持为空（下方取消分支清空并保存断点）
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+
+        if state.cancel_event.is_set():
+            if _cancelled_in_loop or processed == 0:
+                # 真正的中断（主循环未跑完 / 一帧未处理）：删除本次已生成的片段
+                # 文件，清空内存列表，不写入历史（B7）
+                _t2 = time.time()
+                for _c in list(state.last_goal_clips):
+                    try:
+                        os.remove(_c["path"])
+                    except OSError:
+                        pass
+                state.last_goal_clips.clear()
+                state.kept_goal_indices.clear()
+                state.last_goals.clear()
+                # ===== 断点续识别：取消时保存最终 checkpoint（用户可从此处继续）=====
+                # 仅在有可恢复进度时保存：① 已 feed 过帧（processed > 0）
+                # ② 仍有剩余帧（_resume_frame < end）。预热阶段取消、0 帧、
+                # 或恰好处理到区间末尾才取消（_resume_frame == end）都没有可
+                # 恢复的进度——保存只会制造"已处理到末尾"的假断点，下次继续
+                # 后 0 帧空跑并误写一条重复历史（B7）
+                if _cancelled_in_loop and processed > 0 and _resume_frame < end:
+                    state.save_checkpoint(
+                        video_path, _cp_params, _resume_frame,
+                        detector.get_state(),
+                        extra={
+                            "processed": processed,
+                            "yolo_called": _stat_yolo_called,
+                            "yolo_skipped": _stat_yolo_skipped,
+                            "yolo_failed": _stat_yolo_failed,
+                            "elapsed": _prev_elapsed + _detect_elapsed,
+                        })
+                    log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出（可断点续跑）")
+                    return f"已取消 | 已处理 {processed} 帧（可断点续跑）", False
+                log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED] 已处理 {processed} 帧，取消后退出")
+                return f"已取消 | 已处理 {processed} 帧", False
+            # _cancelled_in_loop=False：取消发生在预览生成阶段，主检测已全部
+            # 跑完（_resume_frame==end）。检测结果与已生成的片段全部保留——
+            # 旧实现把跑完的结果整体删除并另存一个"已处理到末尾"的假断点，
+            # 等于白删数十分钟的检测成果（B7）。片段若有缺失，下方状态文本会提示
+            log.info(f"[{time.strftime('%H:%M:%S')}] [CANCELLED-PREVIEW] 取消于预览阶段，保留已完成的检测结果")
 
         # 检测成功后写入片段缓存并持久化（key 统一走 clip_cache_key，排序+round）
         if state.last_goal_clips:
@@ -915,7 +966,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 时 processed == 0，不保存无进度的空断点；_resume_frame 同理已初始化，
         # 此处不会再因 fidx 未定义抛 NameError（旧实现的 'fidx' in dir() 防了一半）
         try:
-            if 'detector' in dir() and processed > 0:
+            # 异常路径保存 checkpoint 同样要求有剩余帧（_resume_frame < end）：
+            # 与取消路径同一口径，避免存"已处理到末尾"的假断点导致续跑 0 帧空跑（B7）
+            if 'detector' in dir() and processed > 0 and _resume_frame < end:
                 state.save_checkpoint(
                     video_path, _cp_params, _resume_frame,
                     detector.get_state(),
