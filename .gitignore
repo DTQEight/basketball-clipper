@@ -52,3 +52,5 @@ desktop.ini
 # 日志
 *.log
 server.log
+
+bug_report_*.txt
