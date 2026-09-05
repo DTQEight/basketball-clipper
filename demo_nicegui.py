@@ -21,6 +21,7 @@
 """
 import os
 import sys
+import time
 import asyncio
 from pathlib import Path
 
@@ -31,6 +32,12 @@ import numpy as np
 from nicegui import ui
 
 from services import state, detection, video_utils
+
+# 主按钮启动时刻（模块级，跨页面连接/刷新共享）：
+# 用于 1s 双击去抖——启动后 1s 内再次点击"开始识别/批量识别"是双击误触，
+# 忽略而不视为取消（加载/预热期的取消无 checkpoint 兜底且 auto 预热断点
+# 会被判无效重来，双击等于白跑；任务运行中 >1s 的点击仍是正常取消）。
+_START_STAMP = {"detect": 0.0, "batch": 0.0}
 
 # 启动时从磁盘恢复片段缓存
 state.init_clip_cache()
@@ -822,6 +829,9 @@ def main_page():
 
     async def _on_batch_run():
         if state.current_task() == 'batch':
+            # 1s 双击去抖：启动后立即再点一次是双击误触，忽略不做取消
+            if time.time() - _START_STAMP["batch"] < 1.0:
+                return
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
             state.cancel_event.set()
             batch_run_btn.set_text('正在取消...')
@@ -834,6 +844,7 @@ def main_page():
         if not token:
             return
         state.cancel_event.clear()
+        _START_STAMP["batch"] = time.time()  # 双击去抖基准
         batch_progress_strip.classes(remove='hidden')  # 显示常驻迷你进度条
         batch_mini_bar.set_value(0)
         batch_mini_text.set_text('后台识别中')
@@ -956,6 +967,10 @@ def main_page():
 
     async def _on_detect():
         if state.current_task() == 'detect':
+            # 1s 双击去抖：启动后立即再点一次是双击误触，忽略不做取消
+            # （加载/预热期取消无 checkpoint 兜底；运行超 1s 的点击仍是正常取消）
+            if time.time() - _START_STAMP["detect"] < 1.0:
+                return
             # 检测中点击 → 请求取消，run_detect 轮询后中断
             state.cancel_event.set()
             detect_btn.set_text('正在取消...')
@@ -1020,6 +1035,7 @@ def main_page():
             return
         _cards_video["path"] = None  # 单视频检测结果显示在全局模式
         state.cancel_event.clear()
+        _START_STAMP["detect"] = time.time()  # 双击去抖基准
         detect_btn.set_text('取消')
         detect_btn.enable()
         # 写入共享进度槽：刷新后新页面可恢复"运行中"UI（timer 轮询）
