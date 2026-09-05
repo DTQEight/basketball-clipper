@@ -71,6 +71,32 @@ def _feed_seq(det, cys, start_idx=0, with_yolo=True):
     return goals
 
 
+class TestAboveFlagLifetime:
+    def test_above_flag_reset_on_gap(self):
+        """断档（连续无斑块帧）必须复位 blob_above_hoop：
+        该布尔无时间上限，残留会让很久之后的无关"下方下移"走上方穿越路径1 误报。"""
+        det = _detector(loose_mode=True)
+        for i in range(3):
+            det.feed(_ball_pos(40), i, FPS, frame=_frame_with_ball(40))
+        assert det.blob_above_hoop is True
+        # 60 帧无球（> 1.5s 超时窗），旧实现不清 flag → 残留
+        for i in range(3, 63):
+            det.feed(None, i, FPS, frame=_base_frame())
+        assert det.blob_above_hoop is False
+        assert det.goals == []
+
+    def test_above_flag_reset_after_loose_goal(self):
+        """loose 进球注册后复位上方标记，避免同轨迹结束后 flag 残留。"""
+        det = _detector()
+        # 上方 3 帧 → 筐内 3 帧（YOLO 确认，第 2 个筐内帧注册 loose 进球）
+        goals = _feed_seq(det, [40, 40, 40, 100, 100, 100])
+        assert len(goals) == 1
+        assert det.blob_above_hoop is False
+        # 进球后再来 1 帧下方运动：不应因旧 flag 立即再注册
+        g = det.feed(_ball_pos(130), 10, FPS, frame=_frame_with_ball(130))
+        assert g is None and len(det.goals) == 1
+
+
 class TestGoalPaths:
     def test_loose_goal_with_yolo_confirm(self):
         """球经过筐内 2 帧且 YOLO 有球 → 注册 1 个进球。"""

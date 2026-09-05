@@ -456,6 +456,7 @@ class GoalDetector:
             self.blob_history.clear()
             self.blob_in_hoop_frames = 0
             self.blob_persistent_frames = 0  # 无斑块，重置持续计数
+            self.blob_above_hoop = False  # 上方状态只属于当前连续轨迹段，断档即失效
             self.last_blob_box = None
             return None
 
@@ -499,6 +500,11 @@ class GoalDetector:
                         ts = frame_idx / fps
                         if self._register_goal(ts, frame_idx, fps, "loose"):
                             self.blob_in_hoop_frames = 0
+                            # loose 进球后复位"曾在上方"标记：否则本次下穿轨迹结束后，
+                            # flag 无限期残留，几秒后任意无关"下方下移"斑块会走路径1
+                            # 直接按 visual 注册（无 YOLO 部署时无兜底）
+                            self.blob_above_hoop = False
+                            self.last_above_frame = -999
                             return ts
                     else:
                         self.diag["yolo_rejected"] += 1

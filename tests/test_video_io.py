@@ -58,3 +58,17 @@ class TestReadFrameContract:
         del r                                     # 触发 __del__ → close()
         import gc
         gc.collect()
+
+
+class TestScanVideoFiles:
+    def test_scan_ignores_fake_dir_and_non_str(self, tmp_path):
+        """scan_video_files：伪视频（*.mp4 子目录）不返回；非 str/None 不抛。"""
+        import os
+        from services import video_utils
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        (tmp_path / "fake.mp4").mkdir()
+        (tmp_path / "b.mov").write_bytes(b"x")
+        got = [os.path.basename(p) for p in video_utils.scan_video_files(str(tmp_path))]
+        assert got == ["a.mp4", "b.mov"]
+        assert video_utils.scan_video_files(None) == []
+        assert video_utils.scan_video_files(123) == []

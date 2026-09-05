@@ -28,16 +28,21 @@ def frame_to_base64(frame) -> "str | None":
     return f'data:image/jpeg;base64,{b64}'
 
 
-def scan_video_files(folder: str) -> list:
+def scan_video_files(folder) -> list:
     """扫描文件夹内的视频文件，按自然顺序排序。"""
+    if not isinstance(folder, str):
+        return []
     folder = folder.strip().strip('"').strip("'")
     if not folder or not os.path.isdir(folder):
         return []
     files = []
     for name in os.listdir(folder):
         ext = os.path.splitext(name)[1].lower()
+        # isfile 过滤：扩展名形如 *.mp4 的子目录不应被当作视频返回
         if ext in state.VIDEO_EXTS:
-            files.append(os.path.join(folder, name))
+            fpath = os.path.join(folder, name)
+            if os.path.isfile(fpath):
+                files.append(fpath)
 
     def _natural_key(s):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]

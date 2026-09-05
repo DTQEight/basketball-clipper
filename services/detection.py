@@ -299,12 +299,18 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     hoop = state.calib["hoop"]
     fps = state.video_state["fps"]
     total = state.video_state["total"]
-    start = max(0, int(start_frame))
+    start = max(0, int(start_frame or 0))
     end = int(end_frame) if end_frame and int(end_frame) > 0 else total
-    end = min(max(start + 1, end), total)
+    # 区间合法性必须先于 clamp 校验：旧实现先 `max(start+1, end)` 强制抬升，
+    # 使"结束 ≤ 起始"（如 500→100）永远检查不到，静默对 1 帧跑完整流程并
+    # 返回"成功"，结果误导。
     if end <= start:
         _release_lock()
         return "❌ 结束帧必须大于起始帧", False
+    end = min(max(start + 1, end), total)
+    if end <= start:
+        _release_lock()
+        return "❌ 结束帧必须大于起始帧（且不超出视频总帧数）", False
 
     # ===== 断点续识别辅助量（必须在恢复逻辑改写 start 之前确定）=====
     # _orig_start: 完整检测区间的原始起始帧。断点恢复会把 start 改写为断点帧，
@@ -486,6 +492,14 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if _resuming:
             detector.set_state(_cp_det_state)
 
+        # 预热阶段取消的再短路：预热跑完到主循环之间还有断点恢复/模型加载等
+        # 耗时步骤（数秒~十几秒），此时取消应立即退出，不应继续加载 YOLO/跑主循环
+        # （与预热前取消 362-366 行为一致，都清空旧结果避免残留误导）
+        if state.cancel_event.is_set():
+            state.last_goal_clips.clear()
+            state.kept_goal_indices.clear()
+            state.last_goals.clear()
+            return "已取消（预热阶段）", False
         _report(10, '加载 YOLO 模型...')
         model, _weights_path = get_ball_model()
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
@@ -525,7 +539,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 log.info(f"  Auto-thresh : ON (预热未完成, 回退固定阈值 {_effective_diff_threshold})")
         else:
             log.info(f"  Auto-thresh : OFF (固定阈值 {diff_threshold})")
-        log.info(f"  YOLO step   : every {yolo_step} frames  ({100/yolo_step:.0f}% coverage)")
+        log.info(f"  YOLO step   : every {yolo_step} frames  ({100/max(1, int(yolo_step)):.0f}% coverage)")
         if skip_yolo_no_motion:
             log.info(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
         log.info(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")

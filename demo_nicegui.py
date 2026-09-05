@@ -1369,6 +1369,11 @@ def main_page():
         token = _try_acquire('highlights')
         if not token:
             return
+        # 非流水线集锦使用 cancel_event 作为剪辑取消检查；cancel_event 只在
+        # detect/batch 启动处 clear。若用户之前取消过检测/批量，flag 残留会让
+        # 本次集锦"第一段即判取消"（幽灵取消）。已独占任务锁、无并发任务，
+        # 且非流水线导出本就没有取消 UI，此处 clear 不损失任何功能。
+        state.cancel_event.clear()
         from nicegui import run
         # 在右侧预览区显示进度
         _show_right_pane('progress')
@@ -1452,6 +1457,9 @@ def main_page():
         token = _try_acquire('highlights')
         if not token:
             return
+        # 同 _on_highlights：非流水线整场集锦以 cancel_event 为取消检查，
+        # 残留的取消 flag 会造成幽灵取消（第一段即失败）；独占锁后 clear
+        state.cancel_event.clear()
         from nicegui import run
         _show_right_pane('progress')
         progress_bar.set_value(0)
@@ -1576,8 +1584,11 @@ def main_page():
         if state.video_state["path"]:
             path_input.set_value(state.video_state["path"])
             _selected_history["video"] = state.video_state["path"]
-        # 加载历史 = 单视频模式：隐藏批量面板（state 层已清 batch 三件套）
+        # 加载历史 = 单视频模式：隐藏批量面板（state 层已清 batch 三件套），
+        # 并复位快照查看指针——否则此前批量快照查看残留的 _cards_video["path"]
+        # 会让列表/√×/导出仍作用在旧快照视频上，历史记录看似加载实则操作错对象
         batch_panel.classes(add='hidden')
+        _cards_video["path"] = None
         info_text.set_text(info)
         _set_status(status, 'ok' if frame is not None else 'err')
         _refresh_result_cards()

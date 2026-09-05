@@ -221,6 +221,13 @@ nvenc_semaphore = threading.Semaphore(2)
 
 
 # ============ 历史记录 ============
+# 历史目录"读-改-写"互斥：update_history_labels（人工打标/流水线标记）与
+# add_history（检测完成落盘）内部都是 load_history(全量) → 改 → save_history(全量
+# 重写)。流水线模式下前台给已完成视频 X 打标、后台批量正给视频 Y 落盘，两线程
+# 各自持旧快照交错读写时，会用旧记录覆盖对方刚写入的记录（静默丢历史/丢标签）。
+_history_io_lock = threading.Lock()
+
+
 def _safe_filename_component(name: str) -> str:
     """将文件名中的路径不安全字符替换为下划线。"""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
@@ -644,6 +651,13 @@ def _find_history_record(records, video_path):
 
 
 def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None):
+    """对已有历史记录打/更新人工标签（加写锁防与 add_history 全量写竞态）。"""
+    with _history_io_lock:
+        return _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list,
+                                           person_map)
+
+
+def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, person_map=None):
     """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
 
     √ 确认 → kept_ts_list（正样本），× 误报 → deleted_ts_list（负样本）。
@@ -841,6 +855,14 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
 
 
 def add_history(video_path, hoop, goals, baseline_idx=-1,
+                diff_threshold=None, **fields):
+    """添加一条历史记录（加写锁防与 update_history_labels 全量写竞态）。"""
+    with _history_io_lock:
+        return _add_history_impl(video_path, hoop, goals, baseline_idx,
+                                 diff_threshold, **fields)
+
+
+def _add_history_impl(video_path, hoop, goals, baseline_idx=-1,
                 diff_threshold=None, **fields):
     """添加一条历史记录（同视频会覆盖旧记录）。
 
