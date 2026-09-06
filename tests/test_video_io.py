@@ -69,6 +69,67 @@ class TestReadFrameContract:
         assert r.decode_errors == 0
 
 
+class TestIterFramesDemuxTolerance:
+    """iter_frames 容器层 demux 异常容错（截断文件回归）。
+
+    旧实现只包住了逐包 decode，demux 抛 ArgumentError("partial file")
+    （断电录制/拷贝中断的 mp4 尾部缺数据）会直接穿出迭代器，
+    打崩 run_detect 主循环。修复后：计数 decode_errors 并优雅停止。
+    """
+
+    def test_demux_error_stops_gracefully(self):
+        class _RaiseDemux:
+            def demux(self, stream):
+                # 首次 next() 即抛容器层错误，模拟读越过真实数据末尾
+                raise RuntimeError("partial file")
+
+            def seek(self, *a, **k):
+                pass
+
+        r = object.__new__(VideoReader)
+        r.container = _RaiseDemux()
+        r.stream = type("S", (), {"codec_context": object()})()
+        r.total = 100
+        r.fps = 30.0
+        r.tb = 1.0 / 30.0
+        r.start_pts = 0
+        r.decode_errors = 0
+        frames = list(r.iter_frames(start=0, end=50, batch=1))
+        assert frames == []        # 无帧产出但**不抛异常**
+        assert r.decode_errors >= 1  # 容器层错误已计数（调用方可告警）
+
+    def test_demux_argument_error_swallowed(self):
+        """容器层 ArgumentError（真实截断文件错误类型）被吞掉，迭代正常结束。"""
+        import av as _av
+
+        class _FakePacket:
+            pass
+
+        class _FakeContainer:
+            def demux(self, stream):
+                yield _FakePacket()   # 首包尝试解码
+                raise _av.error.ArgumentError("Invalid argument: partial file")
+
+            def seek(self, *a, **k):
+                pass
+
+        class _FakeCC:
+            def decode(self, p):
+                yield _FakePacket()   # 解码产出非帧对象 → 走内层 except
+
+        r = object.__new__(VideoReader)
+        r.container = _FakeContainer()
+        r.stream = type("S", (), {"codec_context": _FakeCC()})()
+        r.total = 100
+        r.fps = 30.0
+        r.tb = 1.0 / 30.0
+        r.start_pts = 0
+        r.decode_errors = 0
+        frames = list(r.iter_frames(start=0, end=50, batch=1))
+        assert frames == []              # 不产帧（假对象解码失败）但**不抛异常**
+        assert r.decode_errors >= 2      # 内层 decode 1 + 外层 demux 1，均已计数
+
+
 class _FakeStream:
     def __init__(self, start_time, time_base):
         self.start_time = start_time

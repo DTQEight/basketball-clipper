@@ -999,47 +999,30 @@ def main_page():
                        f"（点「取消」将丢弃断点并从头开始）")
                 # NiceGUI 对话框
                 from nicegui import ui
-                _resume_choice = {"val": None}
-
-                async def _on_yes():
-                    _resume_choice["val"] = True
-                    dlg.close()
-
-                async def _on_no():
-                    _resume_choice["val"] = False
-                    dlg.close()
-
+                # 原生 await + submit：当前版本 Dialog 无 on_hide（旧 API 已被移除，
+                # 此处曾抛 AttributeError 导致弹框即崩、按钮看似无效）。
+                # submit 结束等待并返回结果；客户端断开/对话框被删除时
+                # _handle_delete 也会置位 submitted → await 返回 None，
+                # 不会把 handler 永久挂死（与 H3 persistent+兜底同目标）。
                 with ui.dialog() as dlg, ui.card().classes('p-4 gap-3'):
                     ui.label('断点续识别').classes('text-lg font-bold')
                     ui.label(msg).classes('text-sm whitespace-pre-line')
                     with ui.row().classes('w-full justify-end gap-2'):
-                        ui.button('从头开始', on_click=_on_no).props('ripple').style(
+                        ui.button('从头开始', on_click=lambda: dlg.submit(False)).props('ripple').style(
                             'background: var(--bg-elevated); color: var(--text-secondary)')
-                        ui.button('继续识别', on_click=_on_yes).props('ripple').style(
+                        ui.button('继续识别', on_click=lambda: dlg.submit(True)).props('ripple').style(
                             'background: var(--accent); color: var(--bg-canvas)')
-                # persistent：禁止点遮罩/ESC 关闭。对话框被外因关闭后无人写
-                # _resume_choice，下方 while 轮询会把检测按钮的 async handler
-                # 永久挂死（期间无法再启动任何检测，直到刷新页面）
+                # persistent：禁止点遮罩/ESC 关闭；外因关闭（断连等）→ submit None
                 dlg.props('persistent')
-
-                def _on_dlg_hide():
-                    # 兜底：对话框以任何其他方式关闭且未做选择时按"从头开始"处理，
-                    # 保证 while 轮询必然退出
-                    if _resume_choice["val"] is None:
-                        _resume_choice["val"] = False
-                dlg.on_hide(_on_dlg_hide)
-                dlg.open()
-                # 等待用户选择
-                while _resume_choice["val"] is None:
-                    await asyncio.sleep(0.1)
-                if not _resume_choice["val"]:
+                _resume_choice = await dlg
+                if not _resume_choice:
                     # B3：对话框等待期间（用户在思考）可能有其他任务启动并在后台
                     # 写该视频的 checkpoint，此刻删断点会与后台写竞态。删之前
                     # 二次确认无任务运行（该检查与下方删除/占锁之间无 await，
                     # 事件循环不会插入其他 handler，判断是原子的）
                     if _refuse_if_busy():
                         return
-                    # 用户选择从头开始：删除该视频所有 checkpoint
+                    # 用户选择从头开始（或对话框被外因关闭）：删除该视频所有 checkpoint
                     state.delete_checkpoint(vp)
 
         token = _try_acquire('detect')

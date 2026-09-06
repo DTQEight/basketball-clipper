@@ -202,31 +202,45 @@ class VideoReader:
         end:   结束帧号（不包含），None 则到视频末尾
         batch: 抽帧间隔，每 batch 帧取 1 帧（<1 视为 1，防取模除零）
         yield: (frame_idx, frame_bgr)
+
+        容错范围：decode 逐包与 demux 容器层都做异常隔离——损坏 NAL 跳过
+        继续，截断/读取到 EOF 边界（容器层错误）则停止迭代并计入
+        decode_errors，不再把异常穿给调用方导致整次检测崩溃
+        （断电录制/拷贝中断的 mp4 尾部常缺数据）。
         """
         batch = max(int(batch), 1)
         if end is None:
             end = self.total
         self.seek(start)
         # demux + codec_context.decode 替代 container.decode：逐 packet try/except
-        # 跳过损坏 NAL（与 read_frame 同一容错策略，保证检测流程也能处理损坏视频）
+        # 跳过损坏的 NAL（与 read_frame 同一容错策略，保证检测流程也能处理损坏视频）
         cc = self.stream.codec_context
-        for p in self.container.demux(self.stream):
-            try:
-                for f in cc.decode(p):
-                    cur_pts = f.pts if f.pts is not None else 0
-                    fidx = int(round((cur_pts - self.start_pts) * self.tb * self.fps))
-                    if fidx < start:
-                        continue
-                    if fidx >= end:
-                        return
-                    if (fidx - start) % batch != 0:
-                        continue
-                    yield fidx, f.to_ndarray(format="bgr24")
-            except Exception:
-                # 跳过损坏 NAL（兼容开头损坏但后续数据完好的视频）。
-                # 计数暴露给调用方：全程 0 帧 + 全量错误 → 判定解码失败
-                self.decode_errors += 1
-                continue
+        try:
+            for p in self.container.demux(self.stream):
+                try:
+                    for f in cc.decode(p):
+                        cur_pts = f.pts if f.pts is not None else 0
+                        fidx = int(round((cur_pts - self.start_pts) * self.tb * self.fps))
+                        if fidx < start:
+                            continue
+                        if fidx >= end:
+                            return
+                        if (fidx - start) % batch != 0:
+                            continue
+                        yield fidx, f.to_ndarray(format="bgr24")
+                except Exception:
+                    # 跳过损坏 NAL（兼容开头损坏但后续数据完好的视频）。
+                    # 计数暴露给调用方：全程 0 帧 + 全量错误 → 判定解码失败
+                    self.decode_errors += 1
+                    continue
+        except Exception:
+            # 容器层 demux 错误：多为截断文件读越过真实数据末尾
+            # （如 "partial file"）。没有更多可解数据，计数后停止迭代——
+            # 已解出的帧仍然有效，由调用方按 decode_errors>0 决定如何告警。
+            # 旧实现此处异常直接穿出迭代器，打崩 run_detect 主循环
+            # （断电录制/拷贝中断的 mp4 尾部常缺数据）。
+            self.decode_errors += 1
+            return
 
     def close(self):
         if self.container:
