@@ -1063,6 +1063,63 @@ def clip_action(action, idx, video_path=None, person=None):
     return None, ""
 
 
+def export_single_clip_hq(idx, video_path=None, pre_roll=5, post_roll=5,
+                          task_token=0):
+    """按集锦规格现场导出单个进球片段（高质量 hq + 前后时长可调）。
+
+    检测完成后每球会生成一个 ±3s 的轻量预览片段（cq26 低码率、边界固定），
+    用于卡片内快速浏览；旧实现卡片「导出」直接把这个预览文件原样下载——
+    导出物与集锦成品规格不一致（时长短、码率低）。
+
+    本函数改为现场用与 generate_highlights 相同的参数（cut_clips 内部固定
+    hq: NVENC cq20 / libx264 crf18）按 (ts-pre_roll, ts+post_roll) 重切该球，
+    产出与集锦同规格的单球视频再交由 UI 下载。
+
+    idx: 片段索引（卡片第几个球）
+    video_path: 快照模式传批量视频路径；None=单视频模式用全局状态
+    pre_roll / post_roll: 进球前后时长（秒），UI 集锦滑块当前值
+    task_token: 非零时由调用方持有任务锁，异常/完成在 finally 释放（锁归任务本体）
+    返回: (输出文件路径或 None, 状态文本)
+    """
+    try:
+        # ===== 数据源定位（与 clip_action 同一规则）=====
+        if video_path is not None:
+            snap = state.batch_results.get(video_path)
+            if not snap:
+                return None, "❌ 该视频没有检测结果"
+            clips = snap["clips"]
+            src = video_path
+        else:
+            if state.video_state["path"] is None:
+                return None, "❌ 请先加载视频并检测进球"
+            clips = state.last_goal_clips
+            src = state.video_state["path"]
+        if idx < 0 or idx >= len(clips):
+            return None, "❌ 片段索引无效"
+        ts = float(clips[idx]["ts"])
+        if not os.path.exists(src):
+            return None, f"❌ 源视频不存在: {src}"
+
+        # 输出到 demo_output，命名带进球时刻避免覆盖：{源名}-{ts}-单球.mp4
+        _vname = os.path.splitext(os.path.basename(src))[0]
+        out_path = os.path.join(state.DEMO_OUTPUT_DIR,
+                                f"{_vname}-goal-{ts:.1f}s.mp4")
+        from cutter.ffmpeg_cutter import cut_clips
+        path = cut_clips(src, [ts], pre_roll=int(pre_roll),
+                         post_roll=int(post_roll), min_gap=0,
+                         output_path=out_path)
+        if path and os.path.exists(path):
+            return path, (f"已按集锦规格导出（{ts:.1f}s ±{pre_roll:.0f}/{post_roll:.0f}s，高质量）\n"
+                          f"输出: {path}")
+        return None, "❌ 单球导出失败（见日志）"
+    except Exception as e:
+        import traceback
+        return None, f"❌ 单球导出异常: {e}\n{traceback.format_exc()}"
+    finally:
+        if task_token:
+            state.release_task(task_token)
+
+
 # 人物筛选哨兵值：仅导出"已分类"（任意人物）的片段，不含未分类片段。
 # 用双下划线包裹降低与真实人名撞车的概率；UI 下拉以 detection.PERSON_FILTER_CLASSIFIED 为键。
 PERSON_FILTER_CLASSIFIED = "__classified__"

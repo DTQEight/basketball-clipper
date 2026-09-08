@@ -508,6 +508,9 @@ def main_page():
                 # 底部留白
                 ui.label('').classes('h-4')
 
+    # 单球「导出」并发小锁：现切 ffmpeg 需排队（nvenc 配额有限），避免连点并发
+    _export_clip_busy = {"on": False}
+
     # ====== 事件处理函数 ======
     def _set_status(text, kind='info'):
         """设置结果状态文本并切换颜色（ok=绿 / err=红 / busy=青 / info=灰）。"""
@@ -1326,9 +1329,32 @@ def main_page():
         _set_status(status, 'info')
 
     def _on_export_clip(idx):
+        # 全局模式下有任务运行时拒绝（与 √/× 同一规则：导出也要切源视频，
+        # 与检测/批量线程共写同一源，避免竞态）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        path, status = detection.clip_action("export", idx, video_path=_cards_video["path"])
+        # 单球导出现场走 ffmpeg（hq 质量 + 集锦前后时长），避免 io_bound 同步阻塞
+        import asyncio
+        asyncio.create_task(_run_export_clip(idx))
+
+    async def _run_export_clip(idx):
+        # 导出小锁：连点/并发导出共用 nvenc 配额，逐球排队更稳
+        if _export_clip_busy["on"]:
+            _set_status('正在导出上一球，请稍候...', 'busy')
+            return
+        _export_clip_busy["on"] = True
+        _set_status('正在按集锦规格导出该球...', 'busy')
+        try:
+            from nicegui import run
+            path, status = await run.io_bound(
+                detection.export_single_clip_hq, idx,
+                video_path=_cards_video["path"],
+                pre_roll=int(hl_pre_roll.value), post_roll=int(hl_post_roll.value))
+        except Exception as _e:
+            import traceback
+            path, status = None, f"❌ 单球导出异常: {_e}\n{traceback.format_exc()}"
+        finally:
+            _export_clip_busy["on"] = False
         if path and os.path.exists(path):
             ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
