@@ -343,18 +343,18 @@ def main_page():
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
-                                yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=False).classes('w-full')
-                                ui.label('默认每2帧（推荐, 更准）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
-                                skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=False).classes('w-full')
+                                yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=True).classes('w-full')
+                                ui.label('默认每3帧（推荐, 提速）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
+                                skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=True).classes('w-full')
                                 ui.label('篮筐区域无运动像素时跳过 YOLO 推理').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 with ui.row().classes('gap-2 w-full'):
                                     start_frame = ui.number(label='起始帧', value=0, format='%d').classes('flex-1')
                                     end_frame = ui.number(label='结束帧(0=末尾)', value=0, format='%d').classes('flex-1')
                                 with ui.row().classes('gap-2 w-full'):
-                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.3, step=0.05).classes('flex-1')
+                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.2, step=0.05).classes('flex-1')
                                     ui.label().bind_text_from(ball_conf, 'value', lambda v: f'置信度: {v:.2f}').classes('text-gray-400 text-xs')
                                 with ui.row().classes('gap-2 w-full'):
-                                    min_gap = ui.slider(min=1.0, max=10.0, value=3.0, step=0.5).classes('flex-1')
+                                    min_gap = ui.slider(min=1.0, max=10.0, value=2.0, step=0.5).classes('flex-1')
                                     ui.label().bind_text_from(min_gap, 'value', lambda v: f'进球间隔: {v:.1f}s').classes('text-gray-400 text-xs')
                                 with ui.expansion('高级', icon='tune').classes('w-full text-gray-400'):
                                     auto_threshold_switch = ui.switch('自适应阈值', value=True).classes('text-xs')
