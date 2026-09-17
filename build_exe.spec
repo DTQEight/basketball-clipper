@@ -2,7 +2,7 @@
 """篮球进球集锦助手 - PyInstaller 打包配置。
 
 用法:
-    .\env\Scripts\python.exe -m PyInstaller build_exe.spec --noconfirm
+    env/Scripts/python.exe -m PyInstaller build_exe.spec --noconfirm
 
 产物: dist/basketball-clipper/  (目录模式，内含 basketball-clipper.exe)
 体积: ~4.5 GB (含 torch+CUDA 12.1 + ffmpeg + YOLO 权重)
@@ -94,14 +94,23 @@ a = Analysis(
     noarchive=False,
 )
 
-# collect-all 等价：对每个包收集 data + binaries + submodules
-import PyInstaller.utils.hooks as hooks
+# collect-all：对每个包收集 data + binaries + submodules
+# 注意：PyInstaller 6.x 的 collect_all 返回的 datas/binaries 已是 3 元组 (dest, src, typecode)
+# 直接用 collect_data_files/collect_dynamic_libs 会返回 2 元组，导致 COLLECT 阶段 unpack 失败
+from PyInstaller.utils.hooks import collect_all
 
 for pkg in collect_all_packages:
     try:
-        a.datas += hooks.collect_data_files(pkg)
-        a.binaries += hooks.collect_dynamic_libs(pkg)
-        a.hiddenimports += hooks.collect_submodules(pkg)
+        collected = collect_all(pkg)
+        # PyInstaller 不同版本 collect_all 返回 dict 或 list，兼容两种
+        if isinstance(collected, dict):
+            a.datas += collected.get("datas", [])
+            a.binaries += collected.get("binaries", [])
+            a.hiddenimports += collected.get("hiddenimports", [])
+        elif isinstance(collected, (list, tuple)) and len(collected) == 3:
+            a.datas += collected[0] or []
+            a.binaries += collected[1] or []
+            a.hiddenimports += collected[2] or []
     except Exception as e:
         print(f"[warn] collect {pkg}: {e}")
 
