@@ -45,6 +45,7 @@ excludes = [
     "IPython", "jupyter", "notebook",
     "pytest", "sphinx", "numpydoc",
     "test", "tests", "tkinter",
+    "polars",                           # 178MB，未直接使用
 ]
 
 a = Analysis(
@@ -101,7 +102,33 @@ def _normalize_toc(toc_list):
 a.datas = _normalize_toc(list(a.datas))
 a.binaries = _normalize_toc(list(a.binaries))
 
+# ---- 体积优化：剔除 YOLO 推理不用的 CUDA 库 ----
+# 经测试可安全删除（不影响 torch 加载和 YOLO CNN 推理）：
+_EXCLUDE_DLLS = {
+    "cudnn_adv64_9.dll",                  # 230MB cuDNN 高级算子(RNN/attention)
+    "cusolverMg64_11.dll",                # 73MB  多 GPU 求解器
+}
+_before = len(a.binaries)
+a.binaries = [
+    b for b in a.binaries
+    if not any(excl in str(b[0]) for excl in _EXCLUDE_DLLS)
+]
+_freed = sum(
+    (Path(b[1]).stat().st_size if len(b) >= 2 and Path(b[1]).exists() else 0)
+    for b in a.binaries
+)
+print(f"[trim] 剔除 {_before - len(a.binaries)} 个 CUDA DLL")
+
 pyz = PYZ(a.pure)
+
+# UPX 压缩：压缩非 torch 的 DLL/EXE，torch CUDA 库不压缩（压缩后会损坏）
+_upx = r"C:\Users\desktop\AppData\Local\Microsoft\WinGet\Packages\UPX.UPX_Microsoft.Winget.Source_8wekyb3d8bbwe\upx-5.2.1-win64\upx.exe"
+_upx_exclude = [
+    "torch_cuda", "torch_cpu", "torch_python",
+    "cudnn", "cublas", "cufft", "cusparse", "cusolver", "curand",
+    "nvrtc", "nvJitLink", "caffe2", "fbgemm",
+    "avcodec", "avformat", "avutil", "swscale", "swresample",
+]
 
 # onefile 模式：把 binaries + datas 全部塞进 EXE，不需要 COLLECT
 exe = EXE(
@@ -115,7 +142,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=True,
+    upx_exclude=_upx_exclude,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
