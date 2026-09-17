@@ -5,7 +5,10 @@
     env/Scripts/python.exe -m PyInstaller build_exe.spec --noconfirm
 
 产物: dist/basketball-clipper/  (目录模式，内含 basketball-clipper.exe)
-体积: ~4.5 GB (含 torch+CUDA 12.1 + ffmpeg + YOLO 权重)
+体积: ~2.9 GB (含 torch+CUDA 12.1 + ffmpeg + YOLO 权重)
+
+注意: 本 spec 的依赖收集与剔除规则必须与 build_exe_onefile.spec 保持一致，
+      否则会出现「单文件版能跑、目录版报 WinError 126」这类问题。
 """
 import os
 import sys
@@ -26,11 +29,8 @@ collect_all_packages = [
 ]
 
 # ---- 额外数据文件 ----
-datas = [
-    # YOLO 球检测权重
-    (str(ROOT / "weights" / "basketball_ft.pt"), "weights"),
-]
-# 若存在其他权重一并打包
+datas = []
+# YOLO 球检测权重（打包 weights 目录下所有 .pt）
 wdir = ROOT / "weights"
 if wdir.exists():
     for pt in wdir.glob("*.pt"):
@@ -79,6 +79,7 @@ excludes = [
     "test",
     "tests",
     "tkinter",
+    "polars",              # 178MB，未直接使用
 ]
 
 a = Analysis(
@@ -116,6 +117,43 @@ for pkg in collect_all_packages:
 
 # 去重
 a.hiddenimports = list(dict.fromkeys(a.hiddenimports))
+
+
+def _normalize_toc(toc_list):
+    """确保 TOC 条目都是 3 元组 (dest, src, typecode)。
+
+    PyInstaller 6.x 某些 hook/collect 返回 2 元组 (dest, src)，
+    传给 EXE/COLLECT 时会触发 normalize_toc 解包失败。
+    """
+    fixed = []
+    for item in toc_list:
+        if isinstance(item, (list, tuple)):
+            if len(item) == 3:
+                fixed.append(tuple(item))
+            elif len(item) == 2:
+                dest, src = item
+                typecode = "BINARY" if str(src).lower().endswith(
+                    (".dll", ".pyd", ".so", ".dylib")) else "DATA"
+                fixed.append((dest, src, typecode))
+    return fixed
+
+
+a.datas = _normalize_toc(list(a.datas))
+a.binaries = _normalize_toc(list(a.binaries))
+
+# ---- 体积优化：仅剔除经实测确认不影响 YOLO 推理的 CUDA 库 ----
+# 以下两个已由单文件版实测验证可安全删除；其余 cudnn/nvrtc/cufft/cusolver
+# 系列存在相互依赖，删除会导致 WinError 126 或 CUDNN_STATUS_NOT_INITIALIZED
+_EXCLUDE_DLLS = {
+    "cudnn_adv64_9.dll",                  # 230MB cuDNN 高级算子(RNN/attention)
+    "cusolverMg64_11.dll",                # 73MB  多 GPU 求解器
+}
+_before = len(a.binaries)
+a.binaries = [
+    b for b in a.binaries
+    if not any(excl in str(b[0]) for excl in _EXCLUDE_DLLS)
+]
+print(f"[trim] 剔除 {_before - len(a.binaries)} 个 CUDA DLL")
 
 pyz = PYZ(a.pure)
 

@@ -54,3 +54,7 @@ desktop.ini
 server.log
 
 bug_report_*.txt
+
+# 打包产物（PyInstaller 中间文件 / onedir 目录 / 单文件 exe / 安装包）
+build/
+dist/
