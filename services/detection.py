@@ -15,7 +15,13 @@ import cv2
 import numpy as np
 
 # 项目根目录（basketball-clipper/）—— 必须在扁平模块导入之前注入 sys.path
-_ROOT = Path(__file__).parent.parent.resolve()
+def _get_bundle_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent.parent.resolve()
+
+
+_ROOT = _get_bundle_root()
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 

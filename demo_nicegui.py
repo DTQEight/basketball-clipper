@@ -25,7 +25,14 @@ import time
 import asyncio
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+def _get_bundle_root() -> Path:
+    """代码/资源根目录：开发模式为项目根，冻结模式为 _MEIPASS。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent.resolve()
+
+
+ROOT = _get_bundle_root()
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
@@ -259,7 +266,11 @@ def main_page():
                 """
                 try:
                     import subprocess
-                    _inner = [sys.executable, '-u', str(ROOT / 'demo_nicegui.py')]
+                    if getattr(sys, "frozen", False):
+                        # 打包后直接重启 exe 自身
+                        _inner = [sys.executable]
+                    else:
+                        _inner = [sys.executable, '-u', str(ROOT / 'demo_nicegui.py')]
                     subprocess.Popen(
                         [sys.executable, '-u', '-c',
                          'import subprocess,sys,time;time.sleep(1.0);'

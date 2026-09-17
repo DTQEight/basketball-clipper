@@ -8,7 +8,14 @@ import sys
 import threading
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+def _get_bundle_root() -> Path:
+    """代码/资源根目录：开发模式为项目根，冻结模式为 _MEIPASS。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent.resolve()
+
+
+ROOT = _get_bundle_root()
 sys.path.insert(0, str(ROOT))
 
 # ============ 缓存目录（跨平台）============

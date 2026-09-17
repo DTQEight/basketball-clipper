@@ -5,6 +5,7 @@
 """
 import os
 import re
+import sys
 import json
 import hashlib
 import shutil
@@ -15,14 +16,45 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 # ============ 路径常量 ============
-# 项目根目录（扁平结构：代码直接在项目根下）
-_ROOT = Path(__file__).parent.parent.resolve()
+def _get_bundle_root() -> Path:
+    """返回代码/资源根目录。
 
-# 缓存目录：优先用环境变量，否则用项目内 cache 目录
-if os.environ.get("BBALL_CACHE_ROOT"):
-    CACHE_ROOT = os.environ["BBALL_CACHE_ROOT"]
-else:
-    CACHE_ROOT = str(_ROOT / "cache")
+    - 开发模式：项目根目录（services/state.py 的上级）
+    - PyInstaller 冻结模式：sys._MEIPASS（临时解压目录，权重等资源在此）
+    """
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent.parent.resolve()
+
+
+# 项目根目录（扁平结构：代码直接在项目根下）
+_ROOT = _get_bundle_root()
+
+
+def _get_cache_root() -> str:
+    """缓存根目录。
+
+    - 环境变量 BBALL_CACHE_ROOT 优先
+    - 冻结模式：用户目录 %APPDATA%/basketball-clipper 或 exe 同级 cache
+      （_MEIPASS 是只读临时目录，不能写缓存）
+    - 开发模式：项目内 cache 目录
+    """
+    if os.environ.get("BBALL_CACHE_ROOT"):
+        return os.environ["BBALL_CACHE_ROOT"]
+    if getattr(sys, "frozen", False):
+        # 优先用 exe 同级 cache（便于查看/备份），无写权限时回退到 %APPDATA%
+        exe_dir = Path(sys.executable).parent
+        try:
+            test_dir = exe_dir / "cache"
+            os.makedirs(test_dir, exist_ok=True)
+            return str(test_dir)
+        except OSError:
+            return os.path.join(os.environ.get("APPDATA", str(Path.home())),
+                                "basketball-clipper", "cache")
+    return str(_ROOT / "cache")
+
+
+CACHE_ROOT = _get_cache_root()
 
 # Windows subprocess 屏蔽控制台窗口（Linux 下为 0）
 SBOX = 0x08000000 if os.name == "nt" else 0
