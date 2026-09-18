@@ -17,7 +17,16 @@ imageio-ffmpeg>=0.4.9
 nicegui>=1.4.0
 
 # 深度学习（torch 不在此文件中，因 GPU/CPU 版本不同，需手动安装）
-# GPU 版（推荐，需 NVIDIA 显卡 + CUDA 12.x）:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# GPU 版（推荐，需 NVIDIA 显卡）——必须用 cu128：
+#   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+#
+#   为什么必须是 cu128 而不是 cu121：
+#     cu121 只编译到 sm_90，不支持 Blackwell（RTX 50 系，sm_120），
+#     在 50 系卡上会报 "CUDA error: no kernel image is available"。
+#     cu128 的架构列表为 sm_50~sm_120，从 Maxwell 到 Blackwell 全覆盖：
+#       ['sm_50','sm_60','sm_61','sm_70','sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']
+#     注意 torch>=2.11 的 cu128 构建已移除 Maxwell/Pascal/Volta 支持，
+#     如需覆盖 GTX 10 系及更老的卡，请固定 torch==2.7.1。
+#
 # CPU 版（无显卡时）:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
