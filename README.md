@@ -22,6 +22,7 @@
 | 14 | 人物分类 + 按人物导出 | 卡片彩色徽章归属人物；个人集锦 `{视频名}-{人物}-highlights.mp4`；**整场集锦**四节合并 `{文件夹名}-{人物}-highlights.mp4`；全局名单跨场次复用 |
 | 15 | 断点续跑 + 检测状态序列化 | 300 帧自动存档；续跑跳过预热、恢复阈值/基准帧/滚动候选完整状态 |
 | 16 | NiceGUI 可视化界面 | 深色主题卡片式；检测中可随时取消；三级调试日志 |
+| 17 | 多线程解码（FRAME 线程） | PyAV 由 SLICE 改 FRAME，解码 130 → 285 帧/秒，端到端提速 1.36×，候选结果逐项不变 |
 
 更完整说明 👉 [doc/ALGORITHM.md](doc/ALGORITHM.md) / [doc/BENCHMARKS.md](doc/BENCHMARKS.md)
 
@@ -30,6 +31,7 @@
 - Windows / Linux
 - Python 3.10+
 - NVIDIA GPU（**必需**，推荐 GTX 1650 4G 及以上；CUDA 不可用时服务拒绝检测，不做 CPU 降级）
+  - 支持的显卡世代：Maxwell（GTX 750/900 系）～ Blackwell（**RTX 50 系**）全覆盖，取决于 torch 构建的算力列表，见下方安装说明
 - FFmpeg（含 libx264 + h264_nvenc，由 `imageio-ffmpeg` 自带）
 
 ## 快速开始
@@ -37,7 +39,10 @@
 ```bash
 # 1. 安装依赖（需 Python 3.10+ / NVIDIA GPU）
 pip install -r requirements.txt
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# torch 必须用 cu128 且固定 2.7.1：
+#   cu121 只编译到 sm_90，RTX 50 系（sm_120）会报 "no kernel image is available"；
+#   torch>=2.11 的 cu128 构建移除了 Maxwell/Pascal/Volta，会丢失 GTX 10 系及更老显卡的支持。
+pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 # 2. 把 YOLO 权重放到 weights/basketball_custom.pt（首次运行会自动下载 yolov8n.pt）
 # 3. 启动服务
 python demo_nicegui.py    # Windows 双击 start.bat / Linux 运行 ./start.sh
@@ -71,7 +76,7 @@ basketball-clipper/
 
 ## 更新日志
 
-最新版本 **2026.09.05**：人物分类工作流（彩色徽章 + 按人物导出个人集锦 + 全局名单跨场次复用）+ 批量标定跨会话回填 + 断点续跑 12 项缺陷修复（含自适应阈值失效、标签数据丢失、续跑重复帧）。
+最新版本 **2026.09.19**：漏检根因修复（YOLO 接受框外扩 + `imgsz` 1280）、RTX 50 系显卡支持（cu121 → cu128）、Windows 安装程序（Inno Setup）、FRAME 线程解码（端到端提速 1.36×、结果零变化）。
 
 完整变更记录（含 08.18~08.19 版本进化对比报告、陌生场次泛化验证、三代纵向对比、审查修复、P2/P3 记录不修等）👉 [doc/CHANGELOG.md](doc/CHANGELOG.md)  
-性能与识别质量对比报告（含 3rd/4th 新旧版识别差异球、陌生场次 4 节批量实测）👉 [doc/BENCHMARKS.md](doc/BENCHMARKS.md)
+性能与识别质量对比报告（含解码线程优化前后对比、3rd/4th 新旧版识别差异球、陌生场次 4 节批量实测）👉 [doc/BENCHMARKS.md](doc/BENCHMARKS.md)

@@ -11,11 +11,19 @@ A: `start.bat`（Windows）或 `start.sh`（Linux）启动时会自动清理占�
 **Q: 开始识别后服务崩溃？**
 A: 大概率是后台线程首次初始化 CUDA 上下文导致的驱动层崩溃（Windows 事件日志可见 `nvcuda64.dll`）。程序启动时已在主线程预热模型，日志中应出现 `WARMUP-OK: cuda:0 context created on main thread`；若仍崩溃请更新显卡驱动。
 
+**Q: 换了新显卡（如 RTX 50 系）后报 `CUDA error: no kernel image is available for execution on the device`？**
+A: PyTorch 构建里没有你这张卡算力（sm 架构）的 kernel。RTX 50 系是 sm_120，而 cu121 构建只编译到 sm_90。重装 cu128（必须固定 2.7.1，见下）：`pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128`
+
+用 `python -c "import torch; print(torch.cuda.get_arch_list())"` 确认架构列表里含你的算力。cu128（torch 2.7.1）覆盖 `sm_50 ~ sm_120`，GTX 750 到 RTX 5090 全支持；但 torch ≥ 2.11 的 cu128 构建已移除 Maxwell/Pascal/Volta，若要覆盖 GTX 10 系及更老显卡必须固定 2.7.1。
+
+**Q: 识别速度还能再快吗？瓶颈在哪？**
+A: 实测耗时拆解：**逐帧解码占 60%**、YOLO 推理 23%、逐帧 CV 18%。所以调检测参数（置信度 / `imgsz` / 条件跳过）最多只能影响那 41%。解码已从 PyAV 默认的 SLICE 线程改为 FRAME，1080p 下快 2.19×（130 → 285 帧/秒），端到端 1.36×。再往上只能减少逐帧处理量或换更快的解码路径（如 NVDEC 硬解，未实测）。
+
 **Q: 提速模式会漏检吗？**
 A: 实测 `3rd.mp4`（25.1 分钟，45 个进球）开启提速模式后进球数仍为 45，零漏检。`1st.mp4` 进球数在 28-35 之间波动，其中差异多数来自误检而非漏检。一般比赛视频建议开启。
 
 **Q: 进球误检为什么大幅下降了？**
-A: 新版加入了三条进球路径全覆盖的 **YOLO 硬否决**：任何 diff 触发的候选进球，只要篮筐附近 ±1 倍宽高范围内 ±10 帧 YOLO 历史中没有检测到球，就直接排除、不注册。实测 1st.mp4 从 183 个误检降到 32 个。
+A: 新版加入了三条进球路径全覆盖的 **YOLO 硬否决**：任何 diff 触发的候选进球，只要在篮筐接受范围内（横向 ±1.5 倍框宽、向上 1.0 倍、**向下 2.0 倍框高**）的 ±10 帧 YOLO 历史中没有检测到球，就直接排除、不注册。接受范围向下放宽是有意的——进球是单向过程，球必定穿过筐口落到下方，收紧会把球心落在筐下几十像素的真实进球挡在外面。实测 1st.mp4 从 183 个误检降到 32 个。
 
 **Q: 自适应阈值什么情况下需要关闭？**
 A: 视频前 30 秒内有大量镜头变化（如剪辑拼接、片头过场）或前 30 秒已经有进球时，预热统计会不准，建议关闭后手动设置帧差阈值（15-35）。正常固定机位长视频前 30 秒是热身/换人，统计结果最可靠。
@@ -36,6 +44,6 @@ A: 先开提速模式会减少 YOLO 覆盖窗口的误杀，再看是否提升�
 - 基准帧差法论文：Camera-based Basketball Scoring Detection Using CNN
 - 进球检测状态机参考：chonyy/basketball-shot-detection
 - 多信号融合参考：ClarkWang1214/basketball-highlights
-- 视频读取：PyAV（替代 OpenCV，兼容 HEVC 和 moov 后置 mp4）
+- 视频读取：PyAV（替代 OpenCV，兼容 HEVC 和 moov 后置 mp4）；解码线程 `thread_type=FRAME`（帧间流水线，1080p 下比默认 SLICE 快 2.19×、像素完全一致）
 - 视频编码：优先 NVENC 硬编（`h264_nvenc -preset p4 -rc vbr -cq 20`，NVIDIA GPU 加速），回退 libx264 软编
-- 推理：YOLOv8 / 自定义篮球权重，imgsz=960，按 `model.names` 反查球类索引做 `classes` 预过滤（自定义权重=[0]，COCO 回退=[32] sports ball）
+- 推理：YOLOv8 / 自定义篮球权重，**imgsz=1280**（1080p 下球约 20-30px，960 时只剩 12-17px 接近检测下限），按 `model.names` 反查球类索引做 `classes` 预过滤（自定义权重=[0]，COCO 回退=[32] sports ball）
