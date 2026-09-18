@@ -612,18 +612,24 @@ class GoalDetector:
         return (ys[-1] - ys[0]) > 5
 
     def _check_yolo_near_hoop(self):
-        """检查 YOLO 历史中，篮筐附近（±1倍筐宽高）是否有球。
+        """检查 YOLO 历史中，篮筐附近是否有球。
 
         返回: (有球: bool, 用于诊断: 'confirmed'/'rejected'/'skipped')
+
+        接受范围按篮筐框外扩，且**向下额外放宽**：进球是单向过程，球必定
+        穿过筐口落到下方，实测漏检样本的球心落在筐下 ~97px、筐左 ~92px，
+        原先四周统一 1.0 倍外扩刚好把它们挡在外面（差 10~27px），导致
+        真实进球被硬否决。横向 1.5 倍、向下 2.0 倍可覆盖该偏移。
         """
         if not self.yolo_confirm:
             return True, "skipped"
-        margin_x = self.hoop_w * 1.0
-        margin_y = self.hoop_h * 1.0
+        margin_x = self.hoop_w * 1.5
+        margin_y_up = self.hoop_h * 1.0
+        margin_y_down = self.hoop_h * 2.0
         x_lo = self.hoop_x1 - margin_x
         x_hi = self.hoop_x2 + margin_x
-        y_lo = self.hoop_y1 - margin_y
-        y_hi = self.hoop_y2 + margin_y
+        y_lo = self.hoop_y1 - margin_y_up
+        y_hi = self.hoop_y2 + margin_y_down
         has_ball = any(
             x_lo <= bx <= x_hi and y_lo <= by <= y_hi
             for (_, bx, by) in self.ball_pos_history

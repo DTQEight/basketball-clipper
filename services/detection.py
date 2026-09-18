@@ -610,7 +610,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         # COCO 回退权重=[32] sports ball），不再硬编码 [0]
                         # device 用循环外缓存的 _device：运行中设备不会变化，
                         # 每次推理重新 import torch + is_available 属纯冗余（全程 ~2 万次）
-                        res = model.predict(frame, conf=float(ball_conf), imgsz=960,
+                        # imgsz 1280（原 960）：球在 1080p 里约 20-30px，缩放到
+                        # 960 后仅剩 12-17px，接近检测下限；实测有真实进球因
+                        # 球太小 + 篮下遮挡而完全漏检。1280 下球约 17-23px，
+                        # 小目标检出率明显改善，代价是单次推理变慢（条件跳过
+                        # 已省掉 ~87% 的推理，总耗时增量有限）。
+                        res = model.predict(frame, conf=float(ball_conf), imgsz=1280,
                                             classes=_ball_classes,
                                             device=_device, verbose=False)[0]
                         if res.boxes is not None and len(res.boxes) > 0:

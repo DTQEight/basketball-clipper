@@ -362,7 +362,10 @@ def main_page():
                                     start_frame = ui.number(label='起始帧', value=0, format='%d').classes('flex-1')
                                     end_frame = ui.number(label='结束帧(0=末尾)', value=0, format='%d').classes('flex-1')
                                 with ui.row().classes('gap-2 w-full'):
-                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.2, step=0.05).classes('flex-1')
+                                    # 默认 0.15（原 0.2）：实测有真实进球因 YOLO
+                                    # 置信度略低于 0.2 而完全漏检。配合 imgsz=1280
+                                    # 使用；若误报明显增多可单独调回 0.2 对比。
+                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.15, step=0.05).classes('flex-1')
                                     ui.label().bind_text_from(ball_conf, 'value', lambda v: f'置信度: {v:.2f}').classes('text-gray-400 text-xs')
                                 with ui.row().classes('gap-2 w-full'):
                                     min_gap = ui.slider(min=1.0, max=10.0, value=2.0, step=0.5).classes('flex-1')
