@@ -12,6 +12,11 @@
 
 --feat 模式：用预训练编码器对 frames_b（含增强变体）提 512 维特征
 → frames_b_feat_simclr/，与 train_temporal 同口径，供后续训练对比。
+
+--flow 模式（2026.09.19）：数据源换成 flow_b（光流幅度图，15 帧/事件），
+   给 Flow 臂换骨干用。同一套 SimCLR 配方，只是看的图不一样——
+   光流图是灰度运动边缘图，ImageNet 特征与它失配比彩色帧更严重。
+   产物：flow_simclr_resnet18.pt / flow_feat_simclr/
 """
 from __future__ import annotations
 
@@ -29,13 +34,43 @@ import torch.nn.functional as F
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-FRAMES_B = PROJECT_ROOT / "training" / "frames_b"
-CKPT_OUT = PROJECT_ROOT / "training" / "simclr_resnet18.pt"
-FEAT_OUT = PROJECT_ROOT / "training" / "frames_b_feat_simclr"
+# 两个数据源共用同一套 SimCLR 配方，只有「看的图」和产物路径不同
+SOURCES = {
+    "b": {
+        "dir": PROJECT_ROOT / "training" / "frames_b",
+        "key": "x",              # npz 里的键
+        "frames": 16,            # 每事件帧数
+        "memmap": PROJECT_ROOT / "training" / "crops_all.npy",
+        "ckpt": PROJECT_ROOT / "training" / "simclr_resnet18.pt",
+        "feat": PROJECT_ROOT / "training" / "frames_b_feat_simclr",
+        "desc": "筐心彩色裁剪（BGR uint8）",
+    },
+    "flow": {
+        "dir": PROJECT_ROOT / "training" / "flow_b",
+        "key": "mag",            # (15,224,224) 单通道幅度图
+        "frames": 15,
+        "memmap": PROJECT_ROOT / "training" / "flow_crops_all.npy",
+        "ckpt": PROJECT_ROOT / "training" / "flow_simclr_resnet18.pt",
+        "feat": PROJECT_ROOT / "training" / "flow_feat_simclr",
+        "desc": "光流幅度图（Farneback，单通道复制成 3 通道）",
+    },
+}
+CFG = SOURCES["b"]              # 由 main() 按 --flow 选定，函数内统一读它
 
 TEMP = 0.5
 BATCH_FILES = 8      # 每个事件文件 16 帧 → 8 文件 = 128 crops/batch
 PROJ_DIM = 128
+
+
+def load_frames(path: Path) -> np.ndarray:
+    """读一个事件 npz → (T,224,224,3) uint8。
+
+    光流幅度图是单通道，复制成 3 通道以复用同一套 ResNet18 入口
+    （与服务端 goal_verifier._flow_maps 的口径一致）。
+    """
+    x = np.load(path)[CFG["key"]]
+    return np.repeat(x[..., None], 3, axis=-1) if x.ndim == 3 else x
+
 
 
 class SimCLRModel(nn.Module):
@@ -101,46 +136,47 @@ def nt_xent(z1, z2, temp=TEMP):
     return -(pos - logsum).mean()
 
 
-CROPS_MMAP = PROJECT_ROOT / "training" / "crops_all.npy"
-
-
 def ensure_crops_memmap(files):
     """一次性把全部帧块拼成单个未压缩 npy（内存映射读）。
 
     每步 8 个 npz 的 zlib 解压实测 524ms，是预训练最大瓶颈；
-    换成 5.4GB 单文件后每步只做 ~19MB 随机读（几毫秒级）。
+    换成单文件后每步只做十几 MB 随机读（几毫秒级）。
     """
-    n = len(files) * 16
-    if CROPS_MMAP.exists():
+    per = CFG["frames"]
+    n = len(files) * per
+    mm_path = CFG["memmap"]
+    if mm_path.exists():
         try:
-            mm = np.load(CROPS_MMAP, mmap_mode="r")
+            mm = np.load(mm_path, mmap_mode="r")
             if mm.shape[0] == n:
                 print(f"crops 内存映射已存在: {n} crops", flush=True)
                 return mm
         except Exception:
             pass
-    print(f"构建 crops 内存映射（{n} crops，~5.4GB，一次性）...", flush=True)
+    print(f"构建 crops 内存映射（{n} crops，~{n * 150528 / 1e9:.1f}GB，一次性）...",
+          flush=True)
     t0 = time.time()
-    mm = np.lib.format.open_memmap(CROPS_MMAP, mode="w+", dtype=np.uint8,
+    mm = np.lib.format.open_memmap(mm_path, mode="w+", dtype=np.uint8,
                                    shape=(n, 224, 224, 3))
     for i, f in enumerate(files):
-        mm[i * 16:(i + 1) * 16] = np.load(f)["x"]
+        mm[i * per:(i + 1) * per] = load_frames(f)
         if (i + 1) % 400 == 0:
             print(f"  [{i + 1}/{len(files)}] {(time.time() - t0) / 60:.1f}min",
                   flush=True)
     mm.flush()
     del mm
     print(f"内存映射就绪，耗时 {(time.time() - t0) / 60:.1f}min", flush=True)
-    return np.load(CROPS_MMAP, mmap_mode="r")
+    return np.load(mm_path, mmap_mode="r")
 
 
 def pretrain(epochs=30, lr=3e-4, seed=42, batch_files=BATCH_FILES):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
-    files = sorted(FRAMES_B.glob("*.npz"))
+    files = sorted(CFG["dir"].glob("*.npz"))
+    per = CFG["frames"]
     crops = ensure_crops_memmap(files)
     n_files = len(files)
-    print(f"事件文件 {n_files} 个（{n_files * 16} crops）"
+    print(f"源={CFG['desc']}  事件文件 {n_files} 个（{n_files * per} crops）"
           f" batch={batch_files} 文件", flush=True)
 
     model = SimCLRModel().to(device)
@@ -155,9 +191,9 @@ def pretrain(epochs=30, lr=3e-4, seed=42, batch_files=BATCH_FILES):
         losses = []
         for s in range(0, n_files - batch_files + 1, batch_files):
             idx = order[s:s + batch_files]
-            # 每事件抽 8/16 帧（隔帧）：对比学习不需全部帧，单步计算减半
+            # 每事件隔帧抽一半（16→8 / 15→8）：对比学习不需全部帧，单步计算减半
             imgs = np.concatenate(
-                [np.asarray(crops[f * 16:(f + 1) * 16])[::2] for f in idx],
+                [np.asarray(crops[f * per:(f + 1) * per])[::2] for f in idx],
                 axis=0)
             x = torch.from_numpy(
                 np.ascontiguousarray(imgs[..., ::-1].transpose(0, 3, 1, 2))
@@ -176,9 +212,10 @@ def pretrain(epochs=30, lr=3e-4, seed=42, batch_files=BATCH_FILES):
 
     torch.save({"backbone": model.backbone.state_dict(),
                 "epochs": epochs, "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "pool": f"{len(files)} events x 16 crops (unlabeled)"},
-               CKPT_OUT)
-    print(f"已保存编码器: {CKPT_OUT}")
+                "pool": f"{len(files)} events x {per} crops (unlabeled)",
+                "source": CFG["desc"]},
+               CFG["ckpt"])
+    print(f"已保存编码器: {CFG['ckpt']}")
 
 
 def extract_features(batch_frames=64):
@@ -186,33 +223,35 @@ def extract_features(batch_frames=64):
     from training.train_temporal import _apply_variant, AUG_VARIANTS
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ck = torch.load(CKPT_OUT, map_location=device, weights_only=False)
+    per = CFG["frames"]
+    ck = torch.load(CFG["ckpt"], map_location=device, weights_only=False)
     import torchvision.models as tvm
     net = tvm.resnet18(weights=None)
     net.fc = nn.Identity()
     net.load_state_dict(ck["backbone"])
     net = net.to(device).eval()
-    print(f"SimCLR 编码器已加载（{ck.get('trained_at')}）")
+    print(f"SimCLR 编码器已加载（{ck.get('trained_at')}，{ck.get('pool')}）")
 
     from training.extract_frames_b import load_dataset_events
     events = load_dataset_events()
+    feat_root = CFG["feat"]
 
     for variant in ("orig",) + AUG_VARIANTS:
-        out_dir = FEAT_OUT if variant == "orig" else FEAT_OUT / variant
+        out_dir = feat_root if variant == "orig" else feat_root / variant
         out_dir.mkdir(parents=True, exist_ok=True)
-        todo = [(ev, FRAMES_B / f"{ev['event_id']}.npz") for ev in events
-                if (FRAMES_B / f"{ev['event_id']}.npz").exists()
+        todo = [(ev, CFG["dir"] / f"{ev['event_id']}.npz") for ev in events
+                if (CFG["dir"] / f"{ev['event_id']}.npz").exists()
                 and not (out_dir / f"{ev['event_id']}.npz").exists()]
         print(f"[{variant}] 待抽: {len(todo)}", flush=True)
         t0 = time.time()
         done = 0
         i = 0
-        ev_per_chunk = max(1, batch_frames // 16)
+        ev_per_chunk = max(1, batch_frames // per)
         while i < len(todo):
             chunk = todo[i:i + ev_per_chunk]
             imgs, owners = [], []
             for ev, path in chunk:
-                x = np.load(path)["x"]
+                x = load_frames(path)
                 if variant != "orig":
                     x = _apply_variant(x, variant)
                 for f in x:
@@ -223,6 +262,7 @@ def extract_features(batch_frames=64):
                 # mean/std（编码器是在裸 /255 上自监督训出来的）。
                 # 旧实现漏了 [..., ::-1]，喂进去的是 BGR 而编码器学的是 RGB，
                 # 通道序错位 → 特征与编码器不匹配。
+                # （光流图三通道相同，该反转是空操作，保留只为两源共用一条代码路径）
                 arr = np.stack(imgs).astype(np.float32)[..., ::-1] / 255.0
                 arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))
                 with torch.no_grad():
@@ -241,16 +281,24 @@ def extract_features(batch_frames=64):
 
 
 def main():
+    global CFG
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--feat", action="store_true", help="跳过预训练，只提特征")
+    ap.add_argument("--flow", action="store_true",
+                    help="数据源换成 flow_b（光流幅度图），给 Flow 臂换骨干")
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch-files", type=int, default=BATCH_FILES,
+                    help="每步事件数（每事件隔帧抽一半，故图像数 = 4×该值）")
     args = ap.parse_args()
+    if args.flow:
+        CFG = SOURCES["flow"]
+    print(f"数据源: {CFG['desc']}  ({CFG['dir'].name}，{CFG['frames']} 帧/事件)")
     if not args.feat:
-        pretrain(epochs=args.epochs)
+        pretrain(epochs=args.epochs, batch_files=args.batch_files)
     extract_features()
 
 

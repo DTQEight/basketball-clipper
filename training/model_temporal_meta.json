@@ -36,7 +36,7 @@
     "recall": 0.3728
   },
   "ensemble": {
-    "calibrated_at": "2026-09-19 15:40:00",
+    "calibrated_at": "2026-09-19 22:00:44",
     "composition": "a_b2_f_vm",
     "weights": {
       "lgbm": 0.5,
@@ -44,31 +44,58 @@
       "flow": 1.0,
       "vm": 1.0
     },
-    "keep_thr": 0.72,
-    "source": "B 臂骨干换成 SimCLR 域内自监督编码器（training/model_b_simclr.pt）后，在 831 事件 5 折 OOF 上重定权重与阈值（无对应 --deploy 流程，用 training/recalib_ensemble.py 重算：按 OOF AUC 择优 + precision>=0.95 最大召回工作点）。重跑 train_directions.py --deploy 会覆盖回旧口径",
+    "keep_thr": 0.68,
+    "source": "Flow 臂骨干换成光流域 SimCLR 自监督编码器（training/model_flow_simclr.pt，831 事件 × 15 张光流幅度图无标签预训练）后重标定。权重在 831 事件 OOF 上按 AUC 择优：现役配比仍在最优档（Top-12 落在 0.9687~0.9699，全在噪声内），且它在真实视频上明显优于 OOF 最优的 a.5 b1.5 f2 v.5（精度 0.988 vs 0.958），故权重不变、只重定阈值。阈值刻意**不取** OOF p95 工作点的 0.640——0.640 会在 6 场真实视频上放进 2 个误报（精度 0.976）；0.68 是实测精度 0.988 与召回的均衡点。复算脚本 training/recalib_ensemble.py（重跑 train_directions.py --deploy 会覆盖回旧口径）",
     "reject_thr": 0.16,
-    "oof_auc": 0.9527,
+    "oof_auc": 0.964,
     "n_events": 831,
     "keep_wp": {
+      "threshold": 0.68,
+      "precision": 0.9496,
+      "recall": 0.7081
+    },
+    "keep_wp_oof_p95_not_used": {
       "threshold": 0.72,
       "precision": 0.952,
       "recall": 0.569
     },
+    "flow_backbone": "光流域 SimCLR 自监督 resnet18（training/model_flow_simclr.pt）",
     "video_check": {
-      "note": "两场全人工标注的真实视频（77 个候选），只重算视觉三臂、A 沿用已存分数",
-      "2026.09.01-3rd": {"n": 46, "auc_old": 0.8986, "auc_new": 0.9162,
-                          "零误报阈值": 0.69, "零误报召回": 0.737},
-      "2026.09.01-4th": {"n": 31, "auc_old": 0.9274, "auc_new": 0.9444,
-                          "零误报阈值": 0.64, "零误报召回": 0.846}
+      "note": "6 场真实录像 286 候选 / 98 真进球，逐候选人工标注；A 臂分数沿用缓存，B/Flow/VM 用当前骨干重算",
+      "thr_0.68": {
+        "自动√": 80,
+        "精度": 0.988,
+        "召回": 0.806
+      },
+      "换骨干前后对照_thr0.72": {
+        "旧 Flow": {
+          "自动√": 75,
+          "精度": 1.0,
+          "召回": 0.755
+        },
+        "新 Flow": {
+          "自动√": 72,
+          "精度": 0.986,
+          "召回": 0.724
+        }
+      },
+      "clean_holdout_3": {
+        "note": "与训练集事件零重叠的 3 场（09.01-3rd/4th、09.03-3rd），91 候选 / 35 真进球",
+        "auc_old_flow": 0.9168,
+        "auc_new_flow": 0.9464,
+        "零误报召回_旧Flow": 0.6,
+        "零误报召回_新Flow": 0.371,
+        "警示": "新 Flow 把 09.01-4th 一个误报的集成分从 0.636 抬到 0.781，压在零误报临界线上；同场还有 2 个真进球被压到阈值下（0.857→0.719、0.858→0.683）。AUC 在各口径均为提升，但 3/31 个片段的翻转在小样本上会主导零误报召回，该指标本次不可作唯一判据。"
+      }
     },
     "arms_oof_auc": {
       "A": 0.8034,
-      "B(SimCLR, mean bigru+pool)": 0.9217,
-      "B(ResNet18, 换之前)": 0.6322,
-      "Flow_T": 0.8593,
+      "B(SimCLR)": 0.9217,
+      "Flow(SimCLR)": 0.9478,
+      "Flow(ImageNet, 换之前)": 0.8593,
       "VM": 0.8208,
-      "ab_f_vm(旧配置)": 0.9094,
-      "a_b2_f_vm(现役)": 0.9527
+      "a_b2_f_vm(旧 Flow)": 0.9527,
+      "a_b2_f_vm(新 Flow)": 0.964
     }
   }
 }

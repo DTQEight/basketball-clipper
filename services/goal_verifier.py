@@ -6,12 +6,14 @@
     本模块把离线标定的冠军集成搬到线上，给每个候选打一个 0~1 的分数，
     高分候选直接标「自动通过」，用户可跳过人工确认。
 
-集成口径（与 training/train_directions.py --deploy 标定严格一致）
+集成口径（权重与阈值由 --deploy / recalib_ensemble.py 标定，写进
+training/model_temporal_meta.json 的 ensemble 段）
     A     training/model_lgbm.txt       手工特征 LGBM（±1.5s 密集 YOLO 复检提特征）
-    B     training/model_temporal.pt + model_temporal_pool.pt
-                                        ResNet18 帧特征 → bigru/pool 双 TemporalNet
-                                        取 sigmoid 均值
-    Flow  training/model_flow_t.pt      Farneback 光流幅度序列 → ResNet18 → bigru
+    B     training/model_b_simclr.pt    筐心彩色帧 → SimCLR 域内自监督骨干 →
+                                        bigru/pool 双 TemporalNet 取 sigmoid 均值
+                                        （缺失时退回 model_temporal*.pt 的 ImageNet 口径）
+    Flow  training/model_flow_simclr.pt 光流幅度序列 → 光流域 SimCLR 骨干 → bigru
+                                        （缺失时退回 model_flow_t.pt 的 ImageNet 口径）
     VM    training/model_vm_lgbm.txt    VideoMAE 768 维特征 → LGBM
     score = 各臂 sigmoid 概率按 ENS_WEIGHTS 加权均值（缺臂时按剩余权重重归一化，
             单臂可用时退化为该臂分）
@@ -52,6 +54,8 @@ TEMPORAL_BIGRU = TRAINING_DIR / "model_temporal.pt"
 TEMPORAL_POOL = TRAINING_DIR / "model_temporal_pool.pt"
 # B 臂换骨干：SimCLR 域内自监督编码器 + bigru/pool 双头（自包含 checkpoint）
 B_SIMCLR_FILE = TRAINING_DIR / "model_b_simclr.pt"
+# Flow 臂换骨干：光流域 SimCLR 自监督编码器 + bigru 头（自包含 checkpoint）
+FLOW_SIMCLR_FILE = TRAINING_DIR / "model_flow_simclr.pt"
 FLOW_MODEL = TRAINING_DIR / "model_flow_t.pt"
 VM_MODEL = TRAINING_DIR / "model_vm_lgbm.txt"
 ENSEMBLE_META = TRAINING_DIR / "model_temporal_meta.json"
@@ -133,14 +137,16 @@ _frames_b_mod = None
 def _load_temporal():
     """懒加载 B/Flow 臂推理栈。
 
-    B 臂骨干优先用 SimCLR 域内自监督编码器（training/model_b_simclr.pt，
-    自包含：骨干 + bigru/pool 双头 + 预处理口径），缺失时退回 ImageNet
-    ResNet18 + model_temporal*.pt（旧口径）。
-    Flow 臂固定用 ImageNet ResNet18（光流幅度图，SimCLR 没在这个域上训过）。
+    两臂都优先用各自域内的 SimCLR 自监督编码器，缺失时退回 ImageNet：
+      B      training/model_b_simclr.pt（筐心彩色帧域，自包含骨干 + 双头）
+             → 退回 ImageNet ResNet18 + model_temporal*.pt
+      Flow   training/model_flow_simclr.pt（光流域，自包含骨干 + bigru 头）
+             → 退回 ImageNet ResNet18 + model_flow_t.pt
 
-    预处理两套口径必须严格区分：
-      B(SimCLR)  BGR → RGB，/255，**不做** mean/std（编码器是在裸 /255 上训的）
-      Flow       BGR → RGB，/255，再做 ImageNet mean/std（同训练侧）
+    预处理口径必须严格区分（两臂各自与自己的编码器训练口径一致）：
+      B(SimCLR)    BGR → RGB，/255，**不做** mean/std（编码器在裸 /255 上训的）
+      Flow(SimCLR) 光流幅度 /255，**不做** mean/std（三通道相同，无通道序问题）
+      ImageNet 口径才做 mean/std
     同时读取 ensemble 段的权重与阈值。失败返回 None。
     """
     global _temporal, _temporal_tried, AUTO_THR, ENS_WEIGHTS
@@ -204,12 +210,34 @@ def _load_temporal():
                 b_nets = [_load_net(p) for p in (TEMPORAL_BIGRU, TEMPORAL_POOL)]
                 b_pre = "imagenet"
 
-            flow_resnet = _backbone()
+            # ---- Flow 臂：光流域 SimCLR 骨干优先，缺失退回 ImageNet ----
+            flow_resnet = flow_nets = None
+            flow_pre = "rgb255"
             try:
-                flow_net = _load_net(FLOW_MODEL)
+                ck = torch.load(FLOW_SIMCLR_FILE, map_location=device,
+                                weights_only=False)
+                flow_resnet = _backbone(ck["backbone"])
+                flow_nets = []
+                for n in ck["nets"]:
+                    net = _train_temporal_mod.TemporalNet(
+                        dim=ck.get("dim", 512), arch=n["arch"]).to(device)
+                    net.load_state_dict(n["state_dict"])
+                    flow_nets.append(net.eval())
+                _log.info("goal_verifier: Flow 臂骨干 = 光流 SimCLR（%s，OOF %s）",
+                          "+".join(n["arch"] for n in ck["nets"]),
+                          ck.get("oof_auc"))
             except Exception as e:
-                _log.warning("goal_verifier: Flow 臂加载失败（该臂禁用）: %s", e)
-                flow_net = None
+                _log.warning("goal_verifier: 光流 SimCLR Flow 臂加载失败，"
+                             "退回 ImageNet: %s", e)
+                flow_resnet = flow_nets = None
+            if flow_nets is None:
+                flow_resnet = _backbone()
+                flow_pre = "imagenet"
+                try:
+                    flow_nets = [_load_net(FLOW_MODEL)]
+                except Exception as e:
+                    _log.warning("goal_verifier: Flow 臂加载失败（该臂禁用）: %s", e)
+                    flow_nets = None
 
             mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
             std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
@@ -218,13 +246,15 @@ def _load_temporal():
 
             _temporal = {
                 "b_resnet": b_resnet, "b_nets": b_nets, "b_pre": b_pre,
-                "flow_resnet": flow_resnet, "flow_net": flow_net,
+                "flow_resnet": flow_resnet, "flow_nets": flow_nets,
+                "flow_pre": flow_pre,
                 "device": device, "mean": mean, "std": std,
                 "frame_offs": list(_frames_b_mod.FRAME_OFFS),
                 "crop_hoop": _frames_b_mod.crop_hoop,
             }
-            _log.info("goal_verifier: B/Flow 臂已加载 (device=%s, B骨干=%s, flow=%s)",
-                      device, b_pre, "on" if flow_net else "off")
+            _log.info("goal_verifier: B/Flow 臂已加载 (device=%s, B骨干=%s, "
+                      "Flow骨干=%s, flow=%s)",
+                      device, b_pre, flow_pre, "on" if flow_nets else "off")
         except Exception as e:
             _log.warning("goal_verifier: B/Flow 臂加载失败（两臂禁用）: %s", e)
             _temporal = None
@@ -322,7 +352,8 @@ def model_fingerprint() -> str:
     # 必须先刷新 ENS_WEIGHTS/AUTO_THR：否则首次调用会把「代码默认权重」哈希进去，
     # 而下一次调用哈希的是文件里的权重 → 指纹自己就变了（分数被反复误判为过期）
     thr = _read_ensemble()
-    for p in (B_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL, FLOW_MODEL, VM_MODEL):
+    for p in (B_SIMCLR_FILE, FLOW_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL,
+              FLOW_MODEL, VM_MODEL):
         try:
             h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
         except OSError:
@@ -425,7 +456,8 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
 
     todo.sort(key=lambda c: float(c["ts"]))
     b_resnet, b_nets, b_pre = tt["b_resnet"], tt["b_nets"], tt["b_pre"]
-    flow_resnet, flow_net = tt["flow_resnet"], tt.get("flow_net")
+    flow_resnet, flow_nets = tt["flow_resnet"], tt.get("flow_nets")
+    flow_pre = tt.get("flow_pre", "imagenet")
     device = tt["device"]
     mean, std = tt["mean"], tt["std"]
     frame_offs, crop_hoop = tt["frame_offs"], tt["crop_hoop"]
@@ -495,20 +527,25 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                     f = feat[j * n_frames:(j + 1) * n_frames].unsqueeze(0)
                     ps = [float(torch.sigmoid(n(f)).item()) for n in b_nets]
                     c["score_b"] = round(sum(ps) / len(ps), 3)
-            # ---- Flow 臂：光流幅度序列 → ImageNet ResNet18 → bigru ----
-            if flow_net is not None:
+            # ---- Flow 臂：光流幅度序列 → ResNet18 → bigru ----
+            # 与 B 臂同理按骨干口径分流：光流 SimCLR 用裸 /255，退回
+            # ImageNet 时才是 mean/std（两套口径不能混）
+            if flow_nets:
                 try:
                     fmap_blocks = [_flow_maps(b[1]) for b in chunk]
                     farr = np.concatenate(fmap_blocks).astype(np.float32) / 255.0
                     farr = np.ascontiguousarray(farr.transpose(0, 3, 1, 2))
                     with torch.no_grad():
-                        ft = (torch.from_numpy(farr).to(device) - mean) / std
+                        ft = torch.from_numpy(farr).to(device)
+                        if flow_pre == "imagenet":
+                            ft = (ft - mean) / std
                         ffeat = flow_resnet(ft)  # (N*15, 512)
                         for j, (c, _) in enumerate(chunk):
                             nf = fmap_blocks[j].shape[0]
                             ff = ffeat[j * nf:(j + 1) * nf].unsqueeze(0)
-                            c["score_flow"] = round(
-                                float(torch.sigmoid(flow_net(ff)).item()), 3)
+                            ps = [float(torch.sigmoid(n(ff)).item())
+                                  for n in flow_nets]
+                            c["score_flow"] = round(sum(ps) / len(ps), 3)
                 except Exception as e:
                     _log.warning("goal_verifier: Flow 臂推理失败（跳过该臂）: %s", e)
                     for c, _ in chunk:
