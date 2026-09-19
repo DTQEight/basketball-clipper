@@ -262,6 +262,12 @@ def _load_temporal():
 
 
 # ===== VM 臂：VideoMAE 冻结主干 + LGBM 头 =====
+#
+# 2026.09.19 试过把 LGBM 换成时序头（并改用逐时序位置特征保留运动结构）：
+# OOF 上确实更好（单臂 0.8208→0.8838、集成 0.9640→0.9741），但 **8 场真实视频上没兑现**
+# ——AUC 持平（0.9858 vs 0.9856），同等精度（各 1 个误报）下召回反而更低
+# （LGBM 83.5% vs 时序头 73.7%；时序头分数更饱和、工作点对阈值更敏感）。
+# 故不部署，实验脚本与产物见 training/train_vm_head.py 与 training/exp_vm_head/。
 
 _vm = None
 _vm_tried = False
@@ -272,7 +278,8 @@ def _load_vm():
     """懒加载 VideoMAE 臂。权重缓存在 cache/hf（extract_videomae.py 下载）。
 
     服务进程不允许运行时下载（HF_HUB_OFFLINE=1），缺缓存/缺依赖则该臂禁用。
-    输入口径与训练严格一致：(16,224,224,3) uint8 BGR → RGB → (x/255-0.5)/0.5。
+    输入口径与训练严格一致：(16,224,224,3) uint8 BGR → RGB → (x/255-0.5)/0.5，
+    特征为 last_hidden_state 全 token 均值池化（768 维）。
     """
     global _vm, _vm_tried
     if _vm_tried:

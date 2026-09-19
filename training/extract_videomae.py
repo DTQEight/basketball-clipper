@@ -8,6 +8,13 @@
 增强变体（vflip/dark/bright）同 train_temporal 口径：只进训练折。
 先跑 --probe 验证显存与速度，再全量。
 
+--temporal 模式（2026.09.19）：改为**逐时序位置池化**，保留运动结构。
+    VideoMAE 的 patch_embed 输出 (B,768,8,14,14)，flatten 后 token 索引
+    = t*196 + h*14 + w（t 为 tubelet 时序位置）→ reshape(8,196,768) 对空间维
+    取均值，得 (8,768)：每帧对被保留的时序轨迹，而不是被全局均值拍平。
+    产物 vm_feat_t/（4GB 显存下每事件多存 8 倍，约 12KB/事件）。
+    「全局均值」把 16 帧的运动信息全丢了，这是 VM 臂偏弱的主因之一。
+
 模型：MCG-NJU/videomaev2-base（首跑自动下载 ~350MB）。
 """
 from __future__ import annotations
@@ -27,6 +34,7 @@ os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / "cache" / "hf"))
 
 FRAMES_B = PROJECT_ROOT / "training" / "frames_b"
 VM_OUT = PROJECT_ROOT / "training" / "vm_feat"
+VM_OUT_T = PROJECT_ROOT / "training" / "vm_feat_t"   # --temporal：逐时序位置 (8,768)
 # v1 SSL 原版权重与 HF 键名不兼容（attention bias 未映射）；
 # Kinetics 微调版是 HF 原生格式，加载干净，且语义上更贴近动作判别
 MODEL_ID = "MCG-NJU/videomae-base-finetuned-kinetics"
@@ -95,16 +103,28 @@ def to_input(x: np.ndarray, device, dtype):
     return t.transpose(1, 2).to(device=device, dtype=dtype)        # (1,16,3,224,224)
 
 
-def extract(events, variant="orig", batch=8):
+def temporal_pool(last_hidden, cfg):
+    """(B, T*H*W, D) → (B, T, D)：按时序位置对空间 patch 取均值。
+
+    token 索引 = t*(H*W) + h*W + w（patch_embed 的 Conv3d 输出 (B,D,T,H,W)
+    flatten 而来），所以 reshape 成 (T, H*W, D) 后对第 2 维取均值即为逐时序位置特征。
+    """
+    steps = cfg.num_frames // cfg.tubelet_size
+    b, n_tok, d = last_hidden.shape
+    return last_hidden.view(b, steps, n_tok // steps, d).mean(dim=2)
+
+
+def extract(events, variant="orig", batch=8, temporal=False):
     import torch
-    VM_OUT.mkdir(parents=True, exist_ok=True)
-    sub = VM_OUT if variant == "orig" else VM_OUT / variant
+    root = VM_OUT_T if temporal else VM_OUT
+    root.mkdir(parents=True, exist_ok=True)
+    sub = root if variant == "orig" else root / variant
     sub.mkdir(parents=True, exist_ok=True)
 
     todo = [e for e in events
             if (FRAMES_B / f"{e['event_id']}.npz").exists()
             and not (sub / f"{e['event_id']}.npz").exists()]
-    print(f"[{variant}] 待抽: {len(todo)}", flush=True)
+    print(f"[{variant}{' ·temporal' if temporal else ''}] 待抽: {len(todo)}", flush=True)
     if not todo:
         return
 
@@ -124,7 +144,9 @@ def extract(events, variant="orig", batch=8):
         with torch.no_grad():
             stacked = torch.cat(tensors, dim=0)        # (B,16,3,224,224)
             out = model(pixel_values=stacked)
-            feats = out.last_hidden_state.float().mean(dim=1).cpu().numpy()
+            lh = out.last_hidden_state.float()
+            feats = (temporal_pool(lh, model.config) if temporal
+                     else lh.mean(dim=1)).cpu().numpy()
         for ev, f in zip(chunk, feats):
             np.savez_compressed(sub / f"{ev['event_id']}.npz",
                                 x=f.astype(np.float16))
@@ -149,7 +171,11 @@ def main():
         pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true", help="只抽 3 个事件验证可行性")
+    ap.add_argument("--temporal", action="store_true",
+                    help="逐时序位置池化 (8,768) → vm_feat_t/，保留运动结构")
     ap.add_argument("--variants", nargs="+", default=list(VARIANTS))
+    ap.add_argument("--batch", type=int, default=8,
+                    help="每批事件数（4GB 显存实测 batch=8 峰值 0.32GB，可上调）")
     args = ap.parse_args()
 
     from training.extract_frames_b import load_dataset_events
@@ -157,7 +183,7 @@ def main():
     if args.probe:
         events = events[:3]
     for v in args.variants:
-        extract(events, variant=v)
+        extract(events, variant=v, batch=args.batch, temporal=args.temporal)
 
 
 if __name__ == "__main__":

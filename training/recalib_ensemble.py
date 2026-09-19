@@ -12,6 +12,8 @@
     oof_temporal_simclr.jsonl   —— 新 B（SimCLR 骨干）
     oof_flow_simclr.jsonl       —— 新 Flow（光流域 SimCLR 骨干）
 缺哪个就退回该臂的旧版本，并在输出里标注。
+注意：VM 换时序头的实验（training/exp_vm_head/）未部署，故不纳入——
+真实视频上 OOF 增益没兑现，见 goal_verifier 里 VM 臂段的说明。
 
 用法：
     env\\python.exe training\\recalib_ensemble.py

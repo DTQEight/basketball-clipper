@@ -1,0 +1,84 @@
+{
+  "trained_at": "2026-09-20 00:23:37",
+  "backbone": "VideoMAE v2 base (MCG-NJU/videomae-base-finetuned-kinetics)，冻结",
+  "head": "TemporalNet[pool]  · 特征模式 temporal（含增强变体）",
+  "n_events": 831,
+  "n_pos": 346,
+  "fold_aucs": [
+    0.9073,
+    0.8965,
+    0.9117,
+    0.9002,
+    0.8345
+  ],
+  "final_epochs": 28,
+  "baseline_lgbm_mean_oof": 0.8208,
+  "oof_auc": 0.8839,
+  "candidates": [
+    {
+      "tag": "mean + pool 头",
+      "mode": "mean",
+      "arch": "pool",
+      "use_aug": true,
+      "auc_vm": 0.8633096954889459,
+      "auc_ens": 0.9722126214170789,
+      "wp": [
+        0.623,
+        0.9523809523809523,
+        0.8092485549132948
+      ]
+    },
+    {
+      "tag": "mean + bigru 头",
+      "mode": "mean",
+      "arch": "bigru",
+      "use_aug": true,
+      "auc_vm": 0.8555985936475775,
+      "auc_ens": 0.9715094452058876,
+      "wp": [
+        0.635,
+        0.9506578947368421,
+        0.8352601156069365
+      ]
+    },
+    {
+      "tag": "temporal + bigru 头",
+      "mode": "temporal",
+      "arch": "bigru",
+      "use_aug": true,
+      "auc_vm": 0.8522793635659376,
+      "auc_ens": 0.9723794767892259,
+      "wp": [
+        0.622,
+        0.9519230769230769,
+        0.8583815028901735
+      ]
+    },
+    {
+      "tag": "temporal + pool 头",
+      "mode": "temporal",
+      "arch": "pool",
+      "use_aug": true,
+      "auc_vm": 0.883850783624337,
+      "auc_ens": 0.9741254990763363,
+      "wp": [
+        0.634,
+        0.9514563106796117,
+        0.8497109826589595
+      ]
+    },
+    {
+      "tag": "temporal + bigru（仅 orig）",
+      "mode": "temporal",
+      "arch": "bigru",
+      "use_aug": false,
+      "auc_vm": 0.8438591263929445,
+      "auc_ens": 0.967093736964424,
+      "wp": [
+        0.627,
+        0.9525423728813559,
+        0.8121387283236994
+      ]
+    }
+  ]
+}
