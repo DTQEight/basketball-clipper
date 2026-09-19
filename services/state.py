@@ -998,6 +998,12 @@ def clip_cache_key(video_path: str, goals) -> tuple:
     return (video_path, tuple(sorted(round(float(t), 3) for t in goals)))
 
 
+# AI 复核分数随片段缓存一起落盘：否则服务重启后历史回读只剩 ts/path/idx，
+# 卡片上的「AI 自动通过」徽标整批消失（分数要重跑几分钟复核才有）
+_AI_CACHE_KEYS = ("score", "auto", "verify_score", "verify_ver",
+                  "score_lgbm", "score_b", "score_flow", "score_vm")
+
+
 def put_clip_cache(key, clips):
     """写入片段缓存条目 + 超限驱逐最旧（同步删除其磁盘片段）+ 落盘。"""
     clip_cache[key] = list(clips)
@@ -1024,8 +1030,15 @@ def load_clip_cache():
                 data = json.load(f)
             for item in data:
                 key = (item["video"], tuple(float(g) for g in item["goals"]))
-                clips = [{"ts": float(c["ts"]), "path": c["path"], "idx": int(c["idx"])}
-                         for c in item.get("clips", [])]
+                clips = []
+                for c in item.get("clips", []):
+                    row = {"ts": float(c["ts"]), "path": c["path"],
+                           "idx": int(c["idx"])}
+                    # AI 复核分数（可选字段，旧缓存文件里没有）
+                    for k in _AI_CACHE_KEYS:
+                        if k in c:
+                            row[k] = c[k]
+                    clips.append(row)
                 if clips and all(os.path.exists(c["path"]) for c in clips):
                     cache[key] = clips
     except json.JSONDecodeError as e:
@@ -1042,7 +1055,9 @@ def save_clip_cache():
     """把内存片段缓存索引写入磁盘（原子写）。"""
     try:
         data = [{"video": v, "goals": list(g),
-                 "clips": [{"ts": c["ts"], "path": c["path"], "idx": c["idx"]} for c in clips]}
+                 "clips": [dict({"ts": c["ts"], "path": c["path"], "idx": c["idx"]},
+                                **{k: c[k] for k in _AI_CACHE_KEYS if k in c})
+                           for c in clips]}
                 for (v, g), clips in clip_cache.items()]
         os.makedirs(os.path.dirname(CLIP_CACHE_FILE), exist_ok=True)
         _atomic_write_json(CLIP_CACHE_FILE, data)

@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from nicegui import ui
 
-from services import state, detection, video_utils
+from services import state, detection, video_utils, goal_verifier
 
 # 主按钮启动时刻（模块级，跨页面连接/刷新共享）：
 # 用于 1s 双击去抖——启动后 1s 内再次点击"开始识别/批量识别"是双击误触，
@@ -1301,6 +1301,25 @@ def main_page():
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
+                        # AI 复核：分数始终显示，便于与人工标记对照。
+                        # 不能再用「mark is None」做门——标完之后正好是最需要复核
+                        # 对照的时候，一标就全没了（用户实测反馈）。
+                        _ai_score = clip.get("score")
+                        if _ai_score is not None:
+                            _ai_auto = bool(clip.get("auto"))
+                            ui.label(f'AI ✓ {_ai_score:.2f}' if _ai_auto
+                                     else f'AI {_ai_score:.2f}').classes(
+                                'text-[10px] px-2 py-0.5 rounded-full font-bold'
+                            ).style(
+                                'color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.5); '
+                                'background: rgba(34, 197, 94, 0.12)' if _ai_auto else
+                                'color: var(--text-secondary); '
+                                'border: 1px solid var(--border-subtle)'
+                            ).tooltip(
+                                f'四臂集成分 {clip.get("verify_score")}'
+                                f'（阈值 {goal_verifier.auto_threshold():.3f}）'
+                                + ('，达到阈值 → 可直接跳过人工确认' if _ai_auto
+                                   else '，低于阈值 → 模型判为误报，需人工确认'))
                         person = clip.get("person")
                         _pc = person_colors.get(person) if person else None
                         ui.button((f'👤 {person}' if _pc else '👤 分类'),

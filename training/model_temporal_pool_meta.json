@@ -1,0 +1,38 @@
+{
+  "trained_at": "2026-09-19 13:36:49",
+  "arch": "pool",
+  "use_aug": true,
+  "n_events": 831,
+  "n_pos": 346,
+  "n_games": 6,
+  "fold_aucs": [
+    0.7878,
+    0.6565,
+    0.7543,
+    0.6756,
+    0.7514
+  ],
+  "final_epochs": 22,
+  "oof_auc": 0.5933,
+  "working_points": {
+    "0.9": {
+      "threshold": 0.9908,
+      "precision": 0.9231,
+      "recall": 0.0347
+    },
+    "0.95": {
+      "threshold": 0.9911,
+      "precision": 1.0,
+      "recall": 0.0318
+    },
+    "0.98": {
+      "threshold": 0.9911,
+      "precision": 1.0,
+      "recall": 0.0318
+    }
+  },
+  "fixed_050": {
+    "precision": 0.5292,
+    "recall": 0.3671
+  }
+}

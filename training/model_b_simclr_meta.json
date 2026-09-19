@@ -1,0 +1,43 @@
+{
+  "trained_at": "2026-09-19 15:05:11",
+  "backbone": "SimCLR 自监督 resnet18（无标签，2026-08-29）",
+  "n_events": 831,
+  "n_pos": 346,
+  "fold_aucs": {
+    "bigru": [
+      0.9671,
+      0.9603,
+      0.9601,
+      0.9244,
+      0.9563
+    ],
+    "pool": [
+      0.9277,
+      0.8998,
+      0.9299,
+      0.8806,
+      0.9062
+    ]
+  },
+  "final_epochs": {
+    "bigru": 11,
+    "pool": 11
+  },
+  "oof_auc": 0.9217,
+  "working_points": {
+    "0.9": {
+      "threshold": 0.7971,
+      "precision": 0.9008,
+      "recall": 0.6561
+    },
+    "0.95": {
+      "threshold": 0.9472,
+      "precision": 0.95,
+      "recall": 0.2746
+    }
+  },
+  "fixed_050": {
+    "precision": 0.8169,
+    "recall": 0.8642
+  }
+}

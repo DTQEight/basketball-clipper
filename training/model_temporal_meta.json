@@ -1,0 +1,74 @@
+{
+  "trained_at": "2026-09-19 13:21:41",
+  "arch": "bigru",
+  "use_aug": true,
+  "n_events": 831,
+  "n_pos": 346,
+  "n_games": 6,
+  "fold_aucs": [
+    0.7788,
+    0.7099,
+    0.8081,
+    0.736,
+    0.7151
+  ],
+  "final_epochs": 26,
+  "oof_auc": 0.6521,
+  "working_points": {
+    "0.9": {
+      "threshold": 0.9729,
+      "precision": 0.9091,
+      "recall": 0.1156
+    },
+    "0.95": {
+      "threshold": 0.988,
+      "precision": 0.9524,
+      "recall": 0.0578
+    },
+    "0.98": {
+      "threshold": 0.9938,
+      "precision": 1.0,
+      "recall": 0.0318
+    }
+  },
+  "fixed_050": {
+    "precision": 0.6355,
+    "recall": 0.3728
+  },
+  "ensemble": {
+    "calibrated_at": "2026-09-19 15:40:00",
+    "composition": "a_b2_f_vm",
+    "weights": {
+      "lgbm": 0.5,
+      "b": 2.0,
+      "flow": 1.0,
+      "vm": 1.0
+    },
+    "keep_thr": 0.72,
+    "source": "B 臂骨干换成 SimCLR 域内自监督编码器（training/model_b_simclr.pt）后，在 831 事件 5 折 OOF 上重定权重与阈值（无对应 --deploy 流程，用 cache/_recalib_with_newb.py 一次性的：按 OOF AUC 择优 + precision>=0.95 最大召回工作点）。重跑 train_directions.py --deploy 会覆盖回旧口径",
+    "reject_thr": 0.16,
+    "oof_auc": 0.9527,
+    "n_events": 831,
+    "keep_wp": {
+      "threshold": 0.72,
+      "precision": 0.952,
+      "recall": 0.569
+    },
+    "video_check": {
+      "note": "两场全人工标注的真实视频（77 个候选），只重算视觉三臂、A 沿用已存分数",
+      "2026.09.01-3rd": {"n": 46, "auc_old": 0.8986, "auc_new": 0.9162,
+                          "零误报阈值": 0.69, "零误报召回": 0.737},
+      "2026.09.01-4th": {"n": 31, "auc_old": 0.9274, "auc_new": 0.9444,
+                          "零误报阈值": 0.64, "零误报召回": 0.846}
+    },
+    "arms_oof_auc": {
+      "A": 0.8034,
+      "B(SimCLR, mean bigru+pool)": 0.9217,
+      "B(ResNet18, 换之前)": 0.6322,
+      "Flow_T": 0.8593,
+      "VM": 0.8208,
+      "ab_f_vm(旧配置)": 0.9094,
+      "a_b2_f_vm(现役)": 0.9527
+    }
+  }
+}

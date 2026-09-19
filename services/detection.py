@@ -27,6 +27,7 @@ if str(_ROOT) not in sys.path:
 
 from . import state
 from . import video_utils
+from . import goal_verifier
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector
@@ -262,6 +263,31 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 
 
 # ============ 检测 ============
+
+def _sync_marks(video_path, clips):
+    """自动 √ 之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
+
+    - kept_goal_indices：与 clip_action 同口径（有任何标记时只保留 √ 的索引；
+      完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
+    - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
+      clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
+    返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
+    """
+    marks = [c.get("mark") for c in clips]
+    n_keep = sum(1 for m in marks if m == "keep")
+    n_reject = sum(1 for m in marks if m == "reject")
+    state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
+                               if (n_keep or n_reject) else set(range(len(clips))))
+    try:
+        state.update_history_labels(
+            video_path,
+            kept_ts_list=[c["ts"] for c in clips if c.get("mark") == "keep"],
+            deleted_ts_list=[c["ts"] for c in clips if c.get("mark") == "reject"],
+        )
+    except Exception as e:
+        log.warning(f"[VERIFY] 自动标记落盘失败（不影响本次结果）: {e}")
+    return n_keep, n_reject
+
 
 def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
@@ -761,6 +787,32 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                         fps, total, _stamp, progress_callback=_report,
                                         cancel_check=state.cancel_event.is_set)
             )
+
+            # ===== AI 复核：四臂集成判分，高分候选自动标记「自动通过」=====
+            # 只加 clip["auto"] / clip["verify_score"]（及各臂分），不删除任何候选，
+            # 召回不受影响（低分候选照常人工确认，灰区全部保留）。
+            # 模型缺失/加载失败/推理异常时静默降级，不影响检测结果。
+            if state.last_goal_clips:
+                _report(85, 'AI 复核（四臂集成）...')
+                _t_verify = time.time()
+
+                def _verify_progress(frac, stage):
+                    # A 臂逐帧 YOLO 是瓶颈（约 6.5s/候选），必须持续刷进度，
+                    # 否则复核这几分钟界面完全静止，看起来像卡死
+                    _report(85 + 14 * min(max(frac, 0.0), 1.0),
+                            f'AI 复核 {stage}')
+
+                _n_auto = goal_verifier.mark_auto(
+                    state.last_goal_clips, video_path, hoop,
+                    progress=_verify_progress)
+                _verify_sec = time.time() - _t_verify
+                if _n_auto:
+                    log.info(f"[VERIFY] 自动通过 {_n_auto}/{len(state.last_goal_clips)} "
+                             f"个候选（阈值 {goal_verifier.auto_threshold():.3f}，"
+                             f"耗时 {_verify_sec:.0f}s）")
+                else:
+                    log.info(f"[VERIFY] 无自动通过候选（{goal_verifier.unavailable_reason()}，"
+                             f"耗时 {_verify_sec:.0f}s）")
         else:
             # 主循环被取消：不生成预览，列表保持为空（下方取消分支清空并保存断点）
             state.last_goal_clips.clear()
@@ -961,6 +1013,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           auto_threshold_value=_auto_thr_for_history,
                           warmup_p95_median=_warmup_p95_for_history,
                           warmup_sample_count=_warmup_count_for_history)
+        # ===== AI 自动 √ 落盘 =====
+        # 必须放在 add_history 之后：add_history 只保留磁盘上已有人工标签、
+        # 从不读 clips 上的 mark，先写会被随后的整条记录覆盖掉。
+        if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+            _k, _r = _sync_marks(video_path, state.last_goal_clips)
+            log.info(f"[VERIFY] 自动 √ 已同步（√ {_k} · × {_r} / "
+                     f"{len(state.last_goal_clips)} 个片段）")
         if _saved_record is None:
             # 磁盘/权限问题导致未落盘：显式告知（旧实现静默，用户下次启动才发现历史缺失）
             status += "\n⚠ 历史记录写入失败（磁盘/权限问题），本次结果未持久化"
@@ -1550,6 +1609,44 @@ def _on_load_history_impl(idx_choice, progress_callback):
                 n_person += 1
         if n_person:
             log.info(f"[LOAD] persons matched: {n_person}")
+
+    # ===== AI 复核：历史片段缺分数时补跑四臂集成打分 =====
+    # 片段缓存历史上只存 ts/path/idx（旧条目连 score 都没有），历史回读若拿到
+    # 无分片段，卡片就没有「AI 自动通过」徽标。这里就地补跑一次并回写缓存，
+    # 补过之后分数随 put_clip_cache 落盘，后续重启/再读历史都不会再丢。
+    if state.last_goal_clips and hoop:
+        # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值组合会给出
+        # 错误判决，先作废再走重算分支
+        _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
+        if _n_stale:
+            log.info(f"[LOAD] AI 判定口径已变更（ver={goal_verifier.model_fingerprint()}），"
+                     f"作废 {_n_stale} 个片段的旧分数")
+        _n_missing = sum(1 for c in state.last_goal_clips if "score" not in c)
+        if _n_missing:
+            _report(70, f'AI 复核（{_n_missing}/{len(state.last_goal_clips)} '
+                        f'个片段缺分数）...')
+            _t_verify = time.time()
+
+            def _verify_progress(frac, stage):
+                _report(70 + 25 * min(max(frac, 0.0), 1.0), f'AI 复核 {stage}')
+
+            _n_auto = goal_verifier.mark_auto(
+                state.last_goal_clips, video_path, hoop,
+                progress=_verify_progress)
+            log.info(f"[LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
+                     f"自动通过 {_n_auto}/{len(state.last_goal_clips)} "
+                     f"（耗时 {time.time() - _t_verify:.0f}s）")
+        else:
+            # 分数已就绪：按当前阈值重推 auto 并自动 √（阈值可被手改，缓存里的旧标记会过时）
+            _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
+            log.info(f"[LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
+                     f"/{len(state.last_goal_clips)}"
+                     f"（阈值 {goal_verifier.auto_threshold():.3f}）")
+        state.put_clip_cache(cache_key, state.last_goal_clips)
+        # 自动 √ 同步进 kept 索引 + 历史标签（否则重读历史时标记又没了）
+        if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+            _k, _r = _sync_marks(video_path, state.last_goal_clips)
+            log.info(f"[LOAD] AI 自动 √ 已同步（√ {_k} · × {_r}）")
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None

@@ -1,0 +1,682 @@
+# -*- coding: utf-8 -*-
+"""四臂集成进球验证器：给检测出的候选打「自动通过」标记。
+
+背景
+    GoalDetector 找出的候选里含相当比例的误报，逐个人工确认成本高。
+    本模块把离线标定的冠军集成搬到线上，给每个候选打一个 0~1 的分数，
+    高分候选直接标「自动通过」，用户可跳过人工确认。
+
+集成口径（与 training/train_directions.py --deploy 标定严格一致）
+    A     training/model_lgbm.txt       手工特征 LGBM（±1.5s 密集 YOLO 复检提特征）
+    B     training/model_temporal.pt + model_temporal_pool.pt
+                                        ResNet18 帧特征 → bigru/pool 双 TemporalNet
+                                        取 sigmoid 均值
+    Flow  training/model_flow_t.pt      Farneback 光流幅度序列 → ResNet18 → bigru
+    VM    training/model_vm_lgbm.txt    VideoMAE 768 维特征 → LGBM
+    score = 各臂 sigmoid 概率按 ENS_WEIGHTS 加权均值（缺臂时按剩余权重重归一化，
+            单臂可用时退化为该臂分）
+    权重与阈值由 --deploy 写进 training/model_temporal_meta.json 的 ensemble 段，
+    运行时读取；代码里的默认值仅在该段缺失时兜底。
+
+    B/Flow/VM 三臂共享同一批 16 帧筐心裁剪块，与训练侧 FRAME_OFFS / zoom 3.2 /
+    letterbox 严格同口径 —— 裁剪错位会直接毁掉打分。
+
+重要约束
+    本模块**只做标记，不删除任何候选**。低分候选照常进入人工确认流程，
+    因此不会造成额外漏球。任何情况下不得改成分数过滤。
+    模型缺失或加载失败时静默降级（缺哪臂按剩余权重重归一化），主流程不受影响。
+"""
+from __future__ import annotations
+
+import importlib.util
+import hashlib
+import json
+import logging
+import os
+import threading
+from pathlib import Path
+
+_log = logging.getLogger("goal_verifier")
+
+_ROOT = Path(__file__).resolve().parent.parent
+TRAINING_DIR = _ROOT / "training"
+
+try:
+    from services.state import CACHE_ROOT
+except ImportError:  # 直接以脚本方式 import 时兜底
+    CACHE_ROOT = str(_ROOT / "cache")
+
+LGBM_MODEL = TRAINING_DIR / "model_lgbm.txt"
+LGBM_META = TRAINING_DIR / "model_meta.json"
+TEMPORAL_BIGRU = TRAINING_DIR / "model_temporal.pt"
+TEMPORAL_POOL = TRAINING_DIR / "model_temporal_pool.pt"
+# B 臂换骨干：SimCLR 域内自监督编码器 + bigru/pool 双头（自包含 checkpoint）
+B_SIMCLR_FILE = TRAINING_DIR / "model_b_simclr.pt"
+FLOW_MODEL = TRAINING_DIR / "model_flow_t.pt"
+VM_MODEL = TRAINING_DIR / "model_vm_lgbm.txt"
+ENSEMBLE_META = TRAINING_DIR / "model_temporal_meta.json"
+
+# 兜底阈值/权重（仅在 ENSEMBLE_META 缺 ensemble 段时生效）
+AUTO_THR = 0.70
+ENS_WEIGHTS = {"lgbm": 0.5, "b": 0.5, "flow": 1.0, "vm": 1.0}
+
+# A 臂单批候选数：A 臂逐帧 YOLO 很慢（约 6.5s/候选），分批只为刷 UI 进度
+A_BATCH = 8
+
+
+# ===== A 臂：手工特征 LGBM =====
+
+_lgbm = None
+_lgbm_tried = False
+_lgbm_lock = threading.Lock()
+_feat_names: list = []
+_extract_fn = None
+
+
+def _load_lgbm():
+    global _lgbm, _lgbm_tried, _feat_names
+    if _lgbm_tried:
+        return _lgbm
+    with _lgbm_lock:
+        if _lgbm_tried:
+            return _lgbm
+        _lgbm_tried = True
+        try:
+            import lightgbm as lgb
+            meta = json.loads(LGBM_META.read_text(encoding="utf-8"))
+            names = [str(k) for k in meta.get("features", [])]
+            booster = lgb.Booster(model_file=str(LGBM_MODEL))
+            if len(names) != booster.num_feature():
+                raise ValueError(f"meta 特征数 {len(names)} != 模型特征数 "
+                                 f"{booster.num_feature()}")
+            _feat_names, _lgbm = names, booster
+            _log.info("goal_verifier: A 臂 LGBM 已加载（%d 特征）", len(names))
+        except Exception as e:
+            _log.warning("goal_verifier: A 臂加载失败（该臂禁用）: %s", e)
+            _lgbm, _feat_names = None, []
+    return _lgbm
+
+
+def _get_extract():
+    """懒加载 training/extract_features.py 的 extract()（脚本非包，用 importlib）。"""
+    global _extract_fn
+    if _extract_fn is not None:
+        return _extract_fn
+    try:
+        mod = _load_module(str(TRAINING_DIR / "extract_features.py"),
+                           "bball_extract_features")
+        _extract_fn = mod.extract
+    except Exception as e:
+        _log.warning("goal_verifier: extract_features 加载失败（A 臂禁用）: %s", e)
+        _extract_fn = False
+    return _extract_fn or None
+
+
+# ===== 通用：按文件路径加载 training/ 下的脚本（training 非包） =====
+
+def _load_module(path: str, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ===== B / Flow 臂：ResNet18 帧特征 + TemporalNet =====
+
+_temporal = None
+_temporal_tried = False
+_temporal_lock = threading.Lock()
+_train_temporal_mod = None
+_frames_b_mod = None
+
+
+def _load_temporal():
+    """懒加载 B/Flow 臂推理栈。
+
+    B 臂骨干优先用 SimCLR 域内自监督编码器（training/model_b_simclr.pt，
+    自包含：骨干 + bigru/pool 双头 + 预处理口径），缺失时退回 ImageNet
+    ResNet18 + model_temporal*.pt（旧口径）。
+    Flow 臂固定用 ImageNet ResNet18（光流幅度图，SimCLR 没在这个域上训过）。
+
+    预处理两套口径必须严格区分：
+      B(SimCLR)  BGR → RGB，/255，**不做** mean/std（编码器是在裸 /255 上训的）
+      Flow       BGR → RGB，/255，再做 ImageNet mean/std（同训练侧）
+    同时读取 ensemble 段的权重与阈值。失败返回 None。
+    """
+    global _temporal, _temporal_tried, AUTO_THR, ENS_WEIGHTS
+    if _temporal_tried:
+        return _temporal
+    with _temporal_lock:
+        if _temporal_tried:
+            return _temporal
+        _temporal_tried = True
+        try:
+            import torch
+            import torchvision.models as tvm
+
+            global _train_temporal_mod, _frames_b_mod
+            if _train_temporal_mod is None:
+                _train_temporal_mod = _load_module(
+                    str(TRAINING_DIR / "train_temporal.py"), "bball_train_temporal")
+            if _frames_b_mod is None:
+                _frames_b_mod = _load_module(
+                    str(TRAINING_DIR / "extract_frames_b.py"), "bball_frames_b")
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            def _backbone(sd=None):
+                """resnet18(fc→Identity)：sd=None 用 ImageNet，否则用给定权重。"""
+                net = (tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+                       if sd is None else tvm.resnet18(weights=None))
+                net.fc = torch.nn.Identity()
+                if sd is not None:
+                    net.load_state_dict(sd)
+                return net.to(device).eval()
+
+            def _load_net(path):
+                ck = torch.load(path, map_location=device, weights_only=False)
+                net = _train_temporal_mod.TemporalNet(
+                    dim=ck.get("dim", 512), arch=ck["arch"]).to(device)
+                net.load_state_dict(ck["state_dict"])
+                return net.eval()
+
+            # ---- B 臂：SimCLR 骨干优先，缺失退回 ImageNet ----
+            b_resnet = b_nets = None
+            b_pre = "rgb255"
+            try:
+                ck = torch.load(B_SIMCLR_FILE, map_location=device,
+                                weights_only=False)
+                b_resnet = _backbone(ck["backbone"])
+                b_nets = []
+                for n in ck["nets"]:
+                    net = _train_temporal_mod.TemporalNet(
+                        dim=ck.get("dim", 512), arch=n["arch"]).to(device)
+                    net.load_state_dict(n["state_dict"])
+                    b_nets.append(net.eval())
+                _log.info("goal_verifier: B 臂骨干 = SimCLR 自监督（%s，OOF %s）",
+                          "+".join(n["arch"] for n in ck["nets"]),
+                          ck.get("oof_auc"))
+            except Exception as e:
+                _log.warning("goal_verifier: SimCLR B 臂加载失败，退回 ImageNet: %s", e)
+                b_resnet = b_nets = None
+            if b_nets is None:
+                b_resnet = _backbone()
+                b_nets = [_load_net(p) for p in (TEMPORAL_BIGRU, TEMPORAL_POOL)]
+                b_pre = "imagenet"
+
+            flow_resnet = _backbone()
+            try:
+                flow_net = _load_net(FLOW_MODEL)
+            except Exception as e:
+                _log.warning("goal_verifier: Flow 臂加载失败（该臂禁用）: %s", e)
+                flow_net = None
+
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+            _read_ensemble()
+
+            _temporal = {
+                "b_resnet": b_resnet, "b_nets": b_nets, "b_pre": b_pre,
+                "flow_resnet": flow_resnet, "flow_net": flow_net,
+                "device": device, "mean": mean, "std": std,
+                "frame_offs": list(_frames_b_mod.FRAME_OFFS),
+                "crop_hoop": _frames_b_mod.crop_hoop,
+            }
+            _log.info("goal_verifier: B/Flow 臂已加载 (device=%s, B骨干=%s, flow=%s)",
+                      device, b_pre, "on" if flow_net else "off")
+        except Exception as e:
+            _log.warning("goal_verifier: B/Flow 臂加载失败（两臂禁用）: %s", e)
+            _temporal = None
+    return _temporal
+
+
+# ===== VM 臂：VideoMAE 冻结主干 + LGBM 头 =====
+
+_vm = None
+_vm_tried = False
+_vm_lock = threading.Lock()
+
+
+def _load_vm():
+    """懒加载 VideoMAE 臂。权重缓存在 cache/hf（extract_videomae.py 下载）。
+
+    服务进程不允许运行时下载（HF_HUB_OFFLINE=1），缺缓存/缺依赖则该臂禁用。
+    输入口径与训练严格一致：(16,224,224,3) uint8 BGR → RGB → (x/255-0.5)/0.5。
+    """
+    global _vm, _vm_tried
+    if _vm_tried:
+        return _vm
+    with _vm_lock:
+        if _vm_tried:
+            return _vm
+        _vm_tried = True
+        try:
+            os.environ.setdefault("HF_HOME", str(Path(CACHE_ROOT) / "hf"))
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            import lightgbm as lgb
+
+            mod = _load_module(str(TRAINING_DIR / "extract_videomae.py"),
+                               "bball_extract_videomae")
+            model, device = mod.load_model()
+            booster = lgb.Booster(model_file=str(VM_MODEL))
+            _vm = {
+                "model": model, "booster": booster, "device": device,
+                "dtype": next(model.parameters()).dtype,
+                "to_input": mod.to_input,
+            }
+            _log.info("goal_verifier: VM 臂已加载 (device=%s, dtype=%s)",
+                      device, _vm["dtype"])
+        except Exception as e:
+            _log.info("goal_verifier: VM 臂不可用（该臂禁用）: %s", e)
+            _vm = None
+    return _vm
+
+
+# ===== 集成标定（阈值/权重）=====
+
+_ens_mtime = None
+
+
+def _read_ensemble():
+    """读 model_temporal_meta.json 的 ensemble 段（阈值 + 权重），文件变更自动失效。
+
+    刻意不加载任何模型：历史回读时要按当前阈值重推 auto 标记，不该为此付一次
+    ResNet18/VideoMAE 的加载代价。
+    """
+    global AUTO_THR, ENS_WEIGHTS, _ens_mtime
+    try:
+        mtime = ENSEMBLE_META.stat().st_mtime
+        if _ens_mtime != mtime:
+            ens = json.loads(ENSEMBLE_META.read_text(
+                encoding="utf-8")).get("ensemble", {})
+            _ens_mtime = mtime
+            AUTO_THR = float(ens.get("keep_thr", AUTO_THR))
+            w = ens.get("weights")
+            if isinstance(w, dict) and w:
+                ENS_WEIGHTS = {k: float(v) for k, v in w.items()}
+            _log.info("goal_verifier: 集成标定 keep_thr=%s 权重=%s（组合 %s）",
+                      AUTO_THR, ENS_WEIGHTS, ens.get("composition"))
+        return AUTO_THR
+    except Exception as e:
+        _log.warning("goal_verifier: ensemble 段读取失败，用代码默认 "
+                     "keep_thr=%s 权重=%s: %s", AUTO_THR, ENS_WEIGHTS, e)
+        return AUTO_THR
+
+
+# ===== 公共查询接口 =====
+
+def auto_threshold() -> float:
+    """当前自动通过阈值（读 ensemble.keep_thr，缺省用代码默认值）。"""
+    return _read_ensemble()
+
+
+def model_fingerprint() -> str:
+    """当前判定口径的指纹：B 模型文件 + 各权重 + 阈值。
+
+    分数只在某一套「模型 + 权重 + 阈值」下有意义。换骨干、调权重、改阈值之后，
+    缓存里的旧 score 会和新阈值组合出错误的 √/×，所以必须能识别出"这批分数
+    是另一套口径算的"。
+    """
+    h = hashlib.md5()
+    # 必须先刷新 ENS_WEIGHTS/AUTO_THR：否则首次调用会把「代码默认权重」哈希进去，
+    # 而下一次调用哈希的是文件里的权重 → 指纹自己就变了（分数被反复误判为过期）
+    thr = _read_ensemble()
+    for p in (B_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL, FLOW_MODEL, VM_MODEL):
+        try:
+            h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
+        except OSError:
+            h.update(f"{p.name}:-".encode())
+    h.update(json.dumps(sorted(ENS_WEIGHTS.items())).encode())
+    h.update(str(thr).encode())
+    return h.hexdigest()[:12]
+
+
+def invalidate_stale(clips) -> int:
+    """丢弃口径已过期的分数（就地）。返回被作废的片段数。
+
+    verify_ver 与当前指纹不一致（或旧数据根本没有该字段）→ 清掉 score 及各臂分，
+    调用方的"缺分数"分支就会重跑复核。人工标记 mark/mark_source 不动。
+    """
+    fp = model_fingerprint()
+    n = 0
+    for c in clips:
+        if "score" not in c:
+            continue
+        if c.get("verify_ver") == fp:
+            continue
+        for k in ("score", "verify_ver", "auto", "verify_score",
+                  "score_lgbm", "score_b", "score_flow", "score_vm"):
+            c.pop(k, None)
+        n += 1
+    return n
+
+
+def refresh_auto(clips) -> int:
+    """按当前阈值从已有 score 重推 auto，并对达标片段自动打 √（不重跑模型）。
+
+    阈值可被手改（model_temporal_meta.json），片段缓存里的 auto 是旧阈值的
+    产物——历史回读不重推就会一直显示过时的徽标。
+    自动 √ 只写 mark_source != 'manual' 的片段：**人工标记永远优先，绝不覆盖**
+    （用户已判 × 的球不能因为模型给高分就被翻成 √）。
+    """
+    thr = auto_threshold()
+    n = 0
+    for c in clips:
+        if "score" not in c:
+            continue
+        c["verify_score"] = round(float(c["score"]), 3)
+        c["auto"] = bool(float(c["score"]) >= thr)
+        if not c["auto"]:
+            continue
+        n += 1
+        if c.get("mark_source") != "manual":
+            c["mark"] = "keep"
+            c["mark_source"] = "auto"
+    return n
+
+
+def unavailable_reason() -> str:
+    """各臂可用性摘要，供日志/UI 提示。"""
+    t = _load_temporal()
+    return (f"A={'on' if _load_lgbm() is not None else 'off'} "
+            f"B/Flow={'on' if t else 'off'} "
+            f"VM={'on' if _load_vm() else 'off'} thr={auto_threshold():.3f}")
+
+
+# ===== 打分 =====
+
+def _hoop_at(hoop_track, ts, default_hoop):
+    """按事件时间取篮筐坐标：轨迹里最后一个 ts <= 事件 ts 的位置。
+
+    事件发生在移位前 → 用默认标定；移位后 → 用新坐标。
+    裁剪错位会直接毁掉三臂打分，所以必须按时间取，不能全程用一个框。
+    """
+    if not hoop_track:
+        return default_hoop
+    best = None
+    for t in hoop_track:
+        if float(t.get("ts", 0.0)) <= float(ts):
+            best = t
+        else:
+            break  # 轨迹按时间升序，后面只会更大
+    return tuple(best["hoop"]) if best else default_hoop
+
+
+def _flow_maps(frames):
+    """16 帧筐心块 → Farneback 光流幅度序列 (15,224,224,3) uint8。
+
+    与训练侧 extract_motion.run_flow 严格一致：逐帧灰度 →
+    calcOpticalFlowFarneback(0.5,3,21,3,5,1.2,0) → 幅度×12 clip uint8
+    → 3 通道复制（喂 ResNet18 的口径）。
+    """
+    import cv2
+    import numpy as np
+    gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+    h, w = frames.shape[1], frames.shape[2]
+    mags = np.zeros((len(gray) - 1, h, w), dtype=np.uint8)
+    for j in range(len(gray) - 1):
+        flow = cv2.calcOpticalFlowFarneback(
+            gray[j], gray[j + 1], None, 0.5, 3, 21, 3, 5, 1.2, 0)
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        mags[j] = np.clip(mag * 12.0, 0, 255).astype(np.uint8)
+    return np.repeat(mags[..., None], 3, axis=-1)
+
+
+def _score_visual(video_path, clips, hoop, hoop_track=None, on_progress=None):
+    """B/Flow/VM 三臂打分（共享同一批 16 帧筐心块解码）。
+
+    就地写 clip['score_b'] / clip['score_flow'] / clip['score_vm']（float 0~1）。
+    片段按 ts 排序顺序解码（单 reader，不逐片段重开视频）。
+    某臂缺模型或推理失败时静默跳过（集成端按剩余权重重归一化）。
+    """
+    tt = _load_temporal()
+    todo = [c for c in clips if "score_b" not in c]
+    if tt is None or not todo or not hoop:
+        if on_progress:
+            on_progress(1.0, '视觉三臂不可用')
+        return
+    import numpy as np
+    import torch
+    from video_io import VideoReader
+
+    todo.sort(key=lambda c: float(c["ts"]))
+    b_resnet, b_nets, b_pre = tt["b_resnet"], tt["b_nets"], tt["b_pre"]
+    flow_resnet, flow_net = tt["flow_resnet"], tt.get("flow_net")
+    device = tt["device"]
+    mean, std = tt["mean"], tt["std"]
+    frame_offs, crop_hoop = tt["frame_offs"], tt["crop_hoop"]
+    if on_progress:
+        on_progress(0.0, '视觉三臂：加载模型')
+    vm = _load_vm()
+    n_frames, min_valid = len(frame_offs), 8
+
+    blocks = []  # [(clip, (16,224,224,3) uint8 BGR)]
+    reader = None
+    try:
+        reader = VideoReader(video_path)
+        fps, total = reader.fps, reader.total
+        for k, c in enumerate(todo):
+            ts = float(c["ts"])
+            frames = np.zeros((n_frames, 224, 224, 3), dtype=np.uint8)
+            # offsets 单调递增 → 顺序解码到最后一帧（同 extract_frames_b.main）
+            last = max(0, min(int((ts + frame_offs[-1]) * fps), total - 1))
+            want = {}
+            for i, off in enumerate(frame_offs):
+                fidx = max(0, min(int((ts + off) * fps), total - 1))
+                want[fidx] = i
+            got = 0
+            eff_hoop = _hoop_at(hoop_track, ts, hoop)
+            for fidx, frame in reader.iter_frames(start=min(want), end=last + 1):
+                if fidx in want:
+                    frames[want[fidx]] = crop_hoop(frame, eff_hoop)
+                    got += 1
+                    if got >= n_frames:
+                        break
+            if got >= min_valid:
+                blocks.append((c, frames))
+            if on_progress and (k + 1) % 8 == 0:
+                # 抽帧（解码）占视觉阶段前半：让进度在长时间解码里也能动
+                on_progress(0.5 * (k + 1) / len(todo),
+                            f'三臂抽帧 {k + 1}/{len(todo)}')
+    except Exception as e:
+        _log.warning("goal_verifier: 筐心块抽帧失败 %s: %s", video_path, e)
+        return
+    finally:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+    if on_progress:
+        on_progress(0.5, f'三臂抽帧 {len(blocks)}/{len(todo)}')
+
+    # 批量 GPU 推理（4 片段 = 64 帧/批，同训练特征提取的显存预算）
+    try:
+        for i in range(0, len(blocks), 4):
+            chunk = blocks[i:i + 4]
+            if on_progress:
+                on_progress(0.5 + 0.5 * i / max(len(blocks), 1),
+                            f'三臂推理 {i}/{len(blocks)}')
+            # ---- B 臂：帧特征 → bigru/pool 双头均值 ----
+            # 预处理按骨干口径分流：SimCLR 用裸 /255（编码器这么训的），
+            # 退回 ImageNet 时才是 mean/std
+            arr = np.concatenate([b[1] for b in chunk]).astype(np.float32) / 255.0
+            arr = arr[..., ::-1]  # BGR→RGB
+            arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))
+            with torch.no_grad():
+                t = torch.from_numpy(arr).to(device)
+                if b_pre == "imagenet":
+                    t = (t - mean) / std
+                feat = b_resnet(t)  # (N*16, 512)
+                for j, (c, _) in enumerate(chunk):
+                    f = feat[j * n_frames:(j + 1) * n_frames].unsqueeze(0)
+                    ps = [float(torch.sigmoid(n(f)).item()) for n in b_nets]
+                    c["score_b"] = round(sum(ps) / len(ps), 3)
+            # ---- Flow 臂：光流幅度序列 → ImageNet ResNet18 → bigru ----
+            if flow_net is not None:
+                try:
+                    fmap_blocks = [_flow_maps(b[1]) for b in chunk]
+                    farr = np.concatenate(fmap_blocks).astype(np.float32) / 255.0
+                    farr = np.ascontiguousarray(farr.transpose(0, 3, 1, 2))
+                    with torch.no_grad():
+                        ft = (torch.from_numpy(farr).to(device) - mean) / std
+                        ffeat = flow_resnet(ft)  # (N*15, 512)
+                        for j, (c, _) in enumerate(chunk):
+                            nf = fmap_blocks[j].shape[0]
+                            ff = ffeat[j * nf:(j + 1) * nf].unsqueeze(0)
+                            c["score_flow"] = round(
+                                float(torch.sigmoid(flow_net(ff)).item()), 3)
+                except Exception as e:
+                    _log.warning("goal_verifier: Flow 臂推理失败（跳过该臂）: %s", e)
+                    for c, _ in chunk:
+                        c.pop("score_flow", None)
+            # ---- VM 臂：VideoMAE 768 维 → LGBM Booster ----
+            if vm is not None:
+                try:
+                    with torch.no_grad():
+                        t_in = torch.cat(
+                            [vm["to_input"](b, vm["device"], vm["dtype"])
+                             for _, b in chunk], dim=0)
+                        out = vm["model"](pixel_values=t_in)
+                        vfeat = out.last_hidden_state.float().mean(dim=1)
+                    preds = vm["booster"].predict(vfeat.cpu().numpy())
+                    for (c, _), p in zip(chunk, preds):
+                        c["score_vm"] = round(min(max(float(p), 0.0), 1.0), 3)
+                except Exception as e:
+                    _log.warning("goal_verifier: VM 臂推理失败（跳过该臂）: %s", e)
+                    for c, _ in chunk:
+                        c.pop("score_vm", None)
+    except Exception as e:
+        _log.warning("goal_verifier: 三臂推理失败 %s: %s", video_path, e)
+
+
+def _score_lgbm(video_path, clips, hoop, hoop_track=None, on_progress=None):
+    """A 臂打分：±1.5s 密集 YOLO 复检提手工特征 → LGBM。就地写 clip['score_lgbm']。
+
+    分批调用 extract()（每批 A_BATCH 个候选）：单批耗时长（逐帧 YOLO），
+    分批是为了让 on_progress 有机会刷新 UI 进度——否则整个复核阶段界面全黑箱。
+    """
+    model = _load_lgbm()
+    extract = _get_extract()
+    todo = [c for c in clips if "score_lgbm" not in c]
+    if model is None or extract is None or not todo or not hoop:
+        if on_progress:
+            on_progress(1.0, 'A臂不可用')
+        return
+    try:
+        from video_io import get_video_info
+        info = get_video_info(video_path)
+    except Exception as e:
+        _log.warning("goal_verifier: 读取视频信息失败 %s: %s", video_path, e)
+        if on_progress:
+            on_progress(1.0, 'A臂读取视频失败')
+        return
+    try:
+        from app import get_ball_model, get_ball_class_ids, get_device
+        m, weights = get_ball_model()
+        ball_classes, device = get_ball_class_ids(m, weights), get_device()
+    except Exception as e:
+        _log.warning("goal_verifier: A 臂 YOLO 不可用（跳过该臂）: %s", e)
+        return
+
+    n_done, n_err = 0, 0
+    for s in range(0, len(todo), A_BATCH):
+        chunk = todo[s:s + A_BATCH]
+        events, clip_by_eid = [], {}
+        for c in chunk:
+            ts = round(float(c["ts"]), 3)
+            eid = f"live_{int(ts * 1000):010d}"
+            events.append({
+                "event_id": eid, "video": video_path, "ts": ts,
+                "hoop": list(_hoop_at(hoop_track, ts, hoop)), "label": 0,
+                "video_width": info["width"], "video_height": info["height"],
+            })
+            clip_by_eid[eid] = c
+        try:
+            feats, errors = extract(m, ball_classes, device, events)
+        except Exception as e:
+            _log.warning("goal_verifier: A 臂提特征失败（跳过剩余候选）: %s", e)
+            break
+        n_err += len(errors)
+        for row in feats:
+            c = clip_by_eid.get(row.get("event_id"))
+            if c is None:
+                continue
+            try:
+                # 特征顺序以 meta.features 为准（Booster 内部特征名是 Column_N）
+                vals = [float(row.get(k, 0.0)) for k in _feat_names]
+                c["score_lgbm"] = round(
+                    min(max(float(model.predict([vals])[0]), 0.0), 1.0), 3)
+            except Exception:
+                continue
+        n_done += len(chunk)
+        if on_progress:
+            on_progress(min(n_done, len(todo)) / len(todo),
+                        f'A臂特征 {min(n_done, len(todo))}/{len(todo)}')
+    if n_err:
+        _log.info("goal_verifier: A 臂有 %d 个候选提特征失败（保留人工判断）", n_err)
+
+
+def combine(clip) -> float | None:
+    """按 ENS_WEIGHTS 组合一个 clip 的各臂分数（缺臂按剩余权重重归一化）。"""
+    arms = {"lgbm": clip.get("score_lgbm"), "b": clip.get("score_b"),
+            "flow": clip.get("score_flow"), "vm": clip.get("score_vm")}
+    avail = [(ENS_WEIGHTS.get(k, 0.0), v) for k, v in arms.items()
+             if v is not None and ENS_WEIGHTS.get(k, 0.0) > 0]
+    if not avail:
+        return None
+    wsum = sum(w for w, _ in avail)
+    return sum(w * v for w, v in avail) / wsum
+
+
+def score_clips(video_path, clips, hoop, hoop_track=None, progress=None):
+    """给 clips 跑四臂打分，就地写各臂分与集成分。返回打分成功的片段数。
+
+    progress: 可选回调 progress(frac: float, stage: str)，供 UI 显示长耗时的复核进度。
+    A 臂独占前 70%（逐帧 YOLO 是绝对瓶颈），视觉三臂占后 30%。
+    """
+    if not clips or not hoop:
+        return 0
+
+    def _p_a(frac, stage):
+        if progress:
+            progress(0.05 + 0.65 * frac, stage)
+
+    def _p_v(frac, stage):
+        if progress:
+            progress(0.70 + 0.30 * frac, stage)
+
+    _score_lgbm(video_path, clips, hoop, hoop_track=hoop_track, on_progress=_p_a)
+    _score_visual(video_path, clips, hoop, hoop_track=hoop_track, on_progress=_p_v)
+    # 打分完成后才取指纹：ENS_WEIGHTS 是 _load_temporal 里读进来的
+    fp = model_fingerprint()
+    n = 0
+    for c in clips:
+        s = combine(c)
+        if s is None:
+            continue
+        c["score"] = round(s, 3)
+        c["verify_ver"] = fp
+        n += 1
+    return n
+
+
+def mark_auto(clips, video_path, hoop, hoop_track=None, progress=None):
+    """给 clips 打上 auto 标记（就地修改）。返回自动通过的数量。
+
+    clip 需含 "ts"；会新增 verify_score / auto（及各臂分供排查）。
+    progress: 可选进度回调（见 score_clips）。
+    **只标记，不删除候选**；任何异常都不抛出——打分是增强功能，失败必须静默降级。
+    """
+    if not clips:
+        return 0
+    try:
+        n_scored = score_clips(video_path, clips, hoop, hoop_track=hoop_track,
+                               progress=progress)
+        if not n_scored:
+            return 0
+        return refresh_auto(clips)
+    except Exception as e:
+        _log.warning("goal_verifier: 打标异常（静默跳过）: %s", e)
+        return 0
