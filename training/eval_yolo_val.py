@@ -124,5 +124,6 @@ def main(weights: str):
 
 
 if __name__ == "__main__":
+    # 权重在 main 上已由 basketball_custom.pt 改名为 basketball_ft.pt（同一权重）
     main(sys.argv[1] if len(sys.argv) > 1 else
-         str(PROJECT_ROOT / "weights" / "basketball_custom.pt"))
+         str(PROJECT_ROOT / "weights" / "basketball_ft.pt"))

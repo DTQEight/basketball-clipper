@@ -149,7 +149,8 @@ def main():
     yolo_hoops = {}
     if rest:
         from ultralytics import YOLO
-        model = YOLO(str(PROJECT_ROOT / "weights" / "basketball_custom.pt"))
+        # 权重在 main 上已由 basketball_custom.pt 改名为 basketball_ft.pt（同一权重）
+        model = YOLO(str(PROJECT_ROOT / "weights" / "basketball_ft.pt"))
         t0 = time.time()
         for v in rest:
             hoop = yolo_infer_hoop(v, events[v], model, report)

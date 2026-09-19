@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""YOLO 篮球检测微调：basketball_custom.pt 续训（GTX 1650 4GB 预算）。
+"""YOLO 篮球检测微调：basketball_ft.pt 续训（GTX 1650 4GB 预算）。
 
 数据：training/yolo_data（build_yolo_dataset.py 产出，val=留出比赛日盲测）
 目标：拉起「穿网瞬间变形球」的置信度（0.06~0.17 → 0.3+），保住普通场景。
@@ -14,7 +14,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA = PROJECT_ROOT / "training" / "yolo_data" / "data.yaml"
-BASE = PROJECT_ROOT / "weights" / "basketball_custom.pt"
+# 权重在 main 上已由 basketball_custom.pt 改名为 basketball_ft.pt（同一权重）
+BASE = PROJECT_ROOT / "weights" / "basketball_ft.pt"
 
 batch = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 

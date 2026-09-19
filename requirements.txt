@@ -16,6 +16,11 @@ imageio-ffmpeg>=0.4.9
 # Web 界面
 nicegui>=1.4.0
 
+# AI 复核（四臂集成打分 / 自动 √）——缺任一库时对应臂静默禁用，检测主流程不受影响
+lightgbm>=4.0.0          # A 臂（手工特征）与 VM 臂的分类头
+transformers>=5.0.0      # VM 臂：VideoMAE 主干
+scikit-learn>=1.3.0      # 标定/评测（离线的 train_directions.py 也用它）
+
 # 深度学习（torch 不在此文件中，因 GPU/CPU 版本不同，需手动安装）
 # GPU 版（推荐，需 NVIDIA 显卡）——必须用 cu128：
 #   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
