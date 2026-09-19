@@ -386,23 +386,6 @@ def unavailable_reason() -> str:
 
 # ===== 打分 =====
 
-def _hoop_at(hoop_track, ts, default_hoop):
-    """按事件时间取篮筐坐标：轨迹里最后一个 ts <= 事件 ts 的位置。
-
-    事件发生在移位前 → 用默认标定；移位后 → 用新坐标。
-    裁剪错位会直接毁掉三臂打分，所以必须按时间取，不能全程用一个框。
-    """
-    if not hoop_track:
-        return default_hoop
-    best = None
-    for t in hoop_track:
-        if float(t.get("ts", 0.0)) <= float(ts):
-            best = t
-        else:
-            break  # 轨迹按时间升序，后面只会更大
-    return tuple(best["hoop"]) if best else default_hoop
-
-
 def _flow_maps(frames):
     """16 帧筐心块 → Farneback 光流幅度序列 (15,224,224,3) uint8。
 
@@ -423,7 +406,7 @@ def _flow_maps(frames):
     return np.repeat(mags[..., None], 3, axis=-1)
 
 
-def _score_visual(video_path, clips, hoop, hoop_track=None, on_progress=None):
+def _score_visual(video_path, clips, hoop, on_progress=None):
     """B/Flow/VM 三臂打分（共享同一批 16 帧筐心块解码）。
 
     就地写 clip['score_b'] / clip['score_flow'] / clip['score_vm']（float 0~1）。
@@ -466,10 +449,9 @@ def _score_visual(video_path, clips, hoop, hoop_track=None, on_progress=None):
                 fidx = max(0, min(int((ts + off) * fps), total - 1))
                 want[fidx] = i
             got = 0
-            eff_hoop = _hoop_at(hoop_track, ts, hoop)
             for fidx, frame in reader.iter_frames(start=min(want), end=last + 1):
                 if fidx in want:
-                    frames[want[fidx]] = crop_hoop(frame, eff_hoop)
+                    frames[want[fidx]] = crop_hoop(frame, hoop)
                     got += 1
                     if got >= n_frames:
                         break
@@ -551,7 +533,7 @@ def _score_visual(video_path, clips, hoop, hoop_track=None, on_progress=None):
         _log.warning("goal_verifier: 三臂推理失败 %s: %s", video_path, e)
 
 
-def _score_lgbm(video_path, clips, hoop, hoop_track=None, on_progress=None):
+def _score_lgbm(video_path, clips, hoop, on_progress=None):
     """A 臂打分：±1.5s 密集 YOLO 复检提手工特征 → LGBM。就地写 clip['score_lgbm']。
 
     分批调用 extract()（每批 A_BATCH 个候选）：单批耗时长（逐帧 YOLO），
@@ -589,7 +571,7 @@ def _score_lgbm(video_path, clips, hoop, hoop_track=None, on_progress=None):
             eid = f"live_{int(ts * 1000):010d}"
             events.append({
                 "event_id": eid, "video": video_path, "ts": ts,
-                "hoop": list(_hoop_at(hoop_track, ts, hoop)), "label": 0,
+                "hoop": list(hoop), "label": 0,
                 "video_width": info["width"], "video_height": info["height"],
             })
             clip_by_eid[eid] = c
@@ -630,7 +612,7 @@ def combine(clip) -> float | None:
     return sum(w * v for w, v in avail) / wsum
 
 
-def score_clips(video_path, clips, hoop, hoop_track=None, progress=None):
+def score_clips(video_path, clips, hoop, progress=None):
     """给 clips 跑四臂打分，就地写各臂分与集成分。返回打分成功的片段数。
 
     progress: 可选回调 progress(frac: float, stage: str)，供 UI 显示长耗时的复核进度。
@@ -647,8 +629,8 @@ def score_clips(video_path, clips, hoop, hoop_track=None, progress=None):
         if progress:
             progress(0.70 + 0.30 * frac, stage)
 
-    _score_lgbm(video_path, clips, hoop, hoop_track=hoop_track, on_progress=_p_a)
-    _score_visual(video_path, clips, hoop, hoop_track=hoop_track, on_progress=_p_v)
+    _score_lgbm(video_path, clips, hoop, on_progress=_p_a)
+    _score_visual(video_path, clips, hoop, on_progress=_p_v)
     # 打分完成后才取指纹：ENS_WEIGHTS 是 _load_temporal 里读进来的
     fp = model_fingerprint()
     n = 0
@@ -662,7 +644,7 @@ def score_clips(video_path, clips, hoop, hoop_track=None, progress=None):
     return n
 
 
-def mark_auto(clips, video_path, hoop, hoop_track=None, progress=None):
+def mark_auto(clips, video_path, hoop, progress=None):
     """给 clips 打上 auto 标记（就地修改）。返回自动通过的数量。
 
     clip 需含 "ts"；会新增 verify_score / auto（及各臂分供排查）。
@@ -672,8 +654,7 @@ def mark_auto(clips, video_path, hoop, hoop_track=None, progress=None):
     if not clips:
         return 0
     try:
-        n_scored = score_clips(video_path, clips, hoop, hoop_track=hoop_track,
-                               progress=progress)
+        n_scored = score_clips(video_path, clips, hoop, progress=progress)
         if not n_scored:
             return 0
         return refresh_auto(clips)
