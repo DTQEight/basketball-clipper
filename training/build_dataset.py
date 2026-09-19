@@ -1,73 +1,204 @@
 # -*- coding: utf-8 -*-
-"""把 dataset_20260918/blocks_index.json 的事件转成训练流水线要求的 training/dataset_v1.json。
+"""重建训练集：把 cache/history 的**标注池**转成训练流水线要求的 training/dataset_v1.json。
 
-L4 各脚本只用到 event_id / video / ts / hoop / label 五个字段：
-    extract_frames_b.py → load_dataset_events()
-    extract_features.py → 直读 dataset_v1.json
-event_id 沿用其格式 <视频hash8>_<帧号10位>。
+为什么要刷新：dataset_v1.json 是 2026.09.18 的冻结快照（831 事件 / 21 场），而标注池
+（cache/history 的 labels）已增长到 995 片段 / 25 场。且其中 4 场视频在快照之后被重新
+检测过（09.04-2nd 从 59 个候选增至 100 个），这部分片段任何模型都没见过。
+
+口径与旧版完全一致（下游脚本无需改动）：
+    event_id = md5(视频路径)[:8] + "_" + f"{round(ts*fps):010d}"
+    字段     = event_id / video / ts / label / hoop / video_fps / ...
+
+留出集：HOLDOUT 里的 4 场**不进训练集**，保持无偏验证（这是目前唯一的域外样本）。
+
+event_id 沿用策略：重新检测会让同一进球的时间戳位移 0.03~0.17 秒，帧号随之改变，
+event_id 也就变了——若照搬就会白白重抽全部特征。故对同一视频按 REUSE_TOL（0.25 秒）
+匹配旧 dataset 的事件并**沿用旧 event_id**（同分片的特征可直接复用）。
+容差安全：检测侧 min_gap_sec=2.0，相邻进球至少隔 2 秒，不会误并。
 
 用法：
-    env\\python.exe training\\build_dataset.py
-
-要换数据源（例如攒够新标注后改为从 cache/history 重建）时，只替换读 ITEMS 那一步，
-其余字段格式保持不变，下游脚本无需改动。
+    env\\Scripts\\python.exe training\\build_dataset.py --dry-run   # 只报 delta，不写文件
+    env\\Scripts\\python.exe training\\build_dataset.py             # 覆盖写 dataset_v1.json
+    env\\Scripts\\python.exe training\\build_dataset.py --from-blocks   # 旧的 blocks_index 口径
 """
+import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TR = ROOT / "training"
-DS = ROOT / "dataset_20260918"
+BLOCKS = ROOT / "dataset_20260918" / "blocks_index.json"
+OUT = TR / "dataset_v1.json"
+REUSE_TOL = 0.25   # 秒：重检造成的亚帧位移容差（远小于 min_gap_sec=2.0）
 
-items = json.loads((DS / "blocks_index.json").read_text(encoding="utf-8"))
-print("数据源 blocks_index 事件数: %d" % len(items))
+# 不进训练集的留出场（当前唯一的无偏验证来源，别吃进训练集）
+HOLDOUT = ("2026.08.31-1st.mp4", "2026.09.01-3rd.mp4",
+           "2026.09.01-4th.mp4", "2026.09.03-3rd.mp4")
 
-rows = []
-vhash = {}
-for it in items:
-    v = it["video"]
-    if v not in vhash:
-        vhash[v] = hashlib.md5(v.encode("utf-8")).hexdigest()[:8]
-    fps = float(it["fps"])
-    ts = float(it["ts"])
-    fidx = int(round(ts * fps))
-    rows.append({
-        "event_id": "%s_%010d" % (vhash[v], fidx),
-        "video": v,
-        "ts": round(ts, 3),
-        "clip_path": None,
-        "label": 1 if it["label"] == "kept" else 0,
-        "hoop": [int(x) for x in it["hoop"]],
-        "video_fps": fps,
-        "video_width": None,
-        "video_height": None,
-        "video_duration_sec": None,
-        "yolo_confirmed_history": None,
-        "yolo_rejected_history": None,
-        "detect_time": None,
-        "label_time": None,
-        "label_source": "offline",
-    })
 
-# event_id 去重检查（同一视频同一帧号只应出现一次）
-eids = [r["event_id"] for r in rows]
-dup = len(eids) - len(set(eids))
-print("event_id 唯一性: %d 个，重复 %d" % (len(set(eids)), dup))
-if dup:
-    seen = {}
-    for r in rows:
-        k = r["event_id"]
-        seen[k] = seen.get(k, 0) + 1
-        if seen[k] > 1:
-            r["event_id"] = "%s_dup%d" % (k, seen[k])
-    print("  已加后缀去重")
+def from_blocks():
+    items = json.loads(BLOCKS.read_text(encoding="utf-8"))
+    out = []
+    for it in items:
+        out.append({"video": it["video"], "ts": float(it["ts"]),
+                    "label": 1 if it["label"] == "kept" else 0,
+                    "hoop": [int(x) for x in it["hoop"]], "fps": float(it["fps"])})
+    print(f"数据源 blocks_index: {len(out)} 事件")
+    return out
 
-(TR / "dataset_v1.json").write_text(
-    json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
 
-npos = sum(1 for r in rows if r["label"] == 1)
-print("")
-print("写出 %s" % (TR / "dataset_v1.json"))
-print("  事件 %d   正例 %d / 负例 %d   视频 %d"
-      % (len(rows), npos, len(rows) - npos, len(vhash)))
+def from_history():
+    """读 cache/history 的标注池：当前检测候选 × 人工 kept/deleted 标签。"""
+    sys.path.insert(0, str(ROOT))
+    from services import state
+    out, skipped = [], []
+    for r in state.load_history():
+        name = Path(r["video"]).name
+        if name in HOLDOUT:
+            skipped.append(name)
+            continue
+        lab = state.get_labels(r["video"])
+        hoop, fps = r.get("hoop"), r.get("video_fps")
+        if not hoop or not fps:
+            print(f"[SKIP] {name}: 缺 hoop/fps")
+            continue
+        for t in (lab.get("kept") or []):
+            out.append({"video": r["video"], "ts": float(t), "label": 1,
+                        "hoop": [int(x) for x in hoop], "fps": float(fps)})
+        for t in (lab.get("deleted") or []):
+            out.append({"video": r["video"], "ts": float(t), "label": 0,
+                        "hoop": [int(x) for x in hoop], "fps": float(fps)})
+    print(f"数据源标注池: {len(out)} 事件；留出 {len(skipped)} 场: "
+          f"{', '.join(sorted(skipped))}")
+    return out
+
+
+def reuse_event_ids(items):
+    """按 REUSE_TOL 把新事件对齐到旧 dataset 的 event_id（同分片特征可直接复用）。
+
+    返回 (reused, fresh, flips)；items 就地写入 event_id 或 None（表示需新抽特征）。
+    """
+    import bisect
+    for it in items:
+        it["event_id"] = None
+    if not OUT.exists():
+        return 0, len(items), []
+    idx = {}
+    for r in json.loads(OUT.read_text(encoding="utf-8")):
+        idx.setdefault(r["video"], []).append((float(r["ts"]), r["event_id"], r["label"]))
+    for v in idx:
+        idx[v].sort()
+    reused, flips = 0, []
+    for it in items:
+        cand = idx.get(it["video"])
+        if not cand:
+            continue
+        pts = [c[0] for c in cand]
+        i = bisect.bisect_left(pts, it["ts"])
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(cand):
+                d = abs(cand[j][0] - it["ts"])
+                if d <= REUSE_TOL and (best is None or d < best[0]):
+                    best = (d, cand[j])
+        if best:
+            it["event_id"] = best[1][1]
+            if best[1][2] != it["label"]:
+                flips.append((best[1][1], best[1][2], it["label"]))
+            reused += 1
+    return reused, len(items) - reused, flips
+
+
+def to_rows(items):
+    rows = []
+    vhash = {}
+    for it in items:
+        v = it["video"]
+        if v not in vhash:
+            vhash[v] = hashlib.md5(v.encode("utf-8")).hexdigest()[:8]
+        eid = it.get("event_id") or "%s_%010d" % (
+            vhash[v], int(round(it["ts"] * it["fps"])))
+        rows.append({
+            "event_id": eid,
+            "video": v, "ts": round(it["ts"], 3), "clip_path": None,
+            "label": it["label"], "hoop": it["hoop"],
+            "video_fps": it["fps"],
+            "video_width": None, "video_height": None, "video_duration_sec": None,
+            "yolo_confirmed_history": None, "yolo_rejected_history": None,
+            "detect_time": None, "label_time": None, "label_source": "ui",
+        })
+    eids = [r["event_id"] for r in rows]
+    dup = len(eids) - len(set(eids))
+    if dup:
+        print(f"  event_id 重复 {dup} 个（同视频同帧）→ 后者丢弃")
+        seen, keep = set(), []
+        for r in rows:
+            if r["event_id"] in seen:
+                continue
+            seen.add(r["event_id"])
+            keep.append(r)
+        rows = keep
+    return rows, vhash
+
+
+def report_delta(rows):
+    if not OUT.exists():
+        return
+    old = json.loads(OUT.read_text(encoding="utf-8"))
+    o = {r["event_id"]: r for r in old}
+    n = {r["event_id"]: r for r in rows}
+    common, added, removed = set(o) & set(n), set(n) - set(o), set(o) - set(n)
+    print(f"\n相对现有 dataset_v1.json:")
+    print(f"  旧 {len(o)} → 新 {len(n)}   沿用 {len(common)}  新增 {len(added)}  移除 {len(removed)}")
+    lab_flip = [k for k in common if o[k]["label"] != n[k]["label"]]
+    ts_move = [k for k in common if abs(o[k]["ts"] - n[k]["ts"]) > 1e-6]
+    if lab_flip:
+        print(f"  标签变化 {len(lab_flip)} 个")
+    if ts_move:
+        print(f"  ts 微移 {len(ts_move)} 个（应为 0，event_id 含帧号）")
+    by_v = {}
+    for k in added:
+        by_v.setdefault(Path(n[k]["video"]).name, [0, 0])[0] += 1
+    for k in removed:
+        by_v.setdefault(Path(o[k]["video"]).name, [0, 0])[1] += 1
+    if by_v:
+        print(f"  {'视频':<26}{'新增':>6}{'移除':>6}")
+        for v in sorted(by_v):
+            print(f"  {v:<26}{by_v[v][0]:>6}{by_v[v][1]:>6}")
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="只报 delta，不写文件")
+    ap.add_argument("--from-blocks", action="store_true",
+                    help="用旧的 dataset_20260918/blocks_index.json（复现历史数字用）")
+    args = ap.parse_args()
+
+    items = from_blocks() if args.from_blocks else from_history()
+    if args.from_blocks:
+        rows, vhash = to_rows(items)
+    else:
+        reused, fresh, flips = reuse_event_ids(items)
+        rows, vhash = to_rows(items)
+        print(f"event_id 沿用 {reused} 个，需新抽特征 {fresh} 个")
+        if flips:
+            print(f"[注意] 沿用事件中有 {len(flips)} 个标签与旧记录不一致：{flips[:5]}")
+    npos = sum(1 for r in rows if r["label"] == 1)
+    print(f"→ 事件 {len(rows)}  正 {npos} / 负 {len(rows) - npos}  视频 {len(vhash)}")
+    report_delta(rows)
+
+    if args.dry_run:
+        print("\n（--dry-run：未写文件）")
+        return
+    OUT.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"\n已写出 {OUT}")
+
+
+if __name__ == "__main__":
+    main()
