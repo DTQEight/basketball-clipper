@@ -20,7 +20,7 @@
 
 #### 二、训练与标定（831 事件）
 
-数据取 `cache/history` 的 831 个已标注事件（21 视频 / 6 比赛日），按比赛日分组 5 折。单臂 OOF AUC：**A 0.803 · B 0.632 · Flow 0.859 · VM 0.821**。
+数据取 9 月备份的 831 个已标注事件（`dataset_20260918/blocks_index.json`，21 视频 / 6 比赛日），由 `training/build_dataset.py` 转成流水线要求的 `training/dataset_v1.json`，按比赛日分组 5 折。单臂 OOF AUC：**A 0.803 · B 0.632 · Flow 0.859 · VM 0.821**。
 
 集成权重与阈值由 `train_directions.py --deploy` 在 OOF 上标定，`keep_thr` 取「precision ≥ 0.95 的最大召回工作点」。
 
@@ -57,6 +57,21 @@ B 从最弱臂变成最强臂，集成权重随之从「A/B 半权」改为「B 
 - **评估过但未启用的备选规则**：分位保底（`分数 ≥ 0.72` 或 本场前 10%，并加分数下限 0.5）。五场 186 个候选上精度仍为 100%、召回 68.0% → 70.7%，但 `max(1, …)` 意味着**每场都强制自动通过至少 1 个**，在进球率低于 10% 或 0 进球的场次可能凭空产生错误 √，而这类样本目前一场都没有。故先攒数据再定。
 - **自动 √ 会改变导出范围**：导出规则是「有 √ 只导 √」，若不复核直接导出，只会导出自动通过的那些候选。
 - **批量模式未接入**：文件夹流水线（`_on_batch_load_video_impl`）不跑复核。
+
+#### 六、评估工具下沉到 `training/`
+
+上表所有结论都由下列脚本产出，但它们原先散落在 `cache/` —— 那是 gitignore 目录、且清理时容易被连带删除。现已下沉到 `training/` 并纳入版本管理，同时修掉了硬编码（绝对路径、写死的视频清单、写死的阈值）：
+
+| 脚本 | 用途 |
+|---|---|
+| `build_dataset.py` | 由 `dataset_20260918/blocks_index.json` 生成 `training/dataset_v1.json`（流水线入口） |
+| `eval_ai_vs_manual.py <视频>` | 单场逐候选对照「AI 自动 √」与人工标记，算精确率/召回率 |
+| `eval_thresholds.py <视频>` | 单场 AUC + 各阈值下自动通过的精确率/召回率扫描 |
+| `eval_quantile_rule.py` | 遍历全部已标注场次，评估「绝对阈值 OR 本场 top-k」分位保底规则 |
+| `eval_arm_ablation.py` | 砍臂/降权消融：真实视频（线上概率加权口径）+ OOF（rank 平均口径） |
+| `recalib_ensemble.py` | 换骨干后重定集成权重与阈值，结果需手工写回 `model_temporal_meta.json` |
+
+阈值统一从 `model_temporal_meta.json` 的 `ensemble.keep_thr` 读取，避免脚本里硬编码的值随标定漂移（`keep_thr` 已经改过两次：0.834 → 0.72 → 手改 0.75 → 0.72）。
 
 ### 2026.09.19 漏检根因修复 + RTX 50 系支持 + Windows 安装程序 + FRAME 线程解码
 

@@ -45,7 +45,7 @@
       "vm": 1.0
     },
     "keep_thr": 0.72,
-    "source": "B 臂骨干换成 SimCLR 域内自监督编码器（training/model_b_simclr.pt）后，在 831 事件 5 折 OOF 上重定权重与阈值（无对应 --deploy 流程，用 cache/_recalib_with_newb.py 一次性的：按 OOF AUC 择优 + precision>=0.95 最大召回工作点）。重跑 train_directions.py --deploy 会覆盖回旧口径",
+    "source": "B 臂骨干换成 SimCLR 域内自监督编码器（training/model_b_simclr.pt）后，在 831 事件 5 折 OOF 上重定权重与阈值（无对应 --deploy 流程，用 training/recalib_ensemble.py 重算：按 OOF AUC 择优 + precision>=0.95 最大召回工作点）。重跑 train_directions.py --deploy 会覆盖回旧口径",
     "reject_thr": 0.16,
     "oof_auc": 0.9527,
     "n_events": 831,
