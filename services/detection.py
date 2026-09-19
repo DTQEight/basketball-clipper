@@ -1866,6 +1866,47 @@ def _on_batch_load_video_impl(selected, progress_callback):
         state.kept_goal_indices = (_restored_kept if _has_marks
                                    else set(range(len(state.last_goal_clips))))
 
+        # ===== AI 复核：批量回看同样要补分数 / 按当前阈值重推 auto =====
+        # 批量识别本身走 run_detect，已在检测时就打过复核；但这条路是「重开
+        # 程序后从历史回看」：命中片段缓存的分是旧阈值算的，未命中缓存重新
+        # 生成的片段则一个分数都没有 → 流水线确认界面看不到任何 AI 徽标。
+        # 与单视频历史加载（_on_load_history_impl）保持同一口径。
+        _hoop = state.calib["hoop"]
+        if state.last_goal_clips and _hoop:
+            # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值
+            # 组合会给出错误判决，先作废再走重算分支
+            _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
+            if _n_stale:
+                log.info(f"[BATCH LOAD] AI 判定口径已变更"
+                         f"（ver={goal_verifier.model_fingerprint()}），"
+                         f"作废 {_n_stale} 个片段的旧分数")
+            _n_missing = sum(1 for c in state.last_goal_clips if "score" not in c)
+            if _n_missing:
+                _report(70, f'AI 复核（{_n_missing}/{len(state.last_goal_clips)} '
+                            f'个片段缺分数）...')
+                _t_verify = time.time()
+
+                def _verify_progress(frac, stage):
+                    _report(70 + 25 * min(max(frac, 0.0), 1.0), f'AI 复核 {stage}')
+
+                _n_auto = goal_verifier.mark_auto(
+                    state.last_goal_clips, video_path, _hoop,
+                    progress=_verify_progress)
+                log.info(f"[BATCH LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
+                         f"自动通过 {_n_auto}/{len(state.last_goal_clips)}"
+                         f"（耗时 {time.time() - _t_verify:.0f}s）")
+            else:
+                _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
+                log.info(f"[BATCH LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
+                         f"/{len(state.last_goal_clips)}"
+                         f"（阈值 {goal_verifier.auto_threshold():.3f}）")
+            # 分数随缓存落盘，下次回看不再重算
+            state.put_clip_cache(cache_key, state.last_goal_clips)
+            # 自动 √ 同步进 kept 索引 + 历史标签（人工标记优先，不被覆盖）
+            if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+                _k, _r = _sync_marks(video_path, state.last_goal_clips)
+                log.info(f"[BATCH LOAD] AI 自动 √ 已同步（√ {_k} · × {_r}）")
+
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
                   f"进球: {len(all_goals)} 个\n"
