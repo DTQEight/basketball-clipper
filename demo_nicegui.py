@@ -735,7 +735,8 @@ def main_page():
 
     # 当前结果卡片显示的视频：None=全局模式（单视频/批量最后结果）
     # 非空=批量快照模式（流水线：后台检测继续跑，前台确认该视频的快照结果）
-    _cards_video = {"path": None}
+    # path: 批量快照查看的视频；pending_only: 三段分诊的「只看待确认」开关
+    _cards_video = {"path": None, "pending_only": False}
     # 流水线集锦小锁在 services.state（跨页面连接共享），此处不再用页面局部 dict
 
     async def _on_batch_load_video(path=None):
@@ -1200,6 +1201,11 @@ def main_page():
                     'text-xs').style('color: var(--text-secondary)')
         person_dlg.open()
 
+    def _toggle_pending_only():
+        """三段分诊：只看中间带（无人工/模型标记的片段）。"""
+        _cards_video["pending_only"] = not _cards_video["pending_only"]
+        _refresh_result_cards()
+
     def _refresh_result_cards():
         """刷新结果卡片列表。
 
@@ -1231,6 +1237,11 @@ def main_page():
         n_keep = sum(1 for c in clips if c.get("mark") == "keep")
         n_reject = sum(1 for c in clips if c.get("mark") == "reject")
         n_pending = len(clips) - n_keep - n_reject
+        # 三段分诊：自动 √（高带）/ 自动 ×（低带）分别计数，人工只需看中间带
+        n_auto_keep = sum(1 for c in clips if c.get("mark") == "keep"
+                          and c.get("mark_source") == "auto")
+        n_auto_rej = sum(1 for c in clips if c.get("mark") == "reject"
+                         and c.get("mark_source") == "auto")
         person_counts = {}
         for c in clips:
             p = c.get("person")
@@ -1267,9 +1278,21 @@ def main_page():
                 ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                     'text-xs font-bold w-full pb-1').style('color: var(--accent)')
             with ui.row().classes('w-full items-center gap-2 px-1 pb-2 flex-wrap'):
-                ui.label(f'√ {n_keep}').classes('text-xs font-bold').style('color: #22c55e')
-                ui.label(f'× {n_reject}').classes('text-xs font-bold').style('color: var(--err)')
-                ui.label(f'待标 {n_pending}').classes('text-xs').style('color: var(--text-secondary)')
+                ui.label(f'√ {n_keep}' + (f'（AI {n_auto_keep}）' if n_auto_keep else '')
+                         ).classes('text-xs font-bold').style('color: #22c55e')
+                ui.label(f'× {n_reject}' + (f'（AI {n_auto_rej}）' if n_auto_rej else '')
+                         ).classes('text-xs font-bold').style('color: var(--err)')
+                ui.label(f'待确认 {n_pending}' if n_pending else '全部已判定').classes(
+                    'text-xs font-bold' if n_pending else 'text-xs').style(
+                    'color: #f59e0b' if n_pending else 'color: var(--text-secondary)')
+                _ponly = _cards_video["pending_only"]
+                ui.button('显示全部' if _ponly else '只看待确认',
+                          on_click=_toggle_pending_only).props(
+                    'ripple flat dense no-caps').classes(
+                    'text-[10px] rounded-full px-2 py-0').style(
+                    f'color: {"#f59e0b" if _ponly else "var(--text-secondary)"}; '
+                    f'border: 1px solid {"rgba(245, 158, 11, 0.6)" if _ponly else "var(--border-subtle)"}; '
+                    f'background: {"rgba(245, 158, 11, 0.12)" if _ponly else "transparent"}')
                 if person_counts:
                     for p, n in sorted(person_counts.items()):
                         _c = person_colors.get(p, _PERSON_PALETTE[0])
@@ -1277,7 +1300,12 @@ def main_page():
                             'text-xs font-bold rounded-full px-2 py-0.5').style(
                             f'color: {_c[0]}; background: {_c[1]}; border: 1px solid {_c[0]}')
                 ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
+        n_hidden = 0
         for i, clip in enumerate(clips):
+            # 三段分诊：只看待确认时隐藏已判定（人工或模型）的片段
+            if _cards_video["pending_only"] and clip.get("mark"):
+                n_hidden += 1
+                continue
             ts = clip["ts"]
             # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常量，
             # 旧实现两处各写一个 3，改一处必漏另一处）
@@ -1307,19 +1335,35 @@ def main_page():
                         _ai_score = clip.get("score")
                         if _ai_score is not None:
                             _ai_auto = bool(clip.get("auto"))
-                            ui.label(f'AI ✓ {_ai_score:.2f}' if _ai_auto
-                                     else f'AI {_ai_score:.2f}').classes(
+                            _ai_rej = bool(clip.get("auto_reject"))
+                            _thr_hi = goal_verifier.auto_threshold()
+                            _thr_lo = goal_verifier.reject_threshold()
+                            if _ai_auto:
+                                _badge, _bstyle, _btip = (
+                                    f'AI ✓ {_ai_score:.2f}',
+                                    'color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.5); '
+                                    'background: rgba(34, 197, 94, 0.12)',
+                                    f'四臂集成分 {clip.get("verify_score")} ≥ {_thr_hi:.2f}'
+                                    f' → 自动确认，人工可直接跳过')
+                            elif _ai_rej:
+                                _badge, _bstyle, _btip = (
+                                    f'AI × {_ai_score:.2f}',
+                                    'color: var(--err); '
+                                    'border: 1px solid rgba(239, 68, 68, 0.45); '
+                                    'background: rgba(239, 68, 68, 0.10)',
+                                    f'四臂集成分 {clip.get("verify_score")} < {_thr_lo:.2f}'
+                                    f' → 模型判为误报，人工可直接跳过')
+                            else:
+                                _badge, _bstyle, _btip = (
+                                    f'AI ? {_ai_score:.2f}',
+                                    'color: #f59e0b; '
+                                    'border: 1px solid rgba(245, 158, 11, 0.55); '
+                                    'background: rgba(245, 158, 11, 0.12)',
+                                    f'四臂集成分 {clip.get("verify_score")} 落在 '
+                                    f'{_thr_lo:.2f}–{_thr_hi:.2f} 之间 → 中间带，需人工确认')
+                            ui.label(_badge).classes(
                                 'text-[10px] px-2 py-0.5 rounded-full font-bold'
-                            ).style(
-                                'color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.5); '
-                                'background: rgba(34, 197, 94, 0.12)' if _ai_auto else
-                                'color: var(--text-secondary); '
-                                'border: 1px solid var(--border-subtle)'
-                            ).tooltip(
-                                f'四臂集成分 {clip.get("verify_score")}'
-                                f'（阈值 {goal_verifier.auto_threshold():.3f}）'
-                                + ('，达到阈值 → 可直接跳过人工确认' if _ai_auto
-                                   else '，低于阈值 → 模型判为误报，需人工确认'))
+                            ).style(_bstyle).tooltip(_btip)
                         person = clip.get("person")
                         _pc = person_colors.get(person) if person else None
                         ui.button((f'👤 {person}' if _pc else '👤 分类'),

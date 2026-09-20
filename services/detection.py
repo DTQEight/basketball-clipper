@@ -265,12 +265,14 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 # ============ 检测 ============
 
 def _sync_marks(video_path, clips):
-    """自动 √ 之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
+    """自动标记之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
 
     - kept_goal_indices：与 clip_action 同口径（有任何标记时只保留 √ 的索引；
       完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
     - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
       clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
+    - 负样本按来源分流：人工 × 进 deleted（训练集读它），模型 × 进 auto_rejected。
+      混在一起会形成"模型自己判×→自己学"的闭环（详见 state.py 的说明）
     返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
     """
     marks = [c.get("mark") for c in clips]
@@ -278,11 +280,16 @@ def _sync_marks(video_path, clips):
     n_reject = sum(1 for m in marks if m == "reject")
     state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
                                if (n_keep or n_reject) else set(range(len(clips))))
+    manual_rej = [c["ts"] for c in clips
+                  if c.get("mark") == "reject" and c.get("mark_source") == "manual"]
+    auto_rej = [c["ts"] for c in clips
+                if c.get("mark") == "reject" and c.get("mark_source") == "auto"]
     try:
         state.update_history_labels(
             video_path,
             kept_ts_list=[c["ts"] for c in clips if c.get("mark") == "keep"],
-            deleted_ts_list=[c["ts"] for c in clips if c.get("mark") == "reject"],
+            deleted_ts_list=manual_rej,
+            auto_rejected_ts_list=auto_rej,
         )
     except Exception as e:
         log.warning(f"[VERIFY] 自动标记落盘失败（不影响本次结果）: {e}")

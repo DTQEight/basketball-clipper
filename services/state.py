@@ -711,17 +711,23 @@ def _find_history_record(records, video_path):
     return None
 
 
-def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None):
+def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None,
+                          auto_rejected_ts_list=None):
     """对已有历史记录打/更新人工标签（加写锁防与 add_history 全量写竞态）。"""
     with _history_io_lock:
         return _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list,
-                                           person_map)
+                                           person_map, auto_rejected_ts_list)
 
 
-def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, person_map=None):
+def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, person_map=None,
+                               auto_rejected_ts_list=None):
     """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
 
     √ 确认 → kept_ts_list（正样本），× 误报 → deleted_ts_list（负样本）。
+    auto_rejected_ts_list：**模型**判为误报的低分片段，单独存 labels["auto_rejected"]，
+    刻意不混进 deleted——deleted 是人工负样本，训练集（build_dataset.py）直接读它，
+    把机器判断混进去会形成"模型自己判×→自己学"的闭环，且会让某个漏判的难例
+    被永久固化成负样本。
     person_map: {进球ts: 人物名} 增量合并进 labels["persons"]；值为 "" 清除该 ts
     的分类；None 表示本次不改人物分类。
     找不到对应记录时返回 False；写入磁盘成功返回 True。
@@ -742,6 +748,9 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
         labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
     if deleted_ts_list is not None:
         labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+    if auto_rejected_ts_list is not None:
+        labels["auto_rejected"] = sorted({round(float(t), 3)
+                                          for t in auto_rejected_ts_list})
     if person_map is not None:
         # JSON 对象键只能是字符串：存 str(round(ts,3))，读取方（get_labels）转回 float
         persons = {str(k): v for k, v in (labels.get("persons") or {}).items()
@@ -798,6 +807,7 @@ def get_labels(video_path):
             continue
     return {"kept": list(lab["kept"]) if "kept" in lab else None,
             "deleted": list(lab["deleted"]) if "deleted" in lab else None,
+            "auto_rejected": list(lab["auto_rejected"]) if "auto_rejected" in lab else None,
             "label_time": lab.get("label_time"),
             "persons": persons}
 
@@ -1000,7 +1010,7 @@ def clip_cache_key(video_path: str, goals) -> tuple:
 
 # AI 复核分数随片段缓存一起落盘：否则服务重启后历史回读只剩 ts/path/idx，
 # 卡片上的「AI 自动通过」徽标整批消失（分数要重跑几分钟复核才有）
-_AI_CACHE_KEYS = ("score", "auto", "verify_score", "verify_ver",
+_AI_CACHE_KEYS = ("score", "auto", "auto_reject", "verify_score", "verify_ver",
                   "score_lgbm", "score_b", "score_flow", "score_vm")
 
 

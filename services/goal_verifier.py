@@ -62,6 +62,11 @@ ENSEMBLE_META = TRAINING_DIR / "model_temporal_meta.json"
 
 # 兜底阈值/权重（仅在 ENSEMBLE_META 缺 ensemble 段时生效）
 AUTO_THR = 0.70
+# 自动 ×（低带）阈值：低于它模型判为误报，人工可直接跳过。
+# 三带分诊：≥AUTO_THR 自动 √ / <REJECT_THR 自动 × / 中间带人工只看这一带。
+# 9 场 419 片段实测：0.15 时低带 160 个含 0 个真球（最低真球分 0.152），
+# 高带 131 个含 1 个误报，中间带 128 个（占 30%）。
+REJECT_THR = 0.15
 ENS_WEIGHTS = {"lgbm": 0.5, "b": 0.5, "flow": 1.0, "vm": 1.0}
 
 # A 臂单批候选数：A 臂逐帧 YOLO 很慢（约 6.5s/候选），分批只为刷 UI 进度
@@ -321,7 +326,7 @@ def _read_ensemble():
     刻意不加载任何模型：历史回读时要按当前阈值重推 auto 标记，不该为此付一次
     ResNet18/VideoMAE 的加载代价。
     """
-    global AUTO_THR, ENS_WEIGHTS, _ens_mtime
+    global AUTO_THR, REJECT_THR, ENS_WEIGHTS, _ens_mtime
     try:
         mtime = ENSEMBLE_META.stat().st_mtime
         if _ens_mtime != mtime:
@@ -329,15 +334,18 @@ def _read_ensemble():
                 encoding="utf-8")).get("ensemble", {})
             _ens_mtime = mtime
             AUTO_THR = float(ens.get("keep_thr", AUTO_THR))
+            REJECT_THR = float(ens.get("reject_thr", REJECT_THR))
             w = ens.get("weights")
             if isinstance(w, dict) and w:
                 ENS_WEIGHTS = {k: float(v) for k, v in w.items()}
-            _log.info("goal_verifier: 集成标定 keep_thr=%s 权重=%s（组合 %s）",
-                      AUTO_THR, ENS_WEIGHTS, ens.get("composition"))
+            _log.info("goal_verifier: 集成标定 keep_thr=%s reject_thr=%s 权重=%s"
+                      "（组合 %s）",
+                      AUTO_THR, REJECT_THR, ENS_WEIGHTS, ens.get("composition"))
         return AUTO_THR
     except Exception as e:
         _log.warning("goal_verifier: ensemble 段读取失败，用代码默认 "
-                     "keep_thr=%s 权重=%s: %s", AUTO_THR, ENS_WEIGHTS, e)
+                     "keep_thr=%s reject_thr=%s 权重=%s: %s",
+                     AUTO_THR, REJECT_THR, ENS_WEIGHTS, e)
         return AUTO_THR
 
 
@@ -346,6 +354,12 @@ def _read_ensemble():
 def auto_threshold() -> float:
     """当前自动通过阈值（读 ensemble.keep_thr，缺省用代码默认值）。"""
     return _read_ensemble()
+
+
+def reject_threshold() -> float:
+    """当前自动排除阈值（读 ensemble.reject_thr，缺省用代码默认值）。"""
+    _read_ensemble()
+    return REJECT_THR
 
 
 def model_fingerprint() -> str:
@@ -391,26 +405,38 @@ def invalidate_stale(clips) -> int:
 
 
 def refresh_auto(clips) -> int:
-    """按当前阈值从已有 score 重推 auto，并对达标片段自动打 √（不重跑模型）。
+    """按当前阈值从已有 score 重推三带判定，并对高/低带自动打标（不重跑模型）。
 
-    阈值可被手改（model_temporal_meta.json），片段缓存里的 auto 是旧阈值的
-    产物——历史回读不重推就会一直显示过时的徽标。
-    自动 √ 只写 mark_source != 'manual' 的片段：**人工标记永远优先，绝不覆盖**
-    （用户已判 × 的球不能因为模型给高分就被翻成 √）。
+    三带：
+      高带 score >= keep_thr   → mark=keep,  mark_source=auto（可直接跳过人工）
+      中间带 keep>s>=reject    → 清掉模型标记，**留给人工**（这是唯一要看的带）
+      低带 score <  reject_thr → mark=reject, mark_source=auto（模型判为误报）
+    自动标记只写 mark_source != 'manual' 的片段：**人工标记永远优先，绝不覆盖**
+    （用户已判 × 的球不能因为模型给高分就被翻成 √）。阈值可被手改
+    （model_temporal_meta.json），片段缓存里的标记是旧阈值的产物——历史回读不
+    重推就会一直显示过时的徽标；阈值调高后原本 auto 的片段会落回中间带，
+    此时必须把模型标记清掉，否则会出现"没人看却已被判定"的片段。
     """
-    thr = auto_threshold()
+    keep_thr = auto_threshold()
+    rej_thr = reject_threshold()
     n = 0
     for c in clips:
         if "score" not in c:
             continue
-        c["verify_score"] = round(float(c["score"]), 3)
-        c["auto"] = bool(float(c["score"]) >= thr)
-        if not c["auto"]:
+        s = float(c["score"])
+        c["verify_score"] = round(s, 3)
+        c["auto"] = bool(s >= keep_thr)
+        c["auto_reject"] = bool(s < rej_thr)
+        if c.get("mark_source") == "manual":
             continue
-        n += 1
-        if c.get("mark_source") != "manual":
-            c["mark"] = "keep"
-            c["mark_source"] = "auto"
+        if c["auto"]:
+            c["mark"], c["mark_source"] = "keep", "auto"
+            n += 1
+        elif c["auto_reject"]:
+            c["mark"], c["mark_source"] = "reject", "auto"
+        else:
+            c.pop("mark", None)
+            c.pop("mark_source", None)
     return n
 
 
