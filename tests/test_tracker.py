@@ -584,3 +584,48 @@ class TestEndToEndVideo:
             for idx, frame in r.iter_frames(batch=1):
                 det.feed(None, idx, r.fps, frame=frame)
         assert det.goals == []
+
+
+class TestMotionGateInvariant:
+    """条件跳过的门必须**严格宽松于**斑块门：斑块能找到 ⇒ 门必为真。
+
+    背景（2026.08.15-1st 的 7:35~10:32 空档）：旧门要求「超阈值像素 > 搜索区总
+    像素的 1%」（1080p 下约 715px），而斑块下限只有 30px —— 落在两者之间的真球
+    会「斑块触发了、YOLO 却从没在附近跑过」，被 _check_yolo_near_hoop 硬否决。
+    """
+
+    @pytest.mark.parametrize('cy,radius', [
+        (40, 6), (100, 6), (140, 6),      # 常规球
+        (95, 5), (105, 5),                # 小球：超阈值像素远不到搜索区 1%
+        (100, 12),                        # 大球
+    ])
+    def test_gate_true_whenever_blob_found(self, cy, radius):
+        det = _detector()
+        frame = _frame_with_ball(cy, radius=radius)
+        roi = det.compute_roi(frame)
+        assert det._find_moving_blob(roi) is not None, '用例前提：这个球斑块能找到'
+        assert det.has_motion_near_hoop(frame, frame_roi=roi) is True
+
+    def test_small_blob_below_one_percent_still_gates(self):
+        """小球在旧口径（超阈值像素占比 > 1%）下会被判「无运动」→ 现在必须为真。"""
+        det = _detector()
+        frame = _frame_with_ball(100, radius=5)
+        roi = det.compute_roi(frame)
+        diff = cv2.absdiff(roi, det.baseline_gray)
+        _, diff_bin = cv2.threshold(diff, det.diff_threshold, 255, cv2.THRESH_BINARY)
+        ratio = cv2.countNonZero(diff_bin) / diff_bin.size
+        assert ratio < 0.01, '前提：该球像素占比应远小于 1%%，实际 %.5f' % ratio
+        assert det.has_motion_near_hoop(frame, frame_roi=roi) is True
+        assert det._find_moving_blob(roi) is not None
+
+    def test_gate_false_on_still_frame(self):
+        """全程静止时门仍为假 —— 省 YOLO 的作用保留，不是永远放行。"""
+        det = _detector()
+        assert det.has_motion_near_hoop(_base_frame()) is False
+
+    def test_gate_true_when_baseline_missing(self):
+        """基准未设时保守放行（不跳过）。"""
+        det = GoalDetector(hoop_box=HOOP, loose_mode=True, yolo_confirm=False,
+                           diff_threshold=25, min_blob_area=20, search_margin=60,
+                           rolling_baseline_sec=0, auto_threshold=False, fps=FPS)
+        assert det.has_motion_near_hoop(_base_frame()) is True
