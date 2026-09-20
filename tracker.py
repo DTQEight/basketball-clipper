@@ -431,6 +431,7 @@ class GoalDetector:
             else:
                 # 预热期内不判定进球
                 return None
+
         # ====== 滚动基准帧更新（双触发：时间间隔 + 斑块持续） ======
         # 旧逻辑只在 blob is None 时更新，球员常驻篮筐附近时永不更新导致 diff 失效。
         # 新逻辑：① 不管有没有 blob 都检查触发条件；
