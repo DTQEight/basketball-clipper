@@ -288,6 +288,64 @@ def _ball_boxes_from_result(res):
     return boxes
 
 
+# ===== 裁剪推理：只推「筐接受框 + 外扩」，不推整帧 =====
+# 依据：ball_pos 的唯一用途是 _check_yolo_near_hoop，它只关心
+# GoalDetector.yolo_accept_box() 这个范围；整帧推理把区域外的远端误报也喂给
+# 模型（argmax 修复前它们会把筐边真球挤掉），且 1920×1080 letterbox 到 1280 后
+# 球只剩 ~13-20px。实测各场接受框 +20% 后约 500×580，按 imgsz 640 推（缩放 ~1.1）：
+#   · 单次推理像素量降到约 1/4（1280² → 640²）
+#   · 球在输入里约 22-33px，比整帧 1280 路径（13-20px）更大，小目标检出率不牺牲
+#   · 区域外的误报天然落在输入之外，是 argmax 修复之外的第二道保险
+YOLO_CROP_MARGIN = 0.2    # 接受框再外扩 20%；<=0 表示整帧推理（旧行为，仅供对照）
+YOLO_IMGSZ_CROP = 640     # 裁剪推理的输入尺寸（缩放 ~1.1，球 ~22-33px）
+YOLO_IMGSZ_FULL = 1280    # 整帧推理的输入尺寸
+
+
+def _yolo_input_box(accept_box, frame_shape, margin=None):
+    """YOLO 裁剪推理的输入框 (x1, y1, x2, y2)，整帧坐标；关闭/退化时返回 None。
+
+    **必须 ⊇ 接受框**（不然球可能落在输入之外 → 静默漏球），所以由接受框外扩
+    margin 得到，并 clamp 到画面内。
+
+    margin 默认 None = 取模块常量 YOLO_CROP_MARGIN。**不要写成默认参数值**：
+    Python 默认参数在函数定义时求值，运行时改常量对已绑定的默认值无效
+    （对照实验切换开关时会静默失效）。
+    """
+    m = YOLO_CROP_MARGIN if margin is None else float(margin)
+    if not m or m <= 0:
+        return None
+    x_lo, y_lo, x_hi, y_hi = (float(v) for v in accept_box)
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return None
+    mx = (x_hi - x_lo) * m
+    my = (y_hi - y_lo) * m
+    H, W = int(frame_shape[0]), int(frame_shape[1])
+    x1 = max(0, int(x_lo - mx))
+    y1 = max(0, int(y_lo - my))
+    x2 = min(W, int(round(x_hi + mx)))
+    y2 = min(H, int(round(y_hi + my)))
+    if x2 - x1 < 32 or y2 - y1 < 32:
+        return None          # 退化框（标定异常）→ 回退整帧
+    return x1, y1, x2, y2
+
+
+def _yolo_input(frame, detector):
+    """返回 (待推理图, x 偏移, y 偏移, imgsz)。裁剪关闭时返回整帧。"""
+    box = _yolo_input_box(detector.yolo_accept_box(), frame.shape)
+    if box is None:
+        return frame, 0, 0, YOLO_IMGSZ_FULL
+    x1, y1, x2, y2 = box
+    return frame[y1:y2, x1:x2], x1, y1, YOLO_IMGSZ_CROP
+
+
+def _shift_balls_to_frame(balls, ox, oy):
+    """把裁剪坐标系下的球框映射回整帧坐标（ox/oy 均为 0 时原样返回）。"""
+    if not balls or (ox == 0 and oy == 0):
+        return balls
+    return [(cx + ox, cy + oy, x1 + ox, y1 + oy, x2 + ox, y2 + oy, c)
+            for (cx, cy, x1, y1, x2, y2, c) in balls]
+
+
 def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                min_blob_area=30, search_margin=80, progress_callback=None,
@@ -635,18 +693,20 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         # COCO 回退权重=[32] sports ball），不再硬编码 [0]
                         # device 用循环外缓存的 _device：运行中设备不会变化，
                         # 每次推理重新 import torch + is_available 属纯冗余（全程 ~2 万次）
-                        # imgsz 1280（原 960）：球在 1080p 里约 20-30px，缩放到
-                        # 960 后仅剩 12-17px，接近检测下限；实测有真实进球因
-                        # 球太小 + 篮下遮挡而完全漏检。1280 下球约 17-23px，
-                        # 小目标检出率明显改善，代价是单次推理变慢（条件跳过
-                        # 已省掉 ~87% 的推理，总耗时增量有限）。
-                        res = model.predict(frame, conf=float(ball_conf), imgsz=1280,
+                        # 输入范围与 imgsz：见上方「裁剪推理」段——只推筐接受框（约
+                        # 430×500）并推 512，球保持 ~20-31px（整帧 1280 时只有
+                        # ~13-20px，历史上正是因为球太小而从 960 提到 1280）。
+                        _crop, _ox, _oy, _imgsz = _yolo_input(frame, detector)
+                        res = model.predict(_crop, conf=float(ball_conf), imgsz=_imgsz,
                                             classes=_ball_classes,
                                             device=_device, verbose=False)[0]
                         if res.boxes is not None and len(res.boxes) > 0:
                             # 保留全部球框（见 _ball_boxes_from_result 的说明）；
-                            # 第一个（最高分）仍是主球，供跳帧复用等读取方使用
-                            ball_pos = _ball_boxes_from_result(res) or None
+                            # 第一个（最高分）仍是主球，供跳帧复用等读取方使用。
+                            # 裁剪推理的框要平移回整帧坐标，_check_yolo_near_hoop
+                            # 的接受框是整帧坐标。
+                            ball_pos = _shift_balls_to_frame(
+                                _ball_boxes_from_result(res), _ox, _oy) or None
                         _last_ball = (fidx, ball_pos)
                     except Exception as e:
                         # 不能静默吞掉：CUDA 失效（如升级显卡驱动后未重启服务）会

@@ -640,18 +640,27 @@ class GoalDetector:
         """
         if not self.yolo_confirm:
             return True, "skipped"
-        margin_x = self.hoop_w * 1.5
-        margin_y_up = self.hoop_h * 1.0
-        margin_y_down = self.hoop_h * 2.0
-        x_lo = self.hoop_x1 - margin_x
-        x_hi = self.hoop_x2 + margin_x
-        y_lo = self.hoop_y1 - margin_y_up
-        y_hi = self.hoop_y2 + margin_y_down
+        x_lo, y_lo, x_hi, y_hi = self.yolo_accept_box()
         has_ball = any(
             x_lo <= bx <= x_hi and y_lo <= by <= y_hi
             for (_, bx, by) in self.ball_pos_history
         )
         return has_ball, "confirmed" if has_ball else "rejected"
+
+    def yolo_accept_box(self):
+        """YOLO 证据的接受框 (x_lo, y_lo, x_hi, y_hi)，整帧坐标。
+
+        横向 ±1.5×hoop_w、上 1.0×hoop_h、下 2.0×hoop_h（向下额外放宽的理由
+        见 _check_yolo_near_hoop 的 docstring）。
+
+        **与检测端共用同一份几何**：services/detection._yolo_input_box 用它决定
+        「裁剪推理」的输入范围，输入范围必须 ⊇ 本框，否则会重现
+        「球在筐附近、却不在推理输入里」的静默漏检。
+        """
+        return (self.hoop_x1 - self.hoop_w * 1.5,
+                self.hoop_y1 - self.hoop_h * 1.0,
+                self.hoop_x2 + self.hoop_w * 1.5,
+                self.hoop_y2 + self.hoop_h * 2.0)
 
     # ============ 断点续识别：状态序列化 ============
 
