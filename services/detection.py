@@ -111,7 +111,11 @@ def preview_frame(frame_idx):
 
 
 def click_calibrate(x, y):
-    """点击标定篮筐。"""
+    """点击标定：2 个点为对角，框住**篮筐 + 篮网**（不是只框筐圈）。
+
+    框的语义贯穿三处：状态机的「上方 / 筐内 / 下方」以框边为准（球在框内
+    需停留 2~4 帧）、AI 三臂裁剪取 3.2 × 框高、YOLO 接受范围按框宽高外扩。
+    """
     if state.video_state["path"] is None:
         return None, "请先加载视频"
     frame_idx = state.video_state["current_frame"]
@@ -129,7 +133,7 @@ def click_calibrate(x, y):
         if frame is not None:
             state.calib["baseline_frame"] = frame  # read_frame 返回全新数组，无需 copy
             state.calib["baseline_idx"] = int(frame_idx)
-        status = f"篮筐已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
+        status = f"篮筐+篮网已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
         state.calib["clicks"] = []
     if frame is None:
         return None, status
@@ -143,7 +147,7 @@ def reset_hoop():
     state.calib["hoop"] = None
     state.calib["baseline_frame"] = None
     state.calib["baseline_idx"] = -1
-    return "已重置，请重新点击 2 个点标定篮筐"
+    return "已重置，请重新点击 2 个点框住篮筐+篮网"
 
 
 # ============ 预览片段生成 ============
@@ -317,7 +321,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         return "❌ 请先加载视频", False
     if state.calib["hoop"] is None:
         _release_lock()
-        return "❌ 请先点击画面标定篮筐", False
+        return "❌ 请先点击画面框住篮筐+篮网（2 个点）", False
     if state.calib["baseline_frame"] is None:
         _release_lock()
         return "❌ 基准帧差法需要基准帧，请重新标定", False
@@ -1963,7 +1967,7 @@ def _on_batch_load_video_impl(selected, progress_callback):
     else:
         # 未检测过：函数入口已统一清空 state，这里只写状态文本，无需再清
         status = (f"已加载: {os.path.basename(video_path)}\n"
-                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
+                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点框住篮筐+篮网'}")
     return preview, info_str, status
 
 
@@ -2016,7 +2020,7 @@ def on_batch_save_calib():
     if state.batch_current_video is None:
         return "请先从列表选择视频"
     if state.calib["hoop"] is None or state.calib["baseline_frame"] is None:
-        return "请先标定篮筐"
+        return "请先标定篮筐+篮网"
     state.batch_calibs[state.batch_current_video] = {
         "hoop": state.calib["hoop"],
         "baseline_idx": state.calib["baseline_idx"],

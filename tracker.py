@@ -42,7 +42,8 @@ class GoalDetector:
                  auto_threshold=True,
                  fps=30.0):
         """
-        hoop_box: (x1, y1, x2, y2) 篮筐框
+        hoop_box: (x1, y1, x2, y2) 篮筐+篮网框（标定时框住筐与网；
+                  「上方 / 筐内 / 下方」都以这个框的边界为准）
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
         diff_threshold: 帧差二值化阈值（15 高灵敏度，可提到 25 降误报）
         min_blob_area: 最小连通域面积（过滤噪声）

@@ -2,7 +2,7 @@
 
 功能：
   1. 输入视频文件路径 → 加载
-  2. 滑动到含篮筐的帧，点击画面 2 个点标定篮筐
+  2. 滑动到含篮筐的帧，点击画面 2 个点框住篮筐 + 篮网（标定）
   3. 设置起止帧、置信度、最小进球间隔
   4. 点击「开始检测」→ diff + YOLO 双确认检测进球
   5. 每个进球生成独立预览片段，人工确认保留/删除
@@ -717,7 +717,7 @@ def main_page():
             # 加载失败也必须刷新卡片（state 已在 load_video 里清空，UI 要同步显示空列表）
             _refresh_result_cards()
         info_text.set_text(info)
-        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点标定篮筐' if frame is not None else info)
+        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点框住篮筐+篮网' if frame is not None else info)
         # 更新断点续识别提示
         if frame is not None and state.video_state["path"]:
             _cp = state.load_checkpoint(state.video_state["path"])
@@ -1246,7 +1246,7 @@ def main_page():
                     ui.label('该视频暂无片段').classes('text-gray-400 text-xs text-center w-full')
                 else:
                     ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
-                    ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
+                    ui.label('请先加载视频 → 框住篮筐+篮网 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
             export_row.classes(add='hidden')  # 无结果时隐藏导出按钮
             _set_func_collapsed(False)  # 列表为空时展开功能区
             return
