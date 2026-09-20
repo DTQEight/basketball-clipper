@@ -152,6 +152,50 @@ def reset_hoop():
 
 # ============ 预览片段生成 ============
 
+# ===== 预览切片的打点开关（诊断用，默认关）=====
+# 背景：预览片段的每片段成本约 6~9s（与视频长短无关），但不知道钱花在哪——
+# 等 NVENC 会话配额？读网络盘源？1080p 解码？480p 编码？
+# PREVIEW_PROFILE=True  → 逐片段打印明细（等锁/ffmpeg/回退）
+# PREVIEW_PROBE_N>0    → 对前 N 个片段额外跑一次「只读源+解码、不编码」探针，
+#                        用「ffmpeg 墙钟 − 探针」近似拆出编码占比（每个探针多花约 1s）
+# 无论开关如何，每场都会在日志里留一行汇总（等锁/ffmpeg 的中位与最大、回退次数）。
+PREVIEW_PROFILE = False
+PREVIEW_PROBE_N = 0
+
+
+def _preview_timing_summary(records):
+    """把逐片段打点汇总成一行摘要（纯函数，便于单测）。
+
+    records: [{"wait": 等锁秒, "wall": ffmpeg 墙钟秒, "probe": 只读+解码秒|None,
+               "fallback": bool}, ...]
+    """
+    if not records:
+        return '预览打点: 无片段'
+    def _med(vals):
+        s = sorted(v for v in vals if v is not None)
+        return s[len(s) // 2] if s else float('nan')
+    wall = [r.get('wall') for r in records]
+    wait = [r.get('wait') or 0.0 for r in records]
+    probe = [r.get('probe') for r in records if r.get('probe') is not None]
+    n_fb = sum(1 for r in records if r.get('fallback'))
+    tot_wall = sum(v for v in wall if v)
+    tot_wait = sum(wait)
+    parts = ['预览打点: %d 片段 | ffmpeg 合计 %.1fs | 等锁合计 %.1fs（%.0f%%）'
+             % (len(records), tot_wall, tot_wait,
+                100 * tot_wait / max(tot_wall + tot_wait, 1e-9))]
+    parts.append('等锁 中位/最大 %.2f/%.2fs' % (_med(wait), max(wait) if wait else 0.0))
+    if any(v for v in wall):
+        parts.append('ffmpeg 中位/最大 %.2f/%.2fs'
+                     % (_med(wall), max(v for v in wall if v)))
+    if probe:
+        mp, mw = _med(probe), _med(wall)
+        parts.append('探针(只读+解码) 中位 %.2fs → 编码约占 %.0f%%'
+                     % (mp, 100 * max(0.0, mw - mp) / max(mw, 1e-9)))
+    if n_fb:
+        parts.append('NVENC 回退 %d 次' % n_fb)
+    return ' | '.join(parts)
+
+
 def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                             progress_callback=None, cancel_check=None):
     """为进球时间戳列表生成预览片段（480p 低分辨率，用于 UI 内预览）。
@@ -181,6 +225,8 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     clip_half = int(fps * PREVIEW_CLIP_HALF_SEC)
     # 软编回退参数：NVENC 运行时失败（驱动/会话配额）时单段重切用
     _enc_x264 = None if not _is_nvenc else build_encode_args(ff, quality="preview", use_nvenc=False)
+    # 打点记录（多线程 append，CPython 下 list.append 原子，无需加锁）
+    _preview_recs = []
 
     def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
         return [ff, "-y", "-loglevel", "error",
@@ -189,21 +235,46 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                 "-vf", "scale=-2:480"] + enc_args + \
                ["-movflags", "+faststart", clip_path]
 
+    def _probe_decode(seg_start_sec, seg_dur_sec):
+        """只读源 + 解码 + 缩放、不编码（输出丢到 null），返回墙钟秒。
+
+        与真实切片走同样的 -ss/-i/-vf，只把「编码+写盘」换成 null muxer，
+        因此「切片墙钟 − 探针」近似就是编码+写盘那段。
+        """
+        cmd = [ff, "-loglevel", "error",
+               "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
+               "-t", f"{seg_dur_sec:.3f}",
+               "-vf", "scale=-2:480", "-f", "null", "-"]
+        _t = time.time()
+        _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
+                text=True, timeout=60)
+        return time.time() - _t
+
     def _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args):
-        """跑一次 ffmpeg 切片。失败抛异常（含 stderr 尾部）。"""
-        # NVENC 会话配额（消费卡限 2 路）：与集锦 cut_clips 共用信号量排队
+        """跑一次 ffmpeg 切片。失败抛异常（含 stderr 尾部）。
+
+        返回 (等锁秒, ffmpeg 墙钟秒)。等锁 = NVENC 信号量排队时间（软编恒为 0）
+        ——信号量把整条 ffmpeg（含读源/解码）都圈在里面，所以等锁与执行互斥。
+        """
+        cmd = _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args)
+        wait = 0.0
         if "h264_nvenc" in enc_args:
+            _t0 = time.time()
             with state.nvenc_semaphore:
-                _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
-                             creationflags=state.SBOX, capture_output=True,
+                wait = time.time() - _t0
+                _t1 = time.time()
+                _r = _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                              text=True, timeout=60)
+                wall = time.time() - _t1
         else:
-            _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
-                         creationflags=state.SBOX, capture_output=True,
+            _t1 = time.time()
+            _r = _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                          text=True, timeout=60)
+            wall = time.time() - _t1
         if _r.returncode != 0:
             tail = (_r.stderr or "")[-1500:].strip()
             raise RuntimeError(f"ffmpeg exit {_r.returncode}: {tail}")
+        return wait, wall
 
     def _cut_one(gi, gts):
         """切单个片段，成功返回 clip dict，失败/取消返回 None（异常不外抛）。
@@ -222,27 +293,49 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
         seg_start_sec = seg_start / fps
         seg_dur_sec = (seg_end - seg_start) / fps
         enc_args = _enc
-        for _attempt in range(2):  # 第 2 次 = NVENC 失败后软编重试
-            try:
-                _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args)
-                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                    return {"ts": gts, "path": clip_path, "idx": gi}
-                log.warning(f"[WARN] 预览片段生成空文件 ({gts:.1f}s)，跳过")
-                return None
-            except Exception as e:
-                if _attempt == 0 and _enc_x264 is not None:
-                    log.warning(f"[WARN] 预览片段 NVENC 失败 ({gts:.1f}s)，回退软编重切: {e}")
-                    enc_args = _enc_x264
-                    continue
-                log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
-                # 清理失败残留的半截文件（旧实现留着 0 字节文件占目录）
+        # 打点：wait/wall 为两次尝试（含回退）的累计值
+        rec = {"gi": gi, "ts": gts, "wait": 0.0, "wall": 0.0,
+               "probe": None, "fallback": False, "ok": False}
+        try:
+            for _attempt in range(2):  # 第 2 次 = NVENC 失败后软编重试
                 try:
-                    if os.path.exists(clip_path):
-                        os.remove(clip_path)
-                except OSError:
-                    pass
-                return None
-        return None
+                    _wait, _wall = _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args)
+                    rec["wait"] += _wait
+                    rec["wall"] += _wall
+                    if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                        if PREVIEW_PROBE_N > 0 and gi < PREVIEW_PROBE_N:
+                            try:
+                                rec["probe"] = _probe_decode(seg_start_sec, seg_dur_sec)
+                            except Exception as _pe:
+                                log.warning(f"[WARN] 预览打点探针失败 ({gts:.1f}s): {_pe}")
+                        rec["ok"] = True
+                        return {"ts": gts, "path": clip_path, "idx": gi}
+                    log.warning(f"[WARN] 预览片段生成空文件 ({gts:.1f}s)，跳过")
+                    return None
+                except Exception as e:
+                    if _attempt == 0 and _enc_x264 is not None:
+                        log.warning(f"[WARN] 预览片段 NVENC 失败 ({gts:.1f}s)，回退软编重切: {e}")
+                        rec["fallback"] = True
+                        enc_args = _enc_x264
+                        continue
+                    log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
+                    # 清理失败残留的半截文件（旧实现留着 0 字节文件占目录）
+                    try:
+                        if os.path.exists(clip_path):
+                            os.remove(clip_path)
+                    except OSError:
+                        pass
+                    return None
+            return None
+        finally:
+            # 取消/空文件/失败也留档——这些才是「为什么慢」的高价值样本
+            _preview_recs.append(rec)
+            if PREVIEW_PROFILE:
+                log.info('[打点] 片段 %d ts=%.1fs 等锁 %.2fs ffmpeg %.2fs%s%s%s'
+                         % (gi, gts, rec['wait'], rec['wall'],
+                            '' if rec['probe'] is None else ' 探针 %.2fs' % rec['probe'],
+                            ' 回退' if rec['fallback'] else '',
+                            '' if rec['ok'] else ' 失败'))
 
     clips = []
     _done = 0
@@ -263,6 +356,8 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                                   f'生成片段 {_done}/{len(goals)} | 预计剩余 {_eta_sec:.0f}s')
     # as_completed 完成顺序乱，按进球序恢复，保证卡片时间戳顺序稳定
     clips.sort(key=lambda c: c["idx"])
+    # 每场固定留一行打点（含失败/回退片段），用于定性「钱花在等锁/IO/解码/编码哪一段」
+    log.info(_preview_timing_summary(sorted(_preview_recs, key=lambda r: r["gi"])))
     return clips
 
 
@@ -890,6 +985,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         goals = sorted(detector.goals)
 
+        # 分桶计时：_t1 之后的三段成本必须分开记。旧口径把「切片 + AI 复核 +
+        # 收尾」合并成一个 preview 桶，导致 4~6 分钟的复核被读成「切片慢」
+        # （08.31-2nd: preview 5.2 min 里 4.6 min 是复核、切片只占 0.6 min）
+        _t_slice_done = _t1
+        _t_verify_done = _t1
+
         # ===== 预览片段生成（B7 取消语义）=====
         # 主循环被取消（_cancelled_in_loop）时不再花数分钟生成预览片段——
         # 生成完也会在下方取消分支被全部删除，纯属浪费，直接走取消收尾。
@@ -909,6 +1010,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                         fps, total, _stamp, progress_callback=_report,
                                         cancel_check=state.cancel_event.is_set)
             )
+            _t_slice_done = time.time()
 
             # ===== AI 复核：四臂集成判分，高分候选自动标记「自动通过」=====
             # 只加 clip["auto"] / clip["verify_score"]（及各臂分），不删除任何候选，
@@ -937,6 +1039,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 else:
                     log.info(f"[VERIFY] 无自动通过候选（{goal_verifier.unavailable_reason()}，"
                              f"耗时 {_verify_sec:.0f}s）")
+            _t_verify_done = time.time()
         else:
             # 主循环被取消：不生成预览，列表保持为空（下方取消分支清空并保存断点）
             state.last_goal_clips.clear()
@@ -1008,7 +1111,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _t2 = time.time()
         # 全程口径：断点续跑时叠加断点前累计耗时，与从头跑同字段可比（L2）
         _total_elapsed = _prev_elapsed + (_t2 - t0)
-        _preview_elapsed = _t2 - _t1
+        _preview_elapsed = _t_slice_done - _t1            # 仅切片
+        _verify_elapsed = _t_verify_done - _t_slice_done  # 仅 AI 复核（四臂）
+        _tail_elapsed = _t2 - _t_verify_done              # 缓存落盘/断点清理/统计
         _detect_total = _prev_elapsed + _detect_elapsed
         _proc_fps = (_done_before + processed) / max(_detect_total, 0.001)
         _end_str = time.strftime('%H:%M:%S', time.localtime(_t2))
@@ -1017,7 +1122,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         log.info("")
         log.info("=" * 68)
         log.info(f"[DETECT  END] {_end_str}")
-        log.info(f"  Timing      : detect {_detect_total/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
+        log.info(f"  Timing      : detect {_detect_total/60:.1f} min + preview {_preview_elapsed/60:.1f} min + verify {_verify_elapsed/60:.1f} min + tail {_tail_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
         log.info(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_total/60:.1f} min = {video_dur_min/max(_detect_total/60,0.001):.2f}x vs realtime)")
         log.info(f"  Goals       : {len(goals)} detected")
         if goals:
