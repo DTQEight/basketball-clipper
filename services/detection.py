@@ -287,21 +287,17 @@ def _split_marks_by_source(clips):
     return _ts("keep", False), _ts("reject", False), _ts("keep", True), _ts("reject", True)
 
 
-def _sync_marks(video_path, clips):
-    """自动标记之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
+def _persist_marks(video_path, clips):
+    """把 clips 上的标记**按来源**落盘。
 
-    - kept_goal_indices：与 clip_action 同口径（有任何标记时只保留 √ 的索引；
-      完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
-    - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
-      clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
-    - 正负样本都按来源分流（见 _split_marks_by_source）
-    返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
+    人工 √/× → kept/deleted（训练集读它）；模型 √/× → auto_kept/auto_rejected。
+    落盘口径的唯一出口：任何"把 clips 上的 mark 写回历史"的地方都走这里——少一处
+    就会相互撤销（人工点一次卡片把模型的判断洗成人工标签，或把模型判的 × 混进
+    deleted 形成负样本闭环）。
+
+    kept 索引由调用方按各自语义同步（clip_action 只取 √；_sync_marks 在"完全无标记"
+    时要保持全选，语义不同）。不抛异常——标记是增强功能，写盘失败只记日志。
     """
-    marks = [c.get("mark") for c in clips]
-    n_keep = sum(1 for m in marks if m == "keep")
-    n_reject = sum(1 for m in marks if m == "reject")
-    state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
-                               if (n_keep or n_reject) else set(range(len(clips))))
     manual_keep, manual_rej, auto_keep, auto_rej = _split_marks_by_source(clips)
     try:
         state.update_history_labels(
@@ -312,7 +308,25 @@ def _sync_marks(video_path, clips):
             auto_rejected_ts_list=auto_rej,
         )
     except Exception as e:
-        log.warning(f"[VERIFY] 自动标记落盘失败（不影响本次结果）: {e}")
+        log.warning(f"[MARKS] 标记落盘失败（不影响本次结果）: {e}")
+
+
+def _sync_marks(video_path, clips):
+    """自动标记之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
+
+    - kept_goal_indices：与 clip_action 同口径（有任何标记时只保留 √ 的索引；
+      完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
+    - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
+      clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
+    - 正负样本都按来源分流（见 _persist_marks）
+    返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
+    """
+    marks = [c.get("mark") for c in clips]
+    n_keep = sum(1 for m in marks if m == "keep")
+    n_reject = sum(1 for m in marks if m == "reject")
+    state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
+                               if (n_keep or n_reject) else set(range(len(clips))))
+    _persist_marks(video_path, clips)
     return n_keep, n_reject
 
 
@@ -1104,7 +1118,19 @@ def clip_action(action, idx, video_path=None, person=None):
     if idx < 0 or idx >= len(clips):
         return None, ""
     if action == "preview":
-        return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
+        clip = clips[idx]
+        _note = ""
+        # **点「预览」= 人工复核这个片段**：AI 已判的片段，看过之后没改 → 记为人工
+        # 确认（改了的话走 √/× 分支，本来也就是人工来源）。用户不必为了"记一笔"
+        # 多点一次，也不用重复点两下。仅在「AI 识别」开着时生效——那时卡片上才看得到
+        # AI 标记，预览才算"看了 AI 的判断"；关掉开关时标记不参与呈现，不该被顺带确认
+        if goal_verifier.is_enabled() and clip.get("mark") in ("keep", "reject") \
+                and clip.get("mark_source") == "auto":
+            clip["mark_source"] = "manual"
+            _persist_marks(video_path if video_path else state.video_state["path"], clips)
+            _sym = "√" if clip["mark"] == "keep" else "×"
+            _note = f" | 已记为人工复核（{_sym}）"
+        return clip["path"], f"▶ 正在预览第 {idx+1} 个片段{_note}"
     elif action == "export":
         return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
     elif action == "set_person":
@@ -1142,23 +1168,12 @@ def clip_action(action, idx, video_path=None, person=None):
         # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）
         kept.clear()
         kept.update(i for i, c in enumerate(clips) if c.get("mark") == "keep")
-        # 标签飞轮：**按来源分流**（与 _sync_marks 同一个出口）。这里以前把
-        # 「所有 keep / 所有 reject」整批写回，于是人工每点一次卡片就会撤销分流：
-        # 模型自动 √ 被洗成人工正样本，模型自动 × 被写进 deleted（负样本闭环）
-        manual_keep, manual_rej, auto_keep, auto_rej = _split_marks_by_source(clips)
-        try:
-            state.update_history_labels(
-                video_path if video_path else state.video_state["path"],
-                kept_ts_list=manual_keep,
-                deleted_ts_list=manual_rej,
-                auto_kept_ts_list=auto_keep,
-                auto_rejected_ts_list=auto_rej,
-            )
-        except Exception:
-            pass
+        # 标签飞轮：按来源分流落盘（与 _sync_marks 同一个出口，见 _persist_marks）
+        _persist_marks(video_path if video_path else state.video_state["path"], clips)
         sym = {"keep": "√ 确认", "reject": "× 误报"}.get(clip["mark"], "已取消标记")
-        n_keep = len(manual_keep) + len(auto_keep)
-        n_reject = len(manual_rej) + len(auto_rej)
+        # 提示里的计数含模型判定（人工只需知道"这一场现在有多少 √ / ×"）
+        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
+        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
         msg = (f"第 {idx+1} 个片段（{ts:.1f}s）{sym} | "
                f"√ {n_keep} · × {n_reject} · 待标 {len(clips) - n_keep - n_reject}")
         return None, msg

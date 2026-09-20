@@ -482,6 +482,53 @@ class TestHistory:
         assert labels["auto_rejected"] == [2.0]
         assert "√ 2 · × 1" in msg                # 提示里的计数仍含模型判定
 
+    def test_preview_marks_auto_marks_as_reviewed(self, state_mod, monkeypatch,
+                                                  tmp_path):
+        """用户口径：点「预览」就是人工复核。看过后没改 → 记为人工来源；
+        改了走 √/× 分支本来就是人工来源。不需任何额外点击。"""
+        from services import detection, goal_verifier
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0, 2.0, 3.0])
+        state_mod.video_state["path"] = vp
+        state_mod.kept_goal_indices = {0, 1}
+        state_mod.last_goal_clips = [
+            {"ts": 1.0, "path": "p1", "idx": 0, "mark": "keep",
+             "mark_source": "auto", "auto": True, "score": 0.9},
+            {"ts": 2.0, "path": "p2", "idx": 1, "mark": "reject",
+             "mark_source": "auto", "auto_reject": True, "score": 0.05},
+            {"ts": 3.0, "path": "p3", "idx": 2},                  # 未判定
+        ]
+        prev = goal_verifier.is_enabled()
+        try:
+            goal_verifier.set_enabled(True)
+            path, msg = detection.clip_action("preview", 0)
+            clips = state_mod.last_goal_clips
+            assert path == "p1"                                   # 预览照常返回
+            assert "已记为人工复核（√）" in msg
+            assert clips[0]["mark"] == "keep"                     # 标记值不变
+            assert clips[0]["mark_source"] == "manual"            # 只升级来源
+            assert state_mod.kept_goal_indices == {0, 1}          # 选择集不变
+            _, msg = detection.clip_action("preview", 1)          # AI × 同理
+            assert "已记为人工复核（×）" in msg
+            assert clips[1]["mark_source"] == "manual"
+            labels = state_mod.get_labels(vp)
+            assert labels["kept"] == [1.0] and labels["auto_kept"] == []
+            assert labels["deleted"] == [2.0] and labels["auto_rejected"] == []
+            # 未判定的片段：预览不产生任何标记
+            _, msg = detection.clip_action("preview", 2)
+            assert "已记为人工复核" not in msg
+            assert clips[2].get("mark") is None
+            # 「AI 识别」关掉时不顺带确认：那时卡片上看不到 AI 标记，
+            # 预览不算"看了 AI 的判断"
+            clips[0]["mark_source"] = "auto"
+            goal_verifier.set_enabled(False)
+            _, msg = detection.clip_action("preview", 0)
+            assert "已记为人工复核" not in msg
+            assert clips[0]["mark_source"] == "auto"
+        finally:
+            goal_verifier.set_enabled(prev)
+
     def test_fullgame_collects_sources_across_videos(self, state_mod, monkeypatch, tmp_path):
         """整场导出：跨视频收集同一人物片段，按文件名顺序传给剪辑器。"""
         from services import detection
