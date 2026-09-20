@@ -362,6 +362,24 @@ def reject_threshold() -> float:
     return REJECT_THR
 
 
+# ===== AI 复核总开关（UI「AI 识别」）=====
+# 关闭后不再跑四臂打分：检测更快、不产生任何 auto / auto_reject 标记，
+# 所有候选都留给人工判定。仅进程内生效，重启恢复默认开启（与其余 UI 开关一致）。
+_ENABLED = True
+
+
+def set_enabled(on: bool) -> None:
+    """设置是否启用 AI 复核（四臂集成）。"""
+    global _ENABLED
+    _ENABLED = bool(on)
+    _log.info("goal_verifier: AI 复核已%s", "开启" if _ENABLED else "关闭")
+
+
+def is_enabled() -> bool:
+    """当前是否启用 AI 复核。"""
+    return _ENABLED
+
+
 def model_fingerprint() -> str:
     """当前判定口径的指纹：B 模型文件 + 各权重 + 阈值。
 
@@ -721,7 +739,9 @@ def mark_auto(clips, video_path, hoop, progress=None):
     progress: 可选进度回调（见 score_clips）。
     **只标记，不删除候选**；任何异常都不抛出——打分是增强功能，失败必须静默降级。
     """
-    if not clips:
+    if not clips or not _ENABLED:
+        # 关闭「AI 识别」时兜底：调用方已判过开关，这里再判一次，
+        # 避免将来新增调用点漏判而白跑一遍四臂推理
         return 0
     try:
         n_scored = score_clips(video_path, clips, hoop, progress=progress)

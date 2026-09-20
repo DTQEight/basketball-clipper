@@ -799,7 +799,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             # 只加 clip["auto"] / clip["verify_score"]（及各臂分），不删除任何候选，
             # 召回不受影响（低分候选照常人工确认，灰区全部保留）。
             # 模型缺失/加载失败/推理异常时静默降级，不影响检测结果。
-            if state.last_goal_clips:
+            # UI 关闭「AI 识别」时整段跳过：候选不带任何分数与自动标记，
+            # 全部留给人工判定（同时省掉 A 臂逐帧 YOLO 的数分钟开销）。
+            if state.last_goal_clips and goal_verifier.is_enabled():
                 _report(85, 'AI 复核（四臂集成）...')
                 _t_verify = time.time()
 
@@ -1621,7 +1623,9 @@ def _on_load_history_impl(idx_choice, progress_callback):
     # 片段缓存历史上只存 ts/path/idx（旧条目连 score 都没有），历史回读若拿到
     # 无分片段，卡片就没有「AI 自动通过」徽标。这里就地补跑一次并回写缓存，
     # 补过之后分数随 put_clip_cache 落盘，后续重启/再读历史都不会再丢。
-    if state.last_goal_clips and hoop:
+    # UI 关闭「AI 识别」时整段跳过：不补跑、不重推阈值、不自动打标记，
+    # 卡片上的 AI 标记只在重新开启后由缓存分数即时重推（缓存与历史标签都不动）。
+    if state.last_goal_clips and hoop and goal_verifier.is_enabled():
         # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值组合会给出
         # 错误判决，先作废再走重算分支
         _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
@@ -1878,8 +1882,9 @@ def _on_batch_load_video_impl(selected, progress_callback):
         # 程序后从历史回看」：命中片段缓存的分是旧阈值算的，未命中缓存重新
         # 生成的片段则一个分数都没有 → 流水线确认界面看不到任何 AI 徽标。
         # 与单视频历史加载（_on_load_history_impl）保持同一口径。
+        # UI 关闭「AI 识别」时整段跳过，理由同该处。
         _hoop = state.calib["hoop"]
-        if state.last_goal_clips and _hoop:
+        if state.last_goal_clips and _hoop and goal_verifier.is_enabled():
             # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值
             # 组合会给出错误判决，先作废再走重算分支
             _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)

@@ -354,6 +354,25 @@ def main_page():
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
+                                # AI 识别总开关：关闭后不跑四臂复核（检测更快），
+                                # 候选不带任何分数与自动标记，全部留人工判定。
+                                # value 取当前运行时状态：页面重连后与其他客户端一致。
+                                ai_verify_switch = ui.switch(
+                                    'AI 识别（四臂复核）',
+                                    value=goal_verifier.is_enabled()).classes('w-full')
+
+                                def _on_ai_toggle(e):
+                                    goal_verifier.set_enabled(bool(e.value))
+                                    if e.value:
+                                        _set_status('AI 识别已开启：候选将自动分诊（√ / 待确认 / ×）', 'ok')
+                                    else:
+                                        _set_status('AI 识别已关闭：只做规则检测，候选全部需人工判定', 'info')
+                                    # 卡片上的 AI 徽标与分诊计数随开关即时变化
+                                    _refresh_result_cards()
+                                ai_verify_switch.on_value_change(_on_ai_toggle)
+                                ui.label('关闭后不跑四臂打分，检测更快；'
+                                         '已有分数与历史标签保留，重开即时恢复').classes(
+                                    'text-gray-500 text-[10px] -mt-1 mb-1')
                                 yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=True).classes('w-full')
                                 ui.label('默认每3帧（推荐, 提速）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=True).classes('w-full')
@@ -1234,13 +1253,23 @@ def main_page():
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
         # 顶部统计行：√ / × / 待标 + 人物分类 + 导出说明
-        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
-        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
+        # AI 识别关闭时，模型自己打的分诊标记（mark_source == "auto"）一律按
+        # 「未判定」呈现：只改显示，不动缓存分数与历史标签，重开即时恢复。
+        _ai_on = goal_verifier.is_enabled()
+
+        def _eff_mark(c):
+            m = c.get("mark")
+            if not _ai_on and c.get("mark_source") == "auto":
+                return None
+            return m
+
+        n_keep = sum(1 for c in clips if _eff_mark(c) == "keep")
+        n_reject = sum(1 for c in clips if _eff_mark(c) == "reject")
         n_pending = len(clips) - n_keep - n_reject
         # 三段分诊：自动 √（高带）/ 自动 ×（低带）分别计数，人工只需看中间带
-        n_auto_keep = sum(1 for c in clips if c.get("mark") == "keep"
+        n_auto_keep = sum(1 for c in clips if _ai_on and c.get("mark") == "keep"
                           and c.get("mark_source") == "auto")
-        n_auto_rej = sum(1 for c in clips if c.get("mark") == "reject"
+        n_auto_rej = sum(1 for c in clips if _ai_on and c.get("mark") == "reject"
                          and c.get("mark_source") == "auto")
         person_counts = {}
         for c in clips:
@@ -1303,7 +1332,7 @@ def main_page():
         n_hidden = 0
         for i, clip in enumerate(clips):
             # 三段分诊：只看待确认时隐藏已判定（人工或模型）的片段
-            if _cards_video["pending_only"] and clip.get("mark"):
+            if _cards_video["pending_only"] and _eff_mark(clip):
                 n_hidden += 1
                 continue
             ts = clip["ts"]
@@ -1314,7 +1343,7 @@ def main_page():
             end_ts = ts + half
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
-            mark = clip.get("mark")
+            mark = _eff_mark(clip)
             # 卡片视觉状态：√ 绿框 / × 红框半透明
             card_style = 'margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'
             if mark == 'keep':
@@ -1333,7 +1362,8 @@ def main_page():
                         # 不能再用「mark is None」做门——标完之后正好是最需要复核
                         # 对照的时候，一标就全没了（用户实测反馈）。
                         _ai_score = clip.get("score")
-                        if _ai_score is not None:
+                        # AI 识别关闭时不显示徽标（分数仍在 clip 里，只是不参与呈现）
+                        if _ai_on and _ai_score is not None:
                             _ai_auto = bool(clip.get("auto"))
                             _ai_rej = bool(clip.get("auto_reject"))
                             _thr_hi = goal_verifier.auto_threshold()

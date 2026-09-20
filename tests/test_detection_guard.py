@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 import services.detection as detection
-from services import state
+from services import state, goal_verifier
 
 
 class _EmptyReader:
@@ -169,3 +169,40 @@ class TestExportSingleClipHq:
             assert "请先加载视频" in status
         finally:
             _restore_state(snap)
+
+
+class TestAiVerifySwitch:
+    """AI 识别总开关：关闭后四臂复核整段跳过（不产分数、不打自动标记）。
+
+    关闭是"不再跑"，不是"清掉已有结果"——缓存分数与历史标签都不动，
+    卡片上的 AI 徽标由 UI 在显示层屏蔽，重开即时恢复。
+    """
+
+    def test_mark_auto_noop_when_disabled(self):
+        clips = [{"ts": 10.0, "path": "p.mp4", "idx": 0}]
+        prev = goal_verifier.is_enabled()
+        try:
+            goal_verifier.set_enabled(False)
+            assert goal_verifier.is_enabled() is False
+            # 视频路径不存在：若真进了打分流程会去读视频，返回 0 且不落任何字段
+            assert goal_verifier.mark_auto(
+                clips, "C:/fake/none.mp4", [0, 0, 10, 10]) == 0
+            assert "score" not in clips[0]
+            assert "auto" not in clips[0]
+            assert "mark" not in clips[0]
+        finally:
+            goal_verifier.set_enabled(prev)
+
+    def test_disable_keeps_existing_scores_and_marks(self):
+        clips = [{"ts": 10.0, "score": 0.9, "verify_score": 0.9, "auto": True,
+                  "mark": "keep", "mark_source": "auto"}]
+        prev = goal_verifier.is_enabled()
+        try:
+            goal_verifier.set_enabled(False)
+            assert goal_verifier.mark_auto(
+                clips, "C:/fake/none.mp4", [0, 0, 10, 10]) == 0
+            assert clips[0]["score"] == 0.9
+            assert clips[0]["mark"] == "keep"
+            assert clips[0]["mark_source"] == "auto"
+        finally:
+            goal_verifier.set_enabled(prev)
