@@ -22,9 +22,6 @@ import base64
 
 # 自适应阈值预热时长（秒）：前 N 秒逐帧收集 diff P95 统计量
 WARMUP_TARGET_SEC = 30.0
-# 条件跳过 YOLO 的运动判定：运动像素占搜索区域总像素的最小比例
-# （球经过时通常 2000+ 像素，噪声/光线微变通常 <200 像素）
-MOTION_PIXEL_RATIO = 0.01
 
 
 class GoalDetector:
@@ -204,9 +201,19 @@ class GoalDetector:
 
     def has_motion_near_hoop(self, frame, threshold: int | None = None,
                              frame_roi=None) -> bool:
-        """快速检查篮筐搜索区域是否有运动像素（用于条件跳过 YOLO）。
+        """快速检查筐区有没有「值得 YOLO 看一眼」的运动（用于条件跳过 YOLO）。
 
-        只做裁剪 + absdiff + countNonZero，不做形态学/连通域，~1ms。
+        **不变量：本门必须严格宽松于 `_find_moving_blob`** —— 只要斑块检测器
+        可能产出候选，本门就必须为真。否则会出现「斑块触发了、YOLO 却从没在
+        附近跑过」→ `_check_yolo_near_hoop` 必然判否 → 真进球被硬否决。
+        旧实现要求「超阈值像素 > 搜索区总像素的 1%」（1080p 下约 715px），而斑块
+        下限只有 30px：落在两者之间的真球全部被静默丢掉（2026.08.15-1st 的
+        7:35~10:32 空档即由这一条 + 球框只留 argmax 共同造成）。
+
+        实现：与 `_find_moving_blob` 用**同一套二值化 + 同一套形态学**，只保留
+        面积下限，去掉宽度与圆形度过滤——那两道是「选球」用的，不该决定
+        「要不要跑 YOLO」。
+
         frame_roi: 调用方已用 compute_roi 算好的 ROI，传入可省一次重复计算。
         返回: True=有运动（需要 YOLO），False=无运动（可跳过 YOLO）
         """
@@ -218,9 +225,13 @@ class GoalDetector:
         diff = cv2.absdiff(frame_roi, self.baseline_gray)
         thr = threshold if threshold is not None else (self._auto_threshold_value or self.diff_threshold)
         _, diff_bin = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
-        # 运动像素超过搜索区域总像素的 MOTION_PIXEL_RATIO 才算有运动
-        _motion_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
-        return _motion_ratio > MOTION_PIXEL_RATIO
+        # 与 _find_moving_blob 完全相同的形态学（去噪 + 连接）：
+        # 只做 countNonZero 会把散点噪声算成"有运动"，做形态学才能对齐"连通域"语义。
+        # 代价 ~1ms/帧，换来"斑块能触发 ⇒ YOLO 必已跑过"这个可断言的不变量。
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN, self._morph_kernel)
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, self._morph_kernel)
+        contours, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return any(cv2.contourArea(c) >= self.min_blob_area for c in contours)
 
     def _find_moving_blob(self, frame_roi_gray):
         """在篮筐周边搜索区域 ROI 内找最大运动连通域。
@@ -419,7 +430,6 @@ class GoalDetector:
             else:
                 # 预热期内不判定进球
                 return None
-
         # ====== 滚动基准帧更新（双触发：时间间隔 + 斑块持续） ======
         # 旧逻辑只在 blob is None 时更新，球员常驻篮筐附近时永不更新导致 diff 失效。
         # 新逻辑：① 不管有没有 blob 都检查触发条件；
