@@ -146,14 +146,21 @@ def main():
     P["vm_lgbm"], _ = lgbm_oof(load_seq(VM_FEAT, events), y, games, folds)
     report_metrics(y, P["vm_lgbm"], "VM(LGBM 旧头)")
 
-    Xv = load_seq_variants(VM_FEAT_T, events)
-    P["vm_t"], _, _ = train_b_oof(Xv, y, games, folds, arch="pool", verbose=False)
-    report_metrics(y, P["vm_t"], "VM(时序头 新)")
+    if all((VM_FEAT_T / f"{e['event_id']}.npz").exists() for e in events):
+        Xv = load_seq_variants(VM_FEAT_T, events)
+        P["vm_t"], _, _ = train_b_oof(Xv, y, games, folds, arch="pool", verbose=False)
+        report_metrics(y, P["vm_t"], "VM(时序头 新)")
+    else:
+        print("\n[跳过] VM 时序头对比：缺 vm_feat_t（该实验已结案不部署，"
+              "故未抽该变体；见 training/exp_vm_head/）")
 
     # ===== 集成：现役口径下两种 VM 头 =====
     print(f"\n{'配置':<24}{'集成 AUC':>10}{'p95 th':>9}{'精度':>8}{'召回':>8}")
     ens = {}
-    for tag, vmkey in (("现役（VM=LGBM 旧头）", "vm_lgbm"), ("换成 VM 时序头", "vm_t")):
+    cfgs = [("现役（VM=LGBM 旧头）", "vm_lgbm")]
+    if "vm_t" in P:
+        cfgs.append(("换成 VM 时序头", "vm_t"))
+    for tag, vmkey in cfgs:
         s = (W["a"] * P.get("a", 0) + W["b"] * P["b"] + W["flow"] * P["flow"]
              + W["vm"] * P[vmkey]) / (sum(W.values()) if "a" in P else 3.0)
         ens[vmkey] = s

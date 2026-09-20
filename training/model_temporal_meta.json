@@ -36,67 +36,46 @@
     "recall": 0.3728
   },
   "ensemble": {
-    "calibrated_at": "2026-09-19 22:00:44",
-    "composition": "a_b2_f_vm",
+    "calibrated_at": "2026-09-20 14:02:11",
+    "composition": "a_b_f_vm2",
     "weights": {
       "lgbm": 0.5,
-      "b": 2.0,
+      "b": 1.0,
       "flow": 1.0,
-      "vm": 1.0
+      "vm": 0.5
     },
     "keep_thr": 0.68,
-    "source": "Flow 臂骨干换成光流域 SimCLR 自监督编码器（training/model_flow_simclr.pt，831 事件 × 15 张光流幅度图无标签预训练）后重标定。权重在 831 事件 OOF 上按 AUC 择优：现役配比仍在最优档（Top-12 落在 0.9687~0.9699，全在噪声内），且它在真实视频上明显优于 OOF 最优的 a.5 b1.5 f2 v.5（精度 0.988 vs 0.958），故权重不变、只重定阈值。阈值刻意**不取** OOF p95 工作点的 0.640——0.640 会在 6 场真实视频上放进 2 个误报（精度 0.976）；0.68 是实测精度 0.988 与召回的均衡点。复算脚本 training/recalib_ensemble.py（重跑 train_directions.py --deploy 会覆盖回旧口径）",
+    "source": "数据集从 870 扩到 1167 事件（放入 08.29 / 08.31 三节 / 09.01-3rd/-4th / 09.03-3rd，+34%）后四臂全部重训（A=LGBM 35 维 / B=SimCLR 时序 / Flow=光流域 SimCLR / VM=VideoMAE+LGBM），权重与阈值在新事件集 OOF 上重标定：training/recalib_ensemble.py --from-refresh（读 training/refresh_oof.jsonl）。网格 Top-1 配比 a0.5 b1.0 f1.0 v0.5 → AUC 0.9729；现役配比 a0.5 b2.0 f1.0 v1.0 在同一事件集上 AUC 0.9699。改权重的依据：Flow 单臂 (0.9361) 已略强于 B (0.9289)，配比里 Flow 不应低于 B，且旧配比 B 权重是 B 臂还弱时（SimCLR 换骨干前 OOF 0.63）定的。阈值未动：新权重下的 OOF p95 工作点恰为 0.681，与上一轮在真实视频上调出的 0.68 重合（这次 OOF 与实测双向支持同一个值）。",
     "reject_thr": 0.15,
-    "reject_thr_source": "三段分诊的低带阈值：低于它模型判为误报、人工可直接跳过。9 场 419 片段实测，0.15 时低带 160 个含 0 个真球（最低真球分 0.152），高带（≥keep_thr 0.68）127 个含 1 个误报，中间带 132 个（31%）是人工只需看的量。原值 0.16 会把这个 0.152 的真球划进低带。改此值不需要重算分数（只影响标记），refresh_auto 会按缓存分重推三带。",
-    "oof_auc": 0.964,
-    "n_events": 831,
+    "reject_thr_source": "三段分诊低带阈值（实测口径，本轮未改）：低于它模型判误报、人工可直接跳过。9 场 419 片段实测，0.15 时低带 160 个含 0 真球（最低真球分 0.152）。改此值不重算分数，refresh_auto 按缓存分重推三带。",
+    "oof_auc": 0.9729,
+    "n_events": 1167,
     "keep_wp": {
-      "threshold": 0.68,
-      "precision": 0.9496,
-      "recall": 0.7081
+      "threshold": 0.681,
+      "precision": 0.95,
+      "recall": 0.713
     },
-    "keep_wp_oof_p95_not_used": {
-      "threshold": 0.72,
+    "keep_wp_incumbent_weights": {
+      "threshold": 0.623,
       "precision": 0.952,
-      "recall": 0.569
-    },
-    "flow_backbone": "光流域 SimCLR 自监督 resnet18（training/model_flow_simclr.pt）",
-    "video_check": {
-      "note": "6 场真实录像 286 候选 / 98 真进球，逐候选人工标注；A 臂分数沿用缓存，B/Flow/VM 用当前骨干重算",
-      "thr_0.68": {
-        "自动√": 80,
-        "精度": 0.988,
-        "召回": 0.806
-      },
-      "换骨干前后对照_thr0.72": {
-        "旧 Flow": {
-          "自动√": 75,
-          "精度": 1.0,
-          "召回": 0.755
-        },
-        "新 Flow": {
-          "自动√": 72,
-          "精度": 0.986,
-          "召回": 0.724
-        }
-      },
-      "clean_holdout_3": {
-        "note": "与训练集事件零重叠的 3 场（09.01-3rd/4th、09.03-3rd），91 候选 / 35 真进球",
-        "auc_old_flow": 0.9168,
-        "auc_new_flow": 0.9464,
-        "零误报召回_旧Flow": 0.6,
-        "零误报召回_新Flow": 0.371,
-        "警示": "新 Flow 把 09.01-4th 一个误报的集成分从 0.636 抬到 0.781，压在零误报临界线上；同场还有 2 个真进球被压到阈值下（0.857→0.719、0.858→0.683）。AUC 在各口径均为提升，但 3/31 个片段的翻转在小样本上会主导零误报召回，该指标本次不可作唯一判据。"
-      }
+      "recall": 0.732,
+      "oof_auc": 0.9699
     },
     "arms_oof_auc": {
-      "A": 0.8034,
-      "B(SimCLR)": 0.9217,
-      "Flow(SimCLR)": 0.9478,
-      "Flow(ImageNet, 换之前)": 0.8593,
-      "VM": 0.8208,
-      "a_b2_f_vm(旧 Flow)": 0.9527,
-      "a_b2_f_vm(新 Flow)": 0.964
-    }
+      "A": 0.8191,
+      "B(SimCLR)": 0.9289,
+      "Flow(SimCLR)": 0.9361,
+      "VM": 0.8275
+    },
+    "same_subset_793": {
+      "note": "新旧数据共有 793 事件的 OOF AUC 对比 [刷新前 → 刷新后]；跨事件集直接比 AUC 不严谨，这是唯一可比口径",
+      "A": [0.8025, 0.8172],
+      "B": [0.6415, 0.9291],
+      "Flow": [0.8578, 0.9411],
+      "VM": [0.8182, 0.8461]
+    },
+    "retrained_at": "2026-09-20 13:53~13:56（A / VM / B / Flow 四个产物全部重写）",
+    "top_level_fields_note": "本文件顶层的 arch/fold_aucs/working_points 属于旧的 bigru/pool 头（B 臂 ResNet18 时代），线上 B 臂现用 model_b_simclr.pt，其指标见 model_b_simclr_meta.json；服务端只读本文件的 ensemble 段。",
+    "warning": "四臂模型文件全部重训 → 口径指纹变化 → cache/clip_cache.json 里的历史分数按旧口径作废，重开记录会重算（三带分诊的分数要重算后才回来）；不改权重/阈值不会造成这个，只有模型文件变化才会。"
   }
 }

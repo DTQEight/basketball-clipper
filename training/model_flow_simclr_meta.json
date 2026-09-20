@@ -1,38 +1,38 @@
 {
-  "trained_at": "2026-09-19 21:33:30",
+  "trained_at": "2026-09-20 13:56:09",
   "backbone": "光流域 SimCLR 自监督 resnet18（831 events x 15 crops (unlabeled)，无标签）",
-  "n_events": 831,
-  "n_pos": 346,
+  "n_events": 1167,
+  "n_pos": 456,
   "arch": "bigru",
   "fold_aucs": [
-    0.9617,
-    0.9539,
-    0.9654,
-    0.9027,
-    0.9933
+    0.9513,
+    0.9533,
+    0.9729,
+    0.9381,
+    0.9369
   ],
   "final_epochs": 7,
   "baseline_flow_imagenet_oof": 0.8593,
-  "oof_auc": 0.9478,
+  "oof_auc": 0.9362,
   "working_points": {
     "0.9": {
-      "threshold": 0.8805,
-      "precision": 0.9013,
-      "recall": 0.7919
+      "threshold": 0.9062,
+      "precision": 0.9003,
+      "recall": 0.7522
     },
     "0.95": {
-      "threshold": 0.9988,
-      "precision": 0.9528,
-      "recall": 0.2919
+      "threshold": 1.0,
+      "precision": 0.9535,
+      "recall": 0.0899
     },
     "0.98": {
-      "threshold": 0.9994,
-      "precision": 0.9892,
-      "recall": 0.2659
+      "threshold": 1.0,
+      "precision": 1.0,
+      "recall": 0.0548
     }
   },
   "fixed_050": {
-    "precision": 0.8346,
-    "recall": 0.9335
+    "precision": 0.8214,
+    "recall": 0.9079
   }
 }

@@ -18,6 +18,7 @@
 用法：
     env\\python.exe training\\recalib_ensemble.py
 """
+import argparse
 import json
 from itertools import product
 from pathlib import Path
@@ -28,6 +29,12 @@ from sklearn.metrics import roc_auc_score
 
 ROOT = Path(__file__).resolve().parent.parent
 TR = ROOT / "training"
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--from-refresh", action="store_true",
+                 help="改用 refresh_oof.jsonl（刷新数据集后的四臂 OOF，"
+                      "键 a/b/flow/vm_lgbm），而非 oof_directions.jsonl")
+ARGS = _ap.parse_args()
 
 # 权重网格（线上概率加权口径）。刻意不取连续值：831 事件上细网格会过拟合 OOF，
 # 原 --deploy 也是在一小组手工候选里择优。
@@ -50,38 +57,51 @@ def load(path, key="pred"):
     return {r["event_id"]: r[key] for r in read_jsonl(path)}
 
 
-d = {r["event_id"]: r for r in read_jsonl(TR / "oof_directions.jsonl")}
-new_b = load(TR / "oof_temporal_simclr.jsonl")
-new_f = load(TR / "oof_flow_simclr.jsonl")
-ids = [k for k in d if (new_b is None or k in new_b)
-       and (new_f is None or k in new_f)]
-y = np.array([d[k]["label"] for k in ids])
-print(f"对齐事件: {len(ids)}（正 {int(y.sum())}）")
-
-P = {
-    "a": np.array([d[k]["pred_a"] for k in ids]),
-    "vm": np.array([d[k]["pred_vm"] for k in ids]),
-    # 换骨干的臂：新版本存在则用新版本（线上也是优先新版本）
-    "b": np.array([(new_b or {k: d[k]["pred_b"] for k in ids})[k] for k in ids]),
-    "flow": np.array([(new_f or {k: d[k]["pred_flow_t"] for k in ids})[k]
-                      for k in ids]),
-}
-
-print("\n单臂 OOF AUC")
-print(f"  A(LGBM)              {roc_auc_score(y, P['a']):.4f}")
-if new_b is None:
-    print(f"  B(ResNet18 旧)       {roc_auc_score(y, P['b']):.4f}   ← 无新 B 产物")
+if ARGS.from_refresh:
+    # 刷新数据集后：refresh_oof.jsonl 已是同折同事件集的四臂 OOF，直接用
+    _rf = read_jsonl(TR / "refresh_oof.jsonl")
+    y = np.array([r["label"] for r in _rf])
+    P = {k: np.array([r[k] for r in _rf])
+         for k in ("a", "b", "flow", "vm_lgbm")}
+    P["vm"] = P.pop("vm_lgbm")
+    print(f"数据源 refresh_oof.jsonl  对齐事件 {len(_rf)}（正 {int(y.sum())}）")
+    print("\n单臂 OOF AUC")
+    for _k, _n in (("a", "A(LGBM)"), ("b", "B(SimCLR)"), ("flow", "Flow(SimCLR)"),
+                   ("vm", "VM(VideoMAE)")):
+        print(f"  {_n:<20}{roc_auc_score(y, P[_k]):.4f}")
 else:
-    print(f"  B(SimCLR 新)         {roc_auc_score(y, P['b']):.4f}")
-    print(f"  B(ResNet18 旧)       "
-          f"{roc_auc_score(y, np.array([d[k]['pred_b'] for k in ids])):.4f}")
-if new_f is None:
-    print(f"  Flow(ImageNet 旧)    {roc_auc_score(y, P['flow']):.4f}   ← 无新 Flow 产物")
-else:
-    print(f"  Flow(SimCLR 新)      {roc_auc_score(y, P['flow']):.4f}")
-    print(f"  Flow(ImageNet 旧)    "
-          f"{roc_auc_score(y, np.array([d[k]['pred_flow_t'] for k in ids])):.4f}")
-print(f"  VM(VideoMAE)         {roc_auc_score(y, P['vm']):.4f}")
+    d = {r["event_id"]: r for r in read_jsonl(TR / "oof_directions.jsonl")}
+    new_b = load(TR / "oof_temporal_simclr.jsonl")
+    new_f = load(TR / "oof_flow_simclr.jsonl")
+    ids = [k for k in d if (new_b is None or k in new_b)
+           and (new_f is None or k in new_f)]
+    y = np.array([d[k]["label"] for k in ids])
+    print(f"对齐事件: {len(ids)}（正 {int(y.sum())}）")
+
+    P = {
+        "a": np.array([d[k]["pred_a"] for k in ids]),
+        "vm": np.array([d[k]["pred_vm"] for k in ids]),
+        # 换骨干的臂：新版本存在则用新版本（线上也是优先新版本）
+        "b": np.array([(new_b or {k: d[k]["pred_b"] for k in ids})[k] for k in ids]),
+        "flow": np.array([(new_f or {k: d[k]["pred_flow_t"] for k in ids})[k]
+                          for k in ids]),
+    }
+
+    print("\n单臂 OOF AUC")
+    print(f"  A(LGBM)              {roc_auc_score(y, P['a']):.4f}")
+    if new_b is None:
+        print(f"  B(ResNet18 旧)       {roc_auc_score(y, P['b']):.4f}   ← 无新 B 产物")
+    else:
+        print(f"  B(SimCLR 新)         {roc_auc_score(y, P['b']):.4f}")
+        print(f"  B(ResNet18 旧)       "
+              f"{roc_auc_score(y, np.array([d[k]['pred_b'] for k in ids])):.4f}")
+    if new_f is None:
+        print(f"  Flow(ImageNet 旧)    {roc_auc_score(y, P['flow']):.4f}   ← 无新 Flow 产物")
+    else:
+        print(f"  Flow(SimCLR 新)      {roc_auc_score(y, P['flow']):.4f}")
+        print(f"  Flow(ImageNet 旧)    "
+              f"{roc_auc_score(y, np.array([d[k]['pred_flow_t'] for k in ids])):.4f}")
+    print(f"  VM(VideoMAE)         {roc_auc_score(y, P['vm']):.4f}")
 
 print("\nrank 口径（与历史分析可比，仅参考）")
 
