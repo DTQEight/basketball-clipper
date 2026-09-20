@@ -9,7 +9,16 @@
     event_id = md5(视频路径)[:8] + "_" + f"{round(ts*fps):010d}"
     字段     = event_id / video / ts / label / hoop / video_fps / ...
 
-留出集：HOLDOUT 里的 4 场**不进训练集**，保持无偏验证（这是目前唯一的域外样本）。
+留出集（不进训练集）：
+
+- **整日留出** `HOLDOUT_DAYS`：该比赛日的**所有分节**都不进训练集。08.31（3 节）是
+  当前的整日留出，用作**调参验证日**（它参与过 keep_thr 0.72→0.75→0.68 的历史，
+  所以只算"见过的数据"，不能当最终报告）。
+- **按文件名留出** `HOLDOUT_FILES`：历史遗留的几个单场（09.01-3rd/-4th、09.03-3rd）。
+- 为什么不按文件名写死一切：新跑完一节就会漏进训练集——08.31-2nd/-3rd 今天跑完时
+  就差点这样进池，而它们属于同一个已被留出的比赛日。
+- **待定**：下一场**新录**的比赛整日留出，只跑一次、只报告、永不进训练——那才是真正
+  无偏的测试日（它不参与任何调参）。录完标完后把日期前缀加进 `HOLDOUT_DAYS`。
 
 标签口径（按来源，见 services/state.py 的来源分流表）：
 
@@ -45,9 +54,20 @@ BLOCKS = ROOT / "dataset_20260918" / "blocks_index.json"
 OUT = TR / "dataset_v1.json"
 REUSE_TOL = 0.25   # 秒：重检造成的亚帧位移容差（远小于 min_gap_sec=2.0）
 
-# 不进训练集的留出场（当前唯一的无偏验证来源，别吃进训练集）
-HOLDOUT = ("2026.08.31-1st.mp4", "2026.09.01-3rd.mp4",
-           "2026.09.01-4th.mp4", "2026.09.03-3rd.mp4")
+# 整日留出：这天的所有分节都不进训练集（按日期前缀匹配，新跑完的分节自动排除）
+#   2026.08.31 —— 调参验证日（3 节：-1st / -2nd / -3rd）
+HOLDOUT_DAYS = ("2026.08.31",)
+# 按文件名留出的历史单场（同日其他节已在训练集里，见 docstring）
+HOLDOUT_FILES = ("2026.09.01-3rd.mp4", "2026.09.01-4th.mp4", "2026.09.03-3rd.mp4")
+
+
+def is_holdout(name: str) -> bool:
+    """该视频是否留出（不进训练集）：整日留出按**日期前缀**，其余按文件名。
+
+    整日留出必须用前缀匹配——否则同日新跑完的分节会悄悄进池（08.31-2nd/-3rd 就
+    差点这样），而"同一天的其他节在训练集里"正是留出集失去无偏性的原因。
+    """
+    return name.startswith(HOLDOUT_DAYS) or name in HOLDOUT_FILES
 
 
 def from_blocks():
@@ -78,7 +98,7 @@ def from_history():
     n_auto = 0
     for r in state.load_history():
         name = Path(r["video"]).name
-        if name in HOLDOUT:
+        if is_holdout(name):
             skipped.append(name)
             continue
         lab = state.get_labels(r["video"])
