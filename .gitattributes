@@ -1,0 +1,6 @@
+# LightGBM 文本模型：禁止 git 做任何换行符转换。
+# 本仓库 core.autocrlf=true，检出时会把 LF 换成 CRLF；而 LightGBM 的模型解析器
+# 遇到 \r 会报 "Model format error" 并直接 abort()（进程级崩溃，try/except 拦不住，
+# 报错信息也指不到换行符）。这些文件必须按原样（LF）保存与检出。
+training/model_lgbm.txt -text
+training/model_vm_lgbm.txt -text
