@@ -802,6 +802,17 @@ def main_page():
         if not token:
             _batch_loading = False
             return
+        # 片段缺 AI 分数时先问用户要不要补跑复核。放在锁内、后台线程启动之前：
+        # 这段有 await，若客户端在等待期间断开、协程被取消，锁会永久占位
+        # （正常路径的锁由后台线程归还，而那时线程还没启动）→ 取消/异常时归还。
+        ai_backfill = True
+        try:
+            ai_backfill = await _ask_ai_backfill_if_needed(
+                path, detection.batch_missing_scores)
+        except BaseException:
+            state.release_task(token)
+            _batch_loading = False
+            raise
         try:
             batch_select.set_value(path)
             # 若该视频已有检测结果，生成预览片段可能耗时（缓存未命中时 ~40s/50球），
@@ -824,6 +835,7 @@ def main_page():
             try:
                 frame, info, status = await run.io_bound(
                     detection.on_batch_load_video, path, _progress_callback,
+                    ai_backfill=ai_backfill,
                     task_token=token)
             except Exception as _e:
                 import traceback
@@ -1695,7 +1707,7 @@ def main_page():
                     ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
     async def _ask_ai_backfill(video_path, n_missing, n_total):
-        """历史记录片段缺 AI 分数时，先问用户要不要现在补跑四臂复核。
+        """片段缺 AI 分数时，先问用户要不要现在补跑四臂复核。
 
         补跑是分钟级开销（A 臂逐帧 YOLO 约 6.5 秒/候选），静默跑会让界面看着
         像卡死；不补跑也能正常看结果，只是片段全部要人工判定。
@@ -1718,19 +1730,33 @@ def main_page():
         dlg.props('persistent')
         return bool(await dlg)
 
+    async def _ask_ai_backfill_if_needed(video_path, probe):
+        """片段缺 AI 分数就弹窗问一次，返回「是否补跑复核」。
+
+        probe(video_path) → (need_ai, n_missing, n_total)，由调用方按各自的取数
+        路径给出（历史回读 / 批量回看口径不同）。全局关掉「AI 识别」时不问
+        （本来就不会跑复核）；探针异常按「不问」处理——宁可少问一次，
+        也不能让弹窗挡住正常加载。
+        """
+        if not goal_verifier.is_enabled():
+            return True
+        try:
+            _need, _n_miss, _n_tot = probe(video_path)
+        except Exception:
+            return True
+        if not _need:
+            return True
+        return await _ask_ai_backfill(video_path, _n_miss, _n_tot)
+
     async def _on_load_history(rec_video=None):
         """按视频路径加载历史记录（非索引：新检测插入会使索引整体位移，点旧行会加载错记录）。"""
         # 先问「要不要补跑 AI 复核」——必须放在拿任务锁之前：弹窗等待期间有
         # await，若客户端此时断开、协程被取消，锁会永久占位（正常路径的锁由
         # 后台线程归还，而那时后台线程还没启动），之后所有任务都会被拒。
         ai_backfill = True
-        if rec_video and goal_verifier.is_enabled():
-            try:
-                _need, _n_miss, _n_tot = detection.history_missing_scores(rec_video)
-            except Exception:
-                _need = False
-            if _need:
-                ai_backfill = await _ask_ai_backfill(rec_video, _n_miss, _n_tot)
+        if rec_video:
+            ai_backfill = await _ask_ai_backfill_if_needed(
+                rec_video, detection.history_missing_scores)
         token = _try_acquire('load')
         if not token:
             return

@@ -258,3 +258,37 @@ class TestHistoryMissingScores:
     def test_unknown_record_no_need(self, monkeypatch):
         monkeypatch.setattr(state, "load_history", lambda: [])
         assert detection.history_missing_scores("C:/nope.mp4") == (False, 0, 0)
+
+
+class TestBatchMissingScores:
+    """批量回看的同类判断：有流水线快照就看快照（加载真正会用的那份片段），
+    没有快照才退回「历史记录 + 片段缓存」口径。"""
+
+    def teardown_method(self, method):
+        state.clip_cache.clear()
+        state.batch_results.clear()
+
+    def test_snapshot_takes_priority(self, monkeypatch):
+        video = "C:/fake/batch.mp4"
+        state.batch_results[video] = {
+            "goals": [10.0], "clips": [{"ts": 10.0, "path": "p.mp4", "idx": 0}],
+            "kept": set(), "finished_at": "x"}
+        # 历史记录里根本没有这条：若误走历史口径会返回「不问」
+        monkeypatch.setattr(state, "load_history", lambda: [])
+        assert detection.batch_missing_scores(video) == (True, 1, 1)
+
+    def test_snapshot_all_scored_no_need(self, monkeypatch):
+        video = "C:/fake/batch.mp4"
+        state.batch_results[video] = {
+            "goals": [10.0],
+            "clips": [{"ts": 10.0, "path": "p.mp4", "idx": 0, "score": 0.9}],
+            "kept": set(), "finished_at": "x"}
+        monkeypatch.setattr(state, "load_history", lambda: [])
+        assert detection.batch_missing_scores(video) == (False, 0, 1)
+
+    def test_no_snapshot_falls_back_to_history(self, monkeypatch, tmp_path):
+        video = str(tmp_path / "v.mp4")
+        (tmp_path / "v.mp4").write_bytes(b"x")
+        monkeypatch.setattr(state, "load_history",
+                            lambda: [{"video": video, "goals": [10.0, 20.0]}])
+        assert detection.batch_missing_scores(video) == (True, 2, 2)
