@@ -316,9 +316,14 @@ class GoalDetector:
              ball_frame=None, frame_roi=None):
         """喂入一帧数据。
 
-        ball_pos: YOLO 球位置 (cx, cy, x1, y1, x2, y2, conf) 或 None
+        ball_pos: 该帧 YOLO 检出的**全部**球位置，列表 [(cx, cy, x1, y1, x2, y2, conf), ...]
+                  （可为空列表或 None）。按置信度降序排列，调用方通常把第一个当主球。
                   - diff/diff_loose 模式忽略此参数
                   - diff_yolo 模式需要传入，用于双确认
+                  必须是列表而不是单个框：只留最高分那一个框时，画面上存在的
+                  稳定误报（远端场地上的球/静置物，置信度常达 0.5+）会在真球过筐
+                  口时以微弱优势胜出、把筐边的真球挤掉，导致真进球被 YOLO 硬否决
+                  （见 2026.08.15-1st 7:35~10:32 空档的逐帧归因）。
         frame_idx: 当前帧号
         fps: 帧率
         frame: 当前帧 BGR 图像（必须提供）
@@ -368,10 +373,12 @@ class GoalDetector:
         # 进球是一个过程（~0.3秒），即使触发瞬间 YOLO 漏检，前后帧检测到也能确认。
         # 放在冷却检查之前：冷却 3s 内检出的球位置也是有效样本，
         # 冷却刚结束触发的补篮候选需要窗口内有球才能通过 YOLO 确认
-        if ball_pos is not None:
+        # 本帧全部球位置都写入：_check_yolo_near_hoop 关心的是「筐邻域有没有球」，
+        # 只写最高分那一个会让筐边真球被画面上其它球/误报挤掉（见方法 docstring）
+        for _bp in (ball_pos or ()):
             self.ball_pos_history.append(
                 (ball_frame if ball_frame is not None else frame_idx,
-                 ball_pos[0], ball_pos[1]))
+                 _bp[0], _bp[1]))
         # 保留最近 yolo_window_frames 帧
         cutoff = frame_idx - self.yolo_window_frames
         while self.ball_pos_history and self.ball_pos_history[0][0] < cutoff:
