@@ -206,3 +206,55 @@ class TestAiVerifySwitch:
             assert clips[0]["mark_source"] == "auto"
         finally:
             goal_verifier.set_enabled(prev)
+
+
+class TestHistoryMissingScores:
+    """加载历史前的「要不要补跑 AI 复核」判断：只查记录 + 片段缓存，不碰 GPU。
+
+    返回 (need_ai, n_missing, n_total)。缓存未命中（片段要重新生成）时分数
+    必然全缺；读取异常一律按「不问」处理，宁可少问一次也不能挡加载。
+    """
+
+    def teardown_method(self, method):
+        state.clip_cache.clear()
+
+    def _setup(self, monkeypatch, tmp_path, goals, cached_clips):
+        video = str(tmp_path / "v.mp4")
+        (tmp_path / "v.mp4").write_bytes(b"x")
+        monkeypatch.setattr(state, "load_history",
+                            lambda: [{"video": video, "goals": goals}])
+        state.clip_cache.clear()
+        if cached_clips is not None:
+            state.clip_cache[state.clip_cache_key(video, goals)] = cached_clips
+        return video
+
+    def test_cache_miss_needs_ai(self, monkeypatch, tmp_path):
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], None)
+        assert detection.history_missing_scores(video) == (True, 2, 2)
+
+    def test_all_scored_no_need(self, monkeypatch, tmp_path):
+        clip = tmp_path / "c.mp4"
+        clip.write_bytes(b"x")
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], [
+            {"ts": 10.0, "path": str(clip), "idx": 0, "score": 0.9},
+            {"ts": 20.0, "path": str(clip), "idx": 1, "score": 0.1}])
+        assert detection.history_missing_scores(video) == (False, 0, 2)
+
+    def test_partial_missing_needs_ai(self, monkeypatch, tmp_path):
+        clip = tmp_path / "c.mp4"
+        clip.write_bytes(b"x")
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], [
+            {"ts": 10.0, "path": str(clip), "idx": 0},
+            {"ts": 20.0, "path": str(clip), "idx": 1, "score": 0.1}])
+        assert detection.history_missing_scores(video) == (True, 1, 2)
+
+    def test_missing_clip_file_needs_ai(self, monkeypatch, tmp_path):
+        """片段文件被清理掉 → 加载时会全部重新生成，分数同样是全缺。"""
+        video = self._setup(monkeypatch, tmp_path, [10.0], [
+            {"ts": 10.0, "path": str(tmp_path / "gone.mp4"), "idx": 0,
+             "score": 0.9}])
+        assert detection.history_missing_scores(video) == (True, 1, 1)
+
+    def test_unknown_record_no_need(self, monkeypatch):
+        monkeypatch.setattr(state, "load_history", lambda: [])
+        assert detection.history_missing_scores("C:/nope.mp4") == (False, 0, 0)

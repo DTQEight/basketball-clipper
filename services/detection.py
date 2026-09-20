@@ -1477,8 +1477,43 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
             state.release_task(task_token)
 
 
-def on_load_history(idx_choice, progress_callback=None, task_token=0):
+def history_missing_scores(video_path):
+    """这条历史记录的片段是否缺 AI 分数（加载前问用户「要不要补跑复核」用）。
+
+    只读历史记录 + 片段缓存，不生成预览、不碰 GPU，秒回。返回
+    (need_ai, n_missing, n_total)：
+      - 缓存未命中（片段要重新生成）→ 分数必然全缺
+      - 缓存命中 → 按已存 score 统计缺几个
+      - 无该记录 / 无进球 / 读取异常 → 一律 (False, 0, 0)：
+        宁可少问一次，也不能让弹窗挡住正常加载
+    """
+    try:
+        records = state.load_history()
+        r = next((x for x in records if x.get("video") == video_path), None)
+        if r is None:
+            return False, 0, 0
+        goals = [float(t) for t in r.get("goals", [])]
+        if not goals:
+            return False, 0, 0
+        cached = state.clip_cache.get(state.clip_cache_key(video_path, goals))
+        # 与 _on_load_history_impl 的 cache_hit 同口径：片段文件缺失时
+        # 缓存会被判定失效、全部重新生成，那分数一样是全缺
+        if not cached or not all(os.path.exists(c["path"]) for c in cached):
+            return True, len(goals), len(goals)
+        n_missing = sum(1 for c in cached if "score" not in c)
+        return n_missing > 0, n_missing, len(cached)
+    except Exception as e:
+        log.warning(f"[LOAD] 检查 AI 分数缺失失败（按不弹窗处理）: {e}")
+        return False, 0, 0
+
+
+def on_load_history(idx_choice, progress_callback=None, task_token=0,
+                    ai_backfill=True):
     """从历史记录加载。
+
+    ai_backfill: 片段缺 AI 分数时是否补跑四臂复核。由 UI 弹窗征求用户意见后
+    传入（补跑是分钟级开销，静默跑会让界面看着像卡死）；False 时只加载不补跑，
+    片段全部留人工判定，历史标签与缓存分数都不动，之后重开该记录仍可补跑。
 
     task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体：
     未命中片段缓存时本函数会跑 ffmpeg 生成预览（可达数十秒），
@@ -1486,13 +1521,13 @@ def on_load_history(idx_choice, progress_callback=None, task_token=0):
     锁必须等线程真正结束才释放）。
     """
     try:
-        return _on_load_history_impl(idx_choice, progress_callback)
+        return _on_load_history_impl(idx_choice, progress_callback, ai_backfill)
     finally:
         if task_token:
             state.release_task(task_token)
 
 
-def _on_load_history_impl(idx_choice, progress_callback):
+def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
     """on_load_history 的实际实现（锁由外层 wrapper 管理）。"""
     def _report(pct, msg):
         if progress_callback:
@@ -1625,7 +1660,9 @@ def _on_load_history_impl(idx_choice, progress_callback):
     # 补过之后分数随 put_clip_cache 落盘，后续重启/再读历史都不会再丢。
     # UI 关闭「AI 识别」时整段跳过：不补跑、不重推阈值、不自动打标记，
     # 卡片上的 AI 标记只在重新开启后由缓存分数即时重推（缓存与历史标签都不动）。
-    if state.last_goal_clips and hoop and goal_verifier.is_enabled():
+    # ai_backfill=False（用户在弹窗里选了「直接加载」）同样跳过。
+    if state.last_goal_clips and hoop and ai_backfill \
+            and goal_verifier.is_enabled():
         # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值组合会给出
         # 错误判决，先作废再走重算分支
         _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)

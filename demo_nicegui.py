@@ -1694,8 +1694,43 @@ def main_page():
                     ui.label(name).classes('text-xs flex-1 truncate').style('color: var(--text-primary)')
                     ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
+    async def _ask_ai_backfill(video_path, n_missing, n_total):
+        """历史记录片段缺 AI 分数时，先问用户要不要现在补跑四臂复核。
+
+        补跑是分钟级开销（A 臂逐帧 YOLO 约 6.5 秒/候选），静默跑会让界面看着
+        像卡死；不补跑也能正常看结果，只是片段全部要人工判定。
+        对话框被外因关闭（页面断开等）时返回 False：宁可少跑，不可乱跑。
+        """
+        from nicegui import ui
+        _eta_min = max(1, int(round(n_missing * 6.5 / 60)))
+        with ui.dialog() as dlg, ui.card().classes('p-4 gap-3'):
+            ui.label('是否补跑 AI 识别').classes('text-lg font-bold')
+            ui.label(f'{os.path.basename(video_path)}\n'
+                     f'该记录 {n_total} 个片段里有 {n_missing} 个还没有 AI 分数。\n'
+                     f'补跑四臂复核约需 {_eta_min} 分钟；不补跑则片段全部需人工判定，\n'
+                     f'之后重开这条记录仍可补跑。').classes('text-sm whitespace-pre-line')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('直接加载', on_click=lambda: dlg.submit(False)).props('ripple').style(
+                    'background: var(--bg-elevated); color: var(--text-secondary)')
+                ui.button('补跑 AI', on_click=lambda: dlg.submit(True)).props('ripple').style(
+                    'background: var(--accent); color: var(--bg-canvas)')
+        # persistent：禁止点遮罩/ESC 关闭，避免误触变成「静默不跑」
+        dlg.props('persistent')
+        return bool(await dlg)
+
     async def _on_load_history(rec_video=None):
         """按视频路径加载历史记录（非索引：新检测插入会使索引整体位移，点旧行会加载错记录）。"""
+        # 先问「要不要补跑 AI 复核」——必须放在拿任务锁之前：弹窗等待期间有
+        # await，若客户端此时断开、协程被取消，锁会永久占位（正常路径的锁由
+        # 后台线程归还，而那时后台线程还没启动），之后所有任务都会被拒。
+        ai_backfill = True
+        if rec_video and goal_verifier.is_enabled():
+            try:
+                _need, _n_miss, _n_tot = detection.history_missing_scores(rec_video)
+            except Exception:
+                _need = False
+            if _need:
+                ai_backfill = await _ask_ai_backfill(rec_video, _n_miss, _n_tot)
         token = _try_acquire('load')
         if not token:
             return
@@ -1731,6 +1766,7 @@ def main_page():
         try:
             result = await run.io_bound(detection.on_load_history,
                                          records.index(rec), _progress_callback,
+                                         ai_backfill=ai_backfill,
                                          task_token=token)
             frame, info, status = result
         except Exception as _e:
