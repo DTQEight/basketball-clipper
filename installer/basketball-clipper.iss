@@ -5,7 +5,7 @@
 ;    ISCC.exe installer\basketball-clipper.iss
 ;
 ;  产物:
-;    dist\installer\BasketballClipper-Setup-1.0.0.exe
+;    dist\installer\BasketballClipper-Setup-1.0.1.exe
 ;
 ;  说明:
 ;    载荷使用 dist\basketball-clipper\ (PyInstaller onedir 目录版)
@@ -13,7 +13,7 @@
 ; ============================================================
 
 #define MyAppName        "篮球进球集锦助手"
-#define MyAppVersion     "1.0.0"
+#define MyAppVersion     "1.0.1"
 #define MyAppPublisher   "DTQEight"
 #define MyAppURL         "https://github.com/DTQEight/basketball-clipper"
 #define MyAppExeName     "basketball-clipper.exe"
