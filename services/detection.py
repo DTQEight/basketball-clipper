@@ -1507,24 +1507,6 @@ def history_missing_scores(video_path):
         return False, 0, 0
 
 
-def batch_missing_scores(video_path):
-    """批量回看该视频时片段是否缺 AI 分数（加载前问用户「要不要补跑」用）。
-
-    与 _on_batch_load_video_impl 同口径：有流水线快照就用快照（快照优先水合，
-    探针必须看加载真正会用的那份片段，否则会漏问），没有快照才退回
-    「历史记录 + 片段缓存」。只读内存 / 文件，不生成预览、不碰 GPU。
-    """
-    try:
-        snap = state.batch_results.get(video_path)
-        if snap and snap.get("clips"):
-            clips = snap["clips"]
-            n_missing = sum(1 for c in clips if "score" not in c)
-            return n_missing > 0, n_missing, len(clips)
-    except Exception as e:
-        log.warning(f"[BATCH LOAD] 检查快照 AI 分数缺失失败（改用历史口径）: {e}")
-    return history_missing_scores(video_path)
-
-
 def on_load_history(idx_choice, progress_callback=None, task_token=0,
                     ai_backfill=True):
     """从历史记录加载。
@@ -1782,26 +1764,23 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
     return set(kept_idx), has_marks
 
 
-def on_batch_load_video(selected, progress_callback=None, task_token=0,
-                        ai_backfill=True):
+def on_batch_load_video(selected, progress_callback=None, task_token=0):
     """批量模式：加载选中的视频，应用该视频已保存的标定。
 
     若该视频已有历史检测记录（批量识别完成后再点击下拉框），
     自动加载检测结果和预览片段，无需再去历史记录里找。
-    ai_backfill: 片段缺 AI 分数时是否补跑四臂复核（由 UI 弹窗征求用户意见后
-    传入，见 on_load_history 的同名参数）。
     task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体：
     未命中片段缓存时本函数会跑 ffmpeg 生成预览（可达数十秒），
     UI 协程被取消后线程仍会继续写 state，锁必须等线程结束才释放）。
     """
     try:
-        return _on_batch_load_video_impl(selected, progress_callback, ai_backfill)
+        return _on_batch_load_video_impl(selected, progress_callback)
     finally:
         if task_token:
             state.release_task(task_token)
 
 
-def _on_batch_load_video_impl(selected, progress_callback, ai_backfill=True):
+def _on_batch_load_video_impl(selected, progress_callback):
     """on_batch_load_video 的实际实现（锁由外层 wrapper 管理）。"""
     def _report(pct, msg):
         if progress_callback:
@@ -1940,11 +1919,9 @@ def _on_batch_load_video_impl(selected, progress_callback, ai_backfill=True):
         # 程序后从历史回看」：命中片段缓存的分是旧阈值算的，未命中缓存重新
         # 生成的片段则一个分数都没有 → 流水线确认界面看不到任何 AI 徽标。
         # 与单视频历史加载（_on_load_history_impl）保持同一口径。
-        # UI 关闭「AI 识别」时整段跳过；ai_backfill=False（用户在弹窗里选了
-        # 「直接加载」）同样跳过，理由同该处。
+        # UI 关闭「AI 识别」时整段跳过，理由同该处。
         _hoop = state.calib["hoop"]
-        if state.last_goal_clips and _hoop and ai_backfill \
-                and goal_verifier.is_enabled():
+        if state.last_goal_clips and _hoop and goal_verifier.is_enabled():
             # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值
             # 组合会给出错误判决，先作废再走重算分支
             _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
