@@ -263,6 +263,31 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 
 # ============ 检测 ============
 
+def _ball_boxes_from_result(res):
+    """把 YOLO 推理结果转成候选球框列表（按置信度降序），无检出返回 []。
+
+    返回 [(cx, cy, x1, y1, x2, y2, conf), ...]。
+
+    必须返回**全部**框，不能只返回最高分那一个：ball_pos 的唯一用途是
+    「筐邻域有没有球」这个 YOLO 证据（→ GoalDetector.ball_pos_history →
+    _check_yolo_near_hoop）。画面里常驻的稳定误报（远端场地上的球/静置物，
+    置信度可达 0.5+）会在真球穿过筐口的瞬间以微弱优势胜过真球，把筐边的真球
+    挤掉 → 真进球被 YOLO 硬否决。2026.08.15-1st 的 7:35~10:32 空档即由此产生：
+    8:14 那球斑块轨迹完整（上沿→下沿），YOLO 在四帧都检出了筐边真球
+    （(435,59)0.47 / (377,118)0.45 / (313,197)0.55 / (277,258)0.39），
+    却被 (1738,554)0.68 之类的远端误报顶掉，判定连否 13 次。
+    """
+    if res.boxes is None or len(res.boxes) == 0:
+        return []
+    xyxy = res.boxes.xyxy.cpu().numpy()
+    confs = res.boxes.conf.cpu().numpy()
+    boxes = [(float((x1 + x2) / 2), float((y1 + y2) / 2),
+              float(x1), float(y1), float(x2), float(y2), float(c))
+             for (x1, y1, x2, y2), c in zip(xyxy, confs)]
+    boxes.sort(key=lambda b: b[6], reverse=True)
+    return boxes
+
+
 def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                min_blob_area=30, search_margin=80, progress_callback=None,
@@ -619,13 +644,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                             classes=_ball_classes,
                                             device=_device, verbose=False)[0]
                         if res.boxes is not None and len(res.boxes) > 0:
-                            xyxy = res.boxes.xyxy.cpu().numpy()
-                            confs = res.boxes.conf.cpu().numpy()
-                            best = int(np.argmax(confs))
-                            x1, y1, x2, y2 = xyxy[best]
-                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                            ball_pos = (float(cx), float(cy), float(x1), float(y1),
-                                        float(x2), float(y2), float(confs[best]))
+                            # 保留全部球框（见 _ball_boxes_from_result 的说明）；
+                            # 第一个（最高分）仍是主球，供跳帧复用等读取方使用
+                            ball_pos = _ball_boxes_from_result(res) or None
                         _last_ball = (fidx, ball_pos)
                     except Exception as e:
                         # 不能静默吞掉：CUDA 失效（如升级显卡驱动后未重启服务）会

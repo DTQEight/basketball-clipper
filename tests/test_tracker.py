@@ -51,8 +51,9 @@ def _frame_with_bar(cy, w=56, h=4):
 
 
 def _ball_pos(cy, radius=6):
-    return (float(CX), float(cy), float(CX - radius), float(cy - radius),
-            float(CX + radius), float(cy + radius), 0.9)
+    """单球帧的 YOLO 结果：feed 的 ball_pos 是「该帧全部球框」的列表。"""
+    return [(float(CX), float(cy), float(CX - radius), float(cy - radius),
+             float(CX + radius), float(cy + radius), 0.9)]
 
 
 def _detector(**kw):
@@ -320,7 +321,7 @@ class TestYoloWindowBoundaries:
     def test_ball_far_away_rejected(self):
         """球位置远离篮筐（±1 倍筐宽高之外）→ YOLO 确认失败。"""
         det = _detector()
-        far_ball = (500.0, 100.0, 494.0, 94.0, 506.0, 106.0, 0.9)
+        far_ball = [(500.0, 100.0, 494.0, 94.0, 506.0, 106.0, 0.9)]
         for i, cy in enumerate([40, 40, 100, 100, 100]):
             det.feed(far_ball, i, FPS, frame=_frame_with_ball(cy))
         assert det.goals == []
