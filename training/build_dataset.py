@@ -11,9 +11,17 @@
 
 留出集：HOLDOUT 里的 4 场**不进训练集**，保持无偏验证（这是目前唯一的域外样本）。
 
-标签口径：只读 labels 的 kept / deleted，即**人工**标签。三段分诊里模型自动判为
-误报的片段存在 labels["auto_rejected"]（见 services/state.py），刻意不读——否则会
-形成"模型自己判×→自己学"的闭环，且某个被漏判的难例会永久固化成负样本。
+标签口径（按来源，见 services/state.py 的来源分流表）：
+
+| 来源 | 正样本 | 负样本 |
+|---|---|---|
+| 人工 | kept（收） | deleted（收） |
+| 模型 | auto_kept（默认收，标 `label_source=ui_auto`） | auto_rejected（**不收**） |
+
+不收模型判的 ×：会形成"模型自己判×→自己学"的闭环，且某个被漏判的难例会永久
+固化成负样本。模型自动 √ 默认收（正样本本就不够用，高带精度约 0.99），但打了
+来源标——需要严格只用人工正样本时，按 `label_source == "ui_manual"` 过滤即可。
+本次改动之前写入的记录只有 kept/deleted，无法回溯区分来源，一律记成 ui_manual（不猜）。
 
 event_id 沿用策略：重新检测会让同一进球的时间戳位移 0.03~0.17 秒，帧号随之改变，
 event_id 也就变了——若照搬就会白白重抽全部特征。故对同一视频按 REUSE_TOL（0.25 秒）
@@ -54,10 +62,20 @@ def from_blocks():
 
 
 def from_history():
-    """读 cache/history 的标注池：当前检测候选 × 人工 kept/deleted 标签。"""
+    """读 cache/history 的标注池：当前检测候选 × 标签（按来源打标）。
+
+    正样本取「人工 kept ∪ 模型 auto_kept」，负样本只取「人工 deleted」：
+    - 模型判 × 的 auto_rejected 刻意不读（会形成"模型自己判×→自己学"的闭环，
+      且某个被漏判的难例会永久固化成负样本）
+    - 模型自动 √ 的 auto_kept **默认收进来**（正样本本就不够用，且高带精度约
+      0.99），但写 `label_source` 区分来源，随时可在下游按来源过滤/加权
+    - 本次改动之前写入的历史记录只有 kept/deleted，无法回溯区分来源，一律记成
+      ui_manual（不猜）
+    """
     sys.path.insert(0, str(ROOT))
     from services import state
     out, skipped = [], []
+    n_auto = 0
     for r in state.load_history():
         name = Path(r["video"]).name
         if name in HOLDOUT:
@@ -68,14 +86,21 @@ def from_history():
         if not hoop or not fps:
             print(f"[SKIP] {name}: 缺 hoop/fps")
             continue
+
+        base = {"video": r["video"], "hoop": [int(x) for x in hoop],
+                "fps": float(fps)}
         for t in (lab.get("kept") or []):
-            out.append({"video": r["video"], "ts": float(t), "label": 1,
-                        "hoop": [int(x) for x in hoop], "fps": float(fps)})
+            out.append({**base, "ts": float(t), "label": 1,
+                        "label_source": "ui_manual"})
+        for t in (lab.get("auto_kept") or []):
+            out.append({**base, "ts": float(t), "label": 1,
+                        "label_source": "ui_auto"})
+            n_auto += 1
         for t in (lab.get("deleted") or []):
-            out.append({"video": r["video"], "ts": float(t), "label": 0,
-                        "hoop": [int(x) for x in hoop], "fps": float(fps)})
-    print(f"数据源标注池: {len(out)} 事件；留出 {len(skipped)} 场: "
-          f"{', '.join(sorted(skipped))}")
+            out.append({**base, "ts": float(t), "label": 0,
+                        "label_source": "ui_manual"})
+    print(f"数据源标注池: {len(out)} 事件（其中模型自动 √ {n_auto} 条，"
+          f"source=ui_auto）；留出 {len(skipped)} 场: {', '.join(sorted(skipped))}")
     return out
 
 

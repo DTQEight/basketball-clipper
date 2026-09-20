@@ -260,6 +260,32 @@ UI 一直写「标定篮筐」，但标定框在算法里从头到尾按**篮筐
 
 改动：`demo_nicegui.py` 的标定提示与空列表引导、`services/detection.py` 的 5 条状态/报错文案（标定成功、重置、未标定拦截、批量未标定提示、保存标定前置检查）、`tracker.py` 的 `hoop_box` 参数文档、README 两处流程描述，并在 ALGORITHM.md 新增「标定口径」小节说明画小了的三处后果。
 
+#### 十四、正样本也记来源：标签库两侧对称分流
+
+上一轮已经把模型判的 × 分流到 `labels.auto_rejected`，但正样本没做对称处理：`_sync_marks` 把「所有 keep」不分来源写进 `labels.kept`，而 `build_dataset` 的 docstring 写着「只读 kept/deleted，即**人工**标签」——实际模型自动 √ 也在里面。实测缓存里现存 **121 个 `auto=True` 片段**（未经人工复核），而 `dataset_v1.json` 的 `label_source` 全是 `'ui'`，分辨不出来。
+
+问题有三：高带精度约 0.99，即约 1% 的错误正样本被当人工真值固化且不可见；「模型替人省了多少」算不出来；历史回读时没有来源信息，旧自动 √ 会显示成人工 √（今天已踩到）。
+
+改动（人工 / 模型两侧对称）：
+
+| 来源 | 正样本 | 负样本 |
+|---|---|---|
+| 人工 | `labels.kept` | `labels.deleted` |
+| 模型 | `labels.auto_kept` | `labels.auto_rejected` |
+
+- `state.update_history_labels` / `get_labels` 增 `auto_kept`（`None` = 本次不改，与 kept/deleted 同语义）
+- `detection._sync_marks` 按 `mark_source` 分流四种标记；历史回读与 `_restore_labels_to_clips` 恢复标记时**带来源**（优先级：人工 × > 人工 √ > 模型 √ > 模型 ×），自动 √ 不再被洗成人工
+- **顺带修掉一个把分流整批撤销的旧调用点**：`clip_action` 的卡片 √/× 落盘以前写的是「所有 keep / 所有 reject」，人工每点一次卡片就把模型自动 √ 洗成人工正样本、把模型自动 × 写进 `deleted`——上一轮的负样本分流其实一直在这里被撤销。现在与 `_sync_marks` 共用同一个出口 `_split_marks_by_source`
+- 重检测时模型标签**不搬旧 ts**（本次检测会重跑复核写新的），只抢救人工标签；`_remap_labels_to_goals` 在**任何返回分支之前**摘掉 `auto_*`——否则"只有模型标签、没有人工标签"的记录会走 `total==0` 的提前返回，原样带着陈旧 ts 进新记录（在训练集里变成该场根本不存在的假正样本）
+- 新增 `state.label_sets(labels)`：导出 / 评估的统一口径 = 人工 ∪ 模型。整场集锦（`_clips_from_record`）与 4 个 eval 脚本全部改走它——只看 kept/deleted 会把模型自动 √ 当"未标注"，评估里变假阴性、整场导出直接丢球
+- `build_dataset.from_history`：正样本取「人工 ∪ 模型」并写 `label_source`（`ui_manual` / `ui_auto`），负样本只取人工。模型自动 √ 默认收进来（正样本不够用）但来源可见，需要严格只用人工时按 `label_source == "ui_manual"` 过滤即可
+- 本次改动之前的记录只有 kept/deleted、无法回溯来源 → 一律记 `ui_manual`，不猜
+
+验证：
+- 单测新增 7 项（来源往返 / `None` 不改 / 重检测丢弃模型标签 / 只有模型标签的记录重检测 / `_sync_marks` 四分 / 恢复带来源 / 卡片点 √ 不撤销分流），并扩了整场导出的并集断言
+- `build_dataset.py --dry-run`：标注池 925 事件，**模型自动 √ 0 条**（旧记录还没产生过 auto_kept），与旧 dataset 的差异（+55）全部来自 `2026.08.31-2nd.mp4`（本会话刚检测完的那场，与本次改动无关）——即本次改动**没有悄悄改变训练集构成**
+- 顺带记录一个待办：那 55 个事件（08.31-2nd 全场的 23 正 / 32 负）还没抽特征、没进训练集，下次训练前一并刷新
+
 ### 2026.09.19 漏检根因修复 + RTX 50 系支持 + Windows 安装程序 + FRAME 线程解码
 
 四项改动，其中前三项相互印证于同一段真实数据（`2026.09.01-1st.mp4`），第四项由耗时拆解驱动。

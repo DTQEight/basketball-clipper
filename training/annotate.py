@@ -450,7 +450,9 @@ def cmd_export(_args):
     hist = _load_history()
     labeled = _load_labels()
     # UI 标注（detection_history.json 的 labels 块）：kept→pos deleted→neg，
-    # 以 (video, ts) 合并，UI 优先（比离线标注新）
+    # 以 (video, ts) 合并，UI 优先（比离线标注新）。
+    # 只取**人工**标签：模型自动 √/×（auto_kept / auto_rejected）刻意不收，
+    # 否则模型自己的判断会被当成"已标注"混进标注结果（见 state.py 来源分流表）
     ui_labels = {}
     for r in hist:
         lab = r.get("labels") or {}

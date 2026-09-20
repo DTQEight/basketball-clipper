@@ -28,10 +28,9 @@ FRACS = (0.05, 0.10, 0.15, 0.20)
 
 
 def labelled(entry):
-    """[(ts, score, is_goal)]，只含已人工标注且有分数的片段。"""
+    """[(ts, score, is_goal)]，只含已标注且有分数的片段（标注取人工 ∪ 模型）。"""
     lab = state.get_labels(entry["video"])
-    kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
-    dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
+    kept, dele = state.label_sets(lab)
     out = []
     for c in entry["clips"]:
         ts = round(float(c["ts"]), 3)

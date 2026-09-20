@@ -25,8 +25,9 @@ if rec is None:
     sys.exit(1)
 video = rec["video"]
 labels = state.get_labels(video)
-kept = {round(float(t), 3) for t in (labels.get("kept") or [])}
-deleted = {round(float(t), 3) for t in (labels.get("deleted") or [])}
+# 线上口径：人工 √/× ∪ 模型自动 √/×。只看 kept/deleted 会把模型自动 √ 当"未标注"，
+# 在评估里直接变成假阴性（见 services/state.py 的 label_sets）
+kept, deleted = state.label_sets(labels)
 print(f"视频: {video}")
 print(f"标签时间: {labels.get('label_time')}  √={len(kept)}  ×={len(deleted)}  "
       f"未标={len(rec.get('goals', [])) - len(kept) - len(deleted)}")

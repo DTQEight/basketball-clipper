@@ -712,22 +712,33 @@ def _find_history_record(records, video_path):
 
 
 def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None,
-                          auto_rejected_ts_list=None):
-    """对已有历史记录打/更新人工标签（加写锁防与 add_history 全量写竞态）。"""
+                          auto_rejected_ts_list=None, auto_kept_ts_list=None):
+    """对已有历史记录打/更新标签（加写锁防与 add_history 全量写竞态）。"""
     with _history_io_lock:
         return _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list,
-                                           person_map, auto_rejected_ts_list)
+                                           person_map, auto_rejected_ts_list,
+                                           auto_kept_ts_list)
 
 
 def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, person_map=None,
-                               auto_rejected_ts_list=None):
-    """对已有历史记录打/更新人工确认标签（增量写，不重建整条记录，不会丢检测元信息）。
+                               auto_rejected_ts_list=None, auto_kept_ts_list=None):
+    """对已有历史记录打/更新标签（增量写，不重建整条记录，不会丢检测元信息）。
 
-    √ 确认 → kept_ts_list（正样本），× 误报 → deleted_ts_list（负样本）。
-    auto_rejected_ts_list：**模型**判为误报的低分片段，单独存 labels["auto_rejected"]，
-    刻意不混进 deleted——deleted 是人工负样本，训练集（build_dataset.py）直接读它，
-    把机器判断混进去会形成"模型自己判×→自己学"的闭环，且会让某个漏判的难例
-    被永久固化成负样本。
+    **正负样本都按来源分流**，人工与模型各存各的：
+
+    | 来源 | 正样本 | 负样本 |
+    |---|---|---|
+    | 人工 | `kept` | `deleted` |
+    | 模型 | `auto_kept`（高带自动 √） | `auto_rejected`（低带自动 ×） |
+
+    合并存的问题：训练集（`build_dataset.py`）直接读 `kept`/`deleted`，等于把模型
+    自己的判断当人工真值——高带精度约 0.99，即约 1% 的错误正样本被固化成"真进球"，
+    而且完全不可见（`label_source` 分不出来）、「模型替人省了多少」也算不出来；
+    负样本侧还会形成"模型自己判×→自己学"的闭环。故两侧一律分流。
+
+    auto_* 为 None 表示本次不改该字段（与 kept/deleted 同语义）。
+    本次改动之前写入的记录只有 kept/deleted，无法回溯区分来源，一律按人工处理——不猜。
+
     person_map: {进球ts: 人物名} 增量合并进 labels["persons"]；值为 "" 清除该 ts
     的分类；None 表示本次不改人物分类。
     找不到对应记录时返回 False；写入磁盘成功返回 True。
@@ -751,6 +762,9 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
     if auto_rejected_ts_list is not None:
         labels["auto_rejected"] = sorted({round(float(t), 3)
                                           for t in auto_rejected_ts_list})
+    if auto_kept_ts_list is not None:
+        labels["auto_kept"] = sorted({round(float(t), 3)
+                                      for t in auto_kept_ts_list})
     if person_map is not None:
         # JSON 对象键只能是字符串：存 str(round(ts,3))，读取方（get_labels）转回 float
         persons = {str(k): v for k, v in (labels.get("persons") or {}).items()
@@ -773,9 +787,11 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
 def get_labels(video_path):
     """读取某视频的已保存标签。
 
-    返回 {"kept": list|None, "deleted": list|None, "label_time": str|None,
+    返回 {"kept": list|None, "deleted": list|None, "auto_kept": list|None,
+          "auto_rejected": list|None, "label_time": str|None,
           "persons": {float ts: 人物名}}。
-    找不到记录 / 无标签时返回 None 字段。
+    kept/deleted = 人工标签，auto_kept/auto_rejected = 模型自动判定（见
+    _update_history_labels_impl 的来源分流表）。找不到记录 / 无标签时返回 None 字段。
 
     瞬态 IO 错误（Windows 文件共享冲突）时额外重试：load_history 内置 3 次
     短重试仍可能不足（文件被 update_history_labels 的原子写占用），此处再补
@@ -793,10 +809,12 @@ def get_labels(video_path):
     if records is None:
         logging.getLogger("state").warning(
             f"[WARN] get_labels 读取历史失败（{last_err}），本次不回填标记")
-        return {"kept": None, "deleted": None, "label_time": None, "persons": {}}
+        return {"kept": None, "deleted": None, "auto_kept": None,
+                "auto_rejected": None, "label_time": None, "persons": {}}
     hit_idx = _find_history_record(records, video_path)
     if hit_idx is None:
-        return {"kept": None, "deleted": None, "label_time": None, "persons": {}}
+        return {"kept": None, "deleted": None, "auto_kept": None,
+                "auto_rejected": None, "label_time": None, "persons": {}}
     lab = records[hit_idx].get("labels") or {}
     # persons 键是 JSON 字符串（存盘时 str(round(ts,3))），转回 float 供精确匹配
     persons = {}
@@ -807,9 +825,26 @@ def get_labels(video_path):
             continue
     return {"kept": list(lab["kept"]) if "kept" in lab else None,
             "deleted": list(lab["deleted"]) if "deleted" in lab else None,
+            "auto_kept": list(lab["auto_kept"]) if "auto_kept" in lab else None,
             "auto_rejected": list(lab["auto_rejected"]) if "auto_rejected" in lab else None,
             "label_time": lab.get("label_time"),
             "persons": persons}
+
+
+def label_sets(labels: dict):
+    """从 labels 字典取出 (positive_ts, negative_ts)：**人工 ∪ 模型**。
+
+    线上卡片就是这个口径：人工 √/× 与模型 auto_kept/auto_rejected 都呈现为 √/×，
+    导出与评估必须一致——只看 kept/deleted 会把模型自动 √ 当成"未标注"，在评估
+    里直接变成假阴性、在整场导出里直接丢球。
+
+    需要**严格只用人工标签**时（重建训练集）请显式只取 kept/deleted，
+    `training/build_dataset.py` 就是这么做的，并靠来源打标区分。
+    """
+    def _s(key):
+        return {round(float(t), 3) for t in (labels.get(key) or [])}
+
+    return _s("kept") | _s("auto_kept"), _s("deleted") | _s("auto_rejected")
 
 
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
@@ -879,10 +914,18 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
 
     Returns:
         (remapped_labels, matched, total)：
-        - remapped_labels: kept/deleted 已换成新 ts 的 labels（原样保留其他键）
+        - remapped_labels: kept/deleted/persons 已换成新 ts 的 labels（其他键原样保留，
+          但 auto_kept / auto_rejected 一律丢弃——见函数开头的说明）
         - matched/total: 匹配到新进球的旧标签数 / 旧标签总数（调用方按匹配率决策）
     """
     kept = [float(t) for t in (labels.get("kept") or [])]
+    # 模型标签（auto_kept / auto_rejected）不跨检测搬运：重检测本身会再跑一遍
+    # 复核并把新的 auto_* 写进新记录（run_detect 末尾的 _sync_marks），把旧 ts 映射
+    # 过去只会得到"模型对旧片段的判断贴在陌生片段上"，还会与新一轮的标签混在一起。
+    # 必须在任何 return 分支之前摘掉——"只有模型标签、没有人工标签"的记录会走
+    # 下面的 total==0 提前返回，原样带着陈旧 ts 进新记录
+    labels = {k: v for k, v in labels.items()
+              if k not in ("auto_kept", "auto_rejected")}
     deleted = [float(t) for t in (labels.get("deleted") or [])]
     persons = {}
     for k, v in (labels.get("persons") or {}).items():

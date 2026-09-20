@@ -61,8 +61,7 @@ def collect():
     out = []
     for entry in CACHE:
         lab = state.get_labels(entry["video"])
-        kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
-        dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
+        kept, dele = state.label_sets(lab)   # 人工 ∪ 模型（见 state.label_sets）
         rows = [c for c in entry["clips"]
                 if round(float(c["ts"]), 3) in kept | dele and c.get("score") is not None]
         if rows:

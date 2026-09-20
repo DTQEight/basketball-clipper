@@ -268,6 +268,25 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 
 # ============ 检测 ============
 
+def _split_marks_by_source(clips):
+    """把片段标记按**来源**分成 4 组 ts，返回 (人工√, 人工×, 模型√, 模型×)。
+
+    落盘口径的唯一出口：人工 √/× 进 kept/deleted（训练集读它），模型自动 √/× 进
+    auto_kept/auto_rejected。任何"把 clips 上的 mark 写回历史"的地方都必须走这里
+    ——少一处就会相互撤销：人工点一次卡片就把模型的判断洗成人工标签（正样本自证），
+    或把模型判的 × 混进 deleted（负样本闭环）。
+
+    人工侧用 `!= "auto"` 而不是 `== "manual"`：极少数老片段没有 mark_source，
+    宁可算人工，也不能让它两侧都不落被凭空丢掉。
+    """
+    def _ts(mark, auto):
+        return [c["ts"] for c in clips
+                if c.get("mark") == mark
+                and (c.get("mark_source") == "auto") is auto]
+
+    return _ts("keep", False), _ts("reject", False), _ts("keep", True), _ts("reject", True)
+
+
 def _sync_marks(video_path, clips):
     """自动标记之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
 
@@ -275,8 +294,7 @@ def _sync_marks(video_path, clips):
       完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
     - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
       clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
-    - 负样本按来源分流：人工 × 进 deleted（训练集读它），模型 × 进 auto_rejected。
-      混在一起会形成"模型自己判×→自己学"的闭环（详见 state.py 的说明）
+    - 正负样本都按来源分流（见 _split_marks_by_source）
     返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
     """
     marks = [c.get("mark") for c in clips]
@@ -284,15 +302,13 @@ def _sync_marks(video_path, clips):
     n_reject = sum(1 for m in marks if m == "reject")
     state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
                                if (n_keep or n_reject) else set(range(len(clips))))
-    manual_rej = [c["ts"] for c in clips
-                  if c.get("mark") == "reject" and c.get("mark_source") == "manual"]
-    auto_rej = [c["ts"] for c in clips
-                if c.get("mark") == "reject" and c.get("mark_source") == "auto"]
+    manual_keep, manual_rej, auto_keep, auto_rej = _split_marks_by_source(clips)
     try:
         state.update_history_labels(
             video_path,
-            kept_ts_list=[c["ts"] for c in clips if c.get("mark") == "keep"],
+            kept_ts_list=manual_keep,
             deleted_ts_list=manual_rej,
+            auto_kept_ts_list=auto_keep,
             auto_rejected_ts_list=auto_rej,
         )
     except Exception as e:
@@ -1126,20 +1142,23 @@ def clip_action(action, idx, video_path=None, person=None):
         # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）
         kept.clear()
         kept.update(i for i, c in enumerate(clips) if c.get("mark") == "keep")
-        # 标签飞轮：√ → kept_ts_list（正样本），× → deleted_ts_list（负样本）
-        kept_ts = [c["ts"] for c in clips if c.get("mark") == "keep"]
-        reject_ts = [c["ts"] for c in clips if c.get("mark") == "reject"]
+        # 标签飞轮：**按来源分流**（与 _sync_marks 同一个出口）。这里以前把
+        # 「所有 keep / 所有 reject」整批写回，于是人工每点一次卡片就会撤销分流：
+        # 模型自动 √ 被洗成人工正样本，模型自动 × 被写进 deleted（负样本闭环）
+        manual_keep, manual_rej, auto_keep, auto_rej = _split_marks_by_source(clips)
         try:
             state.update_history_labels(
                 video_path if video_path else state.video_state["path"],
-                kept_ts_list=kept_ts,
-                deleted_ts_list=reject_ts,
+                kept_ts_list=manual_keep,
+                deleted_ts_list=manual_rej,
+                auto_kept_ts_list=auto_keep,
+                auto_rejected_ts_list=auto_rej,
             )
         except Exception:
             pass
         sym = {"keep": "√ 确认", "reject": "× 误报"}.get(clip["mark"], "已取消标记")
-        n_keep = len(kept_ts)
-        n_reject = len(reject_ts)
+        n_keep = len(manual_keep) + len(auto_keep)
+        n_reject = len(manual_rej) + len(auto_rej)
         msg = (f"第 {idx+1} 个片段（{ts:.1f}s）{sym} | "
                f"√ {n_keep} · × {n_reject} · 待标 {len(clips) - n_keep - n_reject}")
         return None, msg
@@ -1341,10 +1360,13 @@ def _clips_from_record(r):
 
     整场导出只需要进球时间戳 + 标记 + 人物分类，不需要预览片段文件；
     直接从记录的 goals + labels 重建，避免逐视频跑 ffmpeg。
+
+    正负样本都取**人工 ∪ 模型**（`state.label_sets`）：单视频路径里模型自动 √ 也是 √
+    （卡片绿标、参与"有 √ 只导 √"），整场导出必须同口径，否则同一批球单场有、整场没有。
+    （历史遗留数据里同一 ts 可能同时落在 √/× 两侧，沿用原有优先级：√ 先判。）
     """
     labels = r.get("labels") or {}
-    kept = {float(t) for t in (labels.get("kept") or [])}
-    deleted = {float(t) for t in (labels.get("deleted") or [])}
+    kept, deleted = state.label_sets(labels)
     persons = {}
     for k, v in (labels.get("persons") or {}).items():
         try:
@@ -1620,17 +1642,25 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
         c.pop("mark_source", None)
         c.pop("person", None)
 
-    # 若历史里已有人工标签（kept=√ / deleted=× / persons=人物分类），恢复而非清空
+    # 若历史里已有标签（人工 kept=√ / deleted=×，模型 auto_kept / auto_rejected，
+    # persons=人物分类），恢复而非清空。**来源要一并恢复**：模型自动 √ 不能被当成
+    # 人工 √（否则重读一次历史就把模型的判断洗成人工标签，再回灌训练集）
     labels = state.get_labels(video_path)
     deleted_set = set(labels["deleted"]) if labels.get("deleted") else set()
     kept_set = set(labels["kept"]) if labels.get("kept") else set()
+    auto_kept_set = set(labels["auto_kept"]) if labels.get("auto_kept") else set()
+    auto_rej_set = set(labels["auto_rejected"]) if labels.get("auto_rejected") else set()
     persons_map = labels.get("persons") or {}
     log.info(f"[LOAD] labels: kept={len(kept_set)} deleted={len(deleted_set)} "
+             f"auto_kept={len(auto_kept_set)} auto_rejected={len(auto_rej_set)} "
              f"persons={len(persons_map)} label_time={labels.get('label_time')}")
-    if deleted_set or kept_set:
+    if kept_set or deleted_set or auto_kept_set or auto_rej_set:
         kept_indices = []
         n_match_keep = 0
         n_match_reject = 0
+        n_auto = 0
+        # 优先级：人工 × > 人工 √ > 模型 √ > 模型 ×。跨轮次留下的陈旧标签可能
+        # 同时命中两个集合（如某 ts 早先被模型判 ×、后来人工改成 √），人工优先
         for idx, c in enumerate(state.last_goal_clips):
             ts = round(float(c["ts"]), 3)
             if ts in deleted_set:
@@ -1642,9 +1672,21 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
                 c["mark_source"] = "manual"
                 kept_indices.append(idx)
                 n_match_keep += 1
+            elif ts in auto_kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "auto"
+                c["auto"] = True
+                kept_indices.append(idx)
+                n_auto += 1
+            elif ts in auto_rej_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "auto"
+                c["auto_reject"] = True
+                n_auto += 1
         state.kept_goal_indices = set(kept_indices)
         log.info(f"[LOAD] matched: keep={n_match_keep} reject={n_match_reject} "
-                 f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject})")
+                 f"auto={n_auto} "
+                 f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject - n_auto})")
     else:
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
     # 人物分类回填（键为 round(ts,3) 精确匹配，与 mark 回填同一口径）
@@ -1738,13 +1780,17 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
         labels = None
     deleted_set = set()
     kept_set = set()
+    auto_kept_set = set()
+    auto_rej_set = set()
     persons_map = {}
     if labels:
         deleted_set = {float(t) for t in (labels.get("deleted") or [])}
         kept_set = {float(t) for t in (labels.get("kept") or [])}
+        auto_kept_set = {float(t) for t in (labels.get("auto_kept") or [])}
+        auto_rej_set = {float(t) for t in (labels.get("auto_rejected") or [])}
         persons_map = labels.get("persons") or {}
     kept_idx = []
-    has_marks = bool(deleted_set or kept_set)
+    has_marks = bool(deleted_set or kept_set or auto_kept_set or auto_rej_set)
     for idx, c in enumerate(clips):
         ts = round(float(c["ts"]), 3)
         manual = c.get("mark_source") == "manual" and c.get("mark") in ("keep", "reject")
@@ -1755,6 +1801,7 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
         else:
             c["mark"] = None
             c["mark_source"] = None
+            # 与 _on_load_history_impl 同口径、同优先级（人工 > 模型）
             if ts in deleted_set:
                 c["mark"] = "reject"
                 c["mark_source"] = "manual"
@@ -1762,6 +1809,15 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
                 c["mark"] = "keep"
                 c["mark_source"] = "manual"
                 kept_idx.append(idx)
+            elif ts in auto_kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "auto"
+                c["auto"] = True
+                kept_idx.append(idx)
+            elif ts in auto_rej_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "auto"
+                c["auto_reject"] = True
         # 人物分类独立回填：已有保留、缺失才补历史值
         if not c.get("person") and persons_map.get(ts):
             c["person"] = persons_map[ts]

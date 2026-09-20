@@ -31,8 +31,7 @@ if e is None:
 v = e["video"]
 print(f"视频: {v}")
 lab = state.get_labels(v)
-kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
-dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
+kept, dele = state.label_sets(lab)   # 人工 ∪ 模型（见 state.label_sets）
 
 y, s = [], []
 skipped = 0

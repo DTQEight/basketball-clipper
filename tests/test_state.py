@@ -363,6 +363,124 @@ class TestHistory:
         # 空 labels → 全部无标记
         clips = detection._clips_from_record({"goals": [5.0]})
         assert clips == [{"ts": 5.0, "mark": None, "person": None}]
+        # 模型自动 √/× 与人工同口径：只看 kept/deleted 会让自动 √ 的球整场丢失
+        clips = detection._clips_from_record(
+            {"goals": [10.0, 20.0],
+             "labels": {"auto_kept": [10.0], "auto_rejected": [20.0]}})
+        assert [c["mark"] for c in clips] == ["keep", "reject"]
+
+    def test_auto_labels_split_by_source(self, state_mod):
+        """正负样本都按来源分流：人工 kept/deleted、模型 auto_kept/auto_rejected。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0, 30.0, 40.0])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0], deleted_ts_list=[20.0],
+            auto_kept_ts_list=[30.0], auto_rejected_ts_list=[40.0])
+        labels = state_mod.get_labels("/a.mp4")
+        assert labels["kept"] == [10.0] and labels["deleted"] == [20.0]
+        assert labels["auto_kept"] == [30.0] and labels["auto_rejected"] == [40.0]
+        # 线上口径（卡片 / 导出 / 评估）= 人工 ∪ 模型
+        pos, neg = state_mod.label_sets(labels)
+        assert pos == {10.0, 30.0}
+        assert neg == {20.0, 40.0}
+
+    def test_auto_labels_kept_when_none(self, state_mod):
+        """auto_* 传 None 表示不改：人工打标不得把模型判定抹掉。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 30.0])
+        state_mod.update_history_labels("/a.mp4", kept_ts_list=None,
+                                        deleted_ts_list=None,
+                                        auto_kept_ts_list=[30.0])
+        # 之后用户只在卡片上点了人工 √（不传 auto_*）
+        state_mod.update_history_labels("/a.mp4", kept_ts_list=[10.0],
+                                        deleted_ts_list=None)
+        labels = state_mod.get_labels("/a.mp4")
+        assert labels["kept"] == [10.0]
+        assert labels["auto_kept"] == [30.0]
+
+    def test_auto_labels_dropped_on_redetect(self, state_mod):
+        """重检测：人工标签按容差重映射抢救，模型标签丢弃（本次检测会重新写）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        state_mod.update_history_labels("/a.mp4", kept_ts_list=[10.0],
+                                        deleted_ts_list=None,
+                                        auto_kept_ts_list=[20.0])
+        rec = state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.05, 20.1])
+        assert rec is not None and "labels" in rec
+        assert rec["labels"]["kept"] == [10.05]       # 人工标签跟着新 ts
+        assert "auto_kept" not in rec["labels"]       # 模型标签不搬旧 ts
+
+    def test_auto_only_record_drops_model_labels_on_redetect(self, state_mod):
+        """只有模型标签、没有任何人工标签的记录（用户一次都没点过）：
+        重检测不得把陈旧 ts 的 auto_kept 搬进新记录（会产出场次里不存在的假正样本）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        state_mod.update_history_labels("/a.mp4", kept_ts_list=[], deleted_ts_list=[],
+                                        auto_kept_ts_list=[10.0, 20.0])
+        rec = state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.05, 20.1])
+        assert rec is not None and "labels" in rec
+        assert "auto_kept" not in rec["labels"]
+        assert rec["labels"]["kept"] == []
+
+    def test_sync_marks_splits_by_source(self, state_mod, monkeypatch, tmp_path):
+        """_sync_marks：人工 √/× 与模型自动 √/× 分开落盘（不再混进 kept/deleted）。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0, 2.0, 3.0, 4.0])
+        clips = [{"ts": 1.0, "mark": "keep", "mark_source": "manual"},
+                 {"ts": 2.0, "mark": "reject", "mark_source": "manual"},
+                 {"ts": 3.0, "mark": "keep", "mark_source": "auto"},
+                 {"ts": 4.0, "mark": "reject", "mark_source": "auto"}]
+        n_keep, n_reject = detection._sync_marks(vp, clips)
+        assert (n_keep, n_reject) == (2, 2)
+        labels = state_mod.get_labels(vp)
+        assert labels["kept"] == [1.0] and labels["deleted"] == [2.0]
+        assert labels["auto_kept"] == [3.0] and labels["auto_rejected"] == [4.0]
+        # 自动 √ 仍算 √（导出集锦只导 √）
+        assert state_mod.kept_goal_indices == {0, 2}
+
+    def test_restore_labels_keeps_source(self, state_mod, monkeypatch, tmp_path):
+        """批量回看恢复标记必须带来源：模型自动 √ 不能被洗成人工 √。"""
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0, 2.0, 3.0, 4.0])
+        state_mod.update_history_labels(vp, kept_ts_list=[1.0], deleted_ts_list=[2.0],
+                                        auto_kept_ts_list=[3.0],
+                                        auto_rejected_ts_list=[4.0])
+        clips = [{"ts": 1.0}, {"ts": 2.0}, {"ts": 3.0}, {"ts": 4.0}]
+        kept_idx, has_marks = detection._restore_labels_to_clips(clips, vp)
+        assert has_marks is True
+        assert [c["mark"] for c in clips] == ["keep", "reject", "keep", "reject"]
+        assert [c["mark_source"] for c in clips] == ["manual", "manual", "auto", "auto"]
+        assert kept_idx == {0, 2}
+
+    def test_clip_action_mark_splits_by_source(self, state_mod, monkeypatch, tmp_path):
+        """回归：人工点 √ 时不得撤销来源分流。
+
+        旧实现在这里把「所有 keep / 所有 reject」整批写回 kept/deleted——人工每点
+        一次卡片，模型自动 √ 就被洗成人工正样本、模型自动 × 被写进 deleted。
+        """
+        from services import detection
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0, 2.0, 3.0])
+        state_mod.update_history_labels(vp, kept_ts_list=None, deleted_ts_list=None,
+                                        auto_kept_ts_list=[3.0],
+                                        auto_rejected_ts_list=[2.0])
+        state_mod.video_state["path"] = vp
+        state_mod.kept_goal_indices = {0, 1, 2}
+        state_mod.last_goal_clips = [
+            {"ts": 1.0, "path": "p", "idx": 0},                      # 等人工判定
+            {"ts": 2.0, "path": "p", "idx": 1, "mark": "reject",
+             "mark_source": "auto", "auto_reject": True},
+            {"ts": 3.0, "path": "p", "idx": 2, "mark": "keep",
+             "mark_source": "auto", "auto": True},
+        ]
+        _, msg = detection.clip_action("mark_keep", 0)
+        labels = state_mod.get_labels(vp)
+        assert labels["kept"] == [1.0]           # 人工 √ 单独一格
+        assert labels["deleted"] == []           # 模型 × 不得被写进 deleted
+        assert labels["auto_kept"] == [3.0]      # 模型 √ 留在 auto_kept
+        assert labels["auto_rejected"] == [2.0]
+        assert "√ 2 · × 1" in msg                # 提示里的计数仍含模型判定
 
     def test_fullgame_collects_sources_across_videos(self, state_mod, monkeypatch, tmp_path):
         """整场导出：跨视频收集同一人物片段，按文件名顺序传给剪辑器。"""
