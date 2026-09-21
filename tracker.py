@@ -37,7 +37,8 @@ class GoalDetector:
                  min_circularity=0.35,
                  min_in_hoop_frames=2,
                  auto_threshold=True,
-                 fps=30.0):
+                 fps=30.0,
+                 yolo_probe=None):
         """
         hoop_box: (x1, y1, x2, y2) 篮筐框
         baseline_frame: 基准帧（无球的篮筐画面）BGR，None 则用第一帧
@@ -71,6 +72,14 @@ class GoalDetector:
         fps: 视频帧率（默认 30）。内部所有"按秒定义"的时间窗口
              （上方状态保持 1.5s / YOLO 时间窗 ±0.34s）按 fps 换算成帧数，
              避免硬编码帧数在 60fps 视频上窗口减半、15fps 上翻倍。
+        yolo_probe: 两段式兜底的「备用档」补检回调 `fn(frame, frame_idx) -> 球框列表 | None`
+            默认档（如裁剪推理）在整窗内没有任何球证据、判定即将否决时，
+            用它补检一次；命中则把证据写入 ball_pos_history（本帧按 confirmed 处理）。
+            None = 关闭兜底，行为与旧版完全一致。
+            设计原因（2026.09.21 实测）：裁剪档在真球帧上会被系统性压低（整窗一帧都不过
+            阈值的事件才会漏球，如 08.31-3rd 的 449.16s），而全局换备用档要付
+            +14.5% 检测耗时的代价；只对「即将被否决」的轨迹补检，效果同全局换档、
+            成本只花在少数边缘轨迹上。
         """
         self.hoop_x1, self.hoop_y1, self.hoop_x2, self.hoop_y2 = [int(v) for v in hoop_box]
         self.hoop_cx = (self.hoop_x1 + self.hoop_x2) / 2
@@ -91,6 +100,12 @@ class GoalDetector:
         self.rolling_baseline_sec = float(rolling_baseline_sec)  # 滚动基准帧间隔
         self.min_circularity = float(min_circularity)  # 最小圆形度（形状过滤）
         self.min_in_hoop_frames = int(min_in_hoop_frames)  # 宽松模式最小进框帧数
+
+        # 两段式兜底（备用档补检）：见 __init__ docstring 的 yolo_probe
+        self.yolo_probe = yolo_probe
+        self._cur_frame = None        # 当前帧 BGR（供补检使用）
+        self._cur_frame_idx = -1
+        self._last_probe_frame = -1   # 补检去重：每帧最多一次
 
         # 自适应阈值：预热期收集 P95，结束时自动计算 diff_threshold
         self.auto_threshold = bool(auto_threshold)
@@ -166,6 +181,8 @@ class GoalDetector:
             "timeout_goal": 0,     # 超时匹配成功
             "yolo_confirmed": 0,   # YOLO 双确认成功
             "yolo_rejected": 0,    # YOLO 双确认失败（diff 触发但 YOLO 没球）
+            "probe_called": 0,     # 备用档补检次数（两段式兜底）
+            "probe_confirmed": 0,  # 备用档补检命中并救回判定的次数
             "baseline_updates": 0, # 滚动基准帧更新次数
         }
 
@@ -358,6 +375,10 @@ class GoalDetector:
 
         if frame is None:
             return None
+
+        # 保存当前帧供「备用档补检」使用（两段式兜底；未装配 probe 时无任何开销）
+        self._cur_frame = frame
+        self._cur_frame_idx = frame_idx
 
         # 首帧自动设为基准（如果未设置）
         if self.baseline_gray is None:
@@ -629,24 +650,62 @@ class GoalDetector:
         # y 整体增加（向下）且至少下降 5 像素（放宽，适配斜向运动）
         return (ys[-1] - ys[0]) > 5
 
+    def _probe_missing_yolo(self, frame_idx):
+        """两段式兜底：默认档整窗无球证据时，用备用档在当前帧补检一次。
+
+        返回是否写入了新证据。**每帧最多补检一次**（_last_probe_frame 去重，
+        避免同一轨迹连续多帧反复推理），且只在 yolo_probe 已装配时生效——
+        未装配时本方法恒返回 False，判定行为与旧版逐字节一致。
+
+        写入的历史项与 feed 同格式 (frame_idx, cx, cy)，因此补检命中后，
+        本帧以及时间窗内后续帧的 _check_yolo_near_hoop 都会看到它。
+        """
+        if self.yolo_probe is None or self._cur_frame is None:
+            return False
+        if self._last_probe_frame == frame_idx:
+            return False
+        self._last_probe_frame = frame_idx
+        self.diag["probe_called"] += 1
+        try:
+            balls = self.yolo_probe(self._cur_frame, frame_idx)
+        except Exception:
+            # 补检是兜底路径，失败不能影响主判定（主判定此时已是"否决"）
+            return False
+        if not balls:
+            return False
+        for _bp in balls:
+            self.ball_pos_history.append((frame_idx, _bp[0], _bp[1]))
+        return True
+
     def _check_yolo_near_hoop(self):
         """检查 YOLO 历史中，篮筐附近是否有球。
 
-        返回: (有球: bool, 用于诊断: 'confirmed'/'rejected'/'skipped')
+        返回: (有球: bool, 用于诊断: 'confirmed'/'probe'/'rejected'/'skipped')
 
         接受范围按篮筐框外扩，且**向下额外放宽**：进球是单向过程，球必定
         穿过筐口落到下方，实测漏检样本的球心落在筐下 ~97px、筐左 ~92px，
         原先四周统一 1.0 倍外扩刚好把它们挡在外面（差 10~27px），导致
         真实进球被硬否决。横向 1.5 倍、向下 2.0 倍可覆盖该偏移。
+
+        整窗没球时先走一次「备用档补检」（见 _probe_missing_yolo）：默认档
+        （裁剪@640）会系统性压低真球置信度，整窗一帧都不过阈值的事件才会漏球
+        （如 2026.08.31-3rd 的 449.16s）；补检命中则本帧按 confirmed 记账。
         """
         if not self.yolo_confirm:
             return True, "skipped"
         x_lo, y_lo, x_hi, y_hi = self.yolo_accept_box()
-        has_ball = any(
-            x_lo <= bx <= x_hi and y_lo <= by <= y_hi
-            for (_, bx, by) in self.ball_pos_history
-        )
-        return has_ball, "confirmed" if has_ball else "rejected"
+
+        def _has_ball():
+            return any(x_lo <= bx <= x_hi and y_lo <= by <= y_hi
+                       for (_, bx, by) in self.ball_pos_history)
+
+        if _has_ball():
+            return True, "confirmed"
+        if self._probe_missing_yolo(self._cur_frame_idx):
+            if _has_ball():
+                self.diag["probe_confirmed"] += 1
+                return True, "probe"
+        return False, "rejected"
 
     def yolo_accept_box(self):
         """YOLO 证据的接受框 (x_lo, y_lo, x_hi, y_hi)，整帧坐标。

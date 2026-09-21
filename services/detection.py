@@ -296,8 +296,31 @@ def _ball_boxes_from_result(res):
 #   · 单次推理像素量降到约 1/4（1280² → 640²）
 #   · 球在输入里约 22-33px，比整帧 1280 路径（13-20px）更大，小目标检出率不牺牲
 #   · 区域外的误报天然落在输入之外，是 argmax 修复之外的第二道保险
+# 2026.09.21 修正：上述「裁剪」在真球帧上是**系统性削弱**，不是偶发。同帧同权重对比
+# （4 场 / 80 个真球 / 518 个「整帧认得出而裁剪认不出」的真硬帧）：
+#   · 真裁剪@640          硬帧命中 0%     正常帧 180/180      单次 ~22ms
+#   · 抹黑画布@640        硬帧命中 64%    正常帧坏 34%        ~22ms
+#   · 抹黑画布@1280       硬帧命中 93%    正常帧仅坏 6%       ~45ms
+# 两个坏处各占一半：裁剪把球放大到 ~22px 但画布变成竖版小图（488×583，训练分布是 16:9）；
+# 抹黑@640 几何对但 1920→640 后球只剩 ~6.7px。
+#
+# 但**全局换抹黑@1280 不划算**（库里 5 场 A/B，2026.09.21）：召回净 +1 个真球（±1.5s
+# 102→103）、误报持平，代价是检测耗时 +14.5%、候选 +13%。原因是事件级召回对单帧分数
+# 不敏感——状态机只要窗口里有**一帧**过阈值就够了，只有「整窗一帧都没过」的事件才会漏
+# （08.31-3rd 的 449.16s 就是这种）。
+# 故采用**两段式**：默认仍走裁剪@640；只在某条轨迹即将被 YOLO 硬否决（整窗无球证据）时，
+# 用 YOLO_PROBE_MODE 的档位在当前帧补检一次（见 GoalDetector.yolo_probe）。
 YOLO_CROP_MARGIN = 0.2    # 接受框再外扩 20%；<=0 表示整帧推理（旧行为，仅供对照）
-YOLO_IMGSZ_CROP = 640     # 裁剪推理的输入尺寸（缩放 ~1.1，球 ~22-33px）
+YOLO_INPUT_MODE = 'crop'  # 'crop' 真裁剪（默认）/ 'mask' 抹黑画布 / 'full' 整帧
+YOLO_PROBE_MODE = 'mask'  # 两段式兜底档：整窗无证据时用它补检；None/'' = 关闭兜底
+# 补检证据的置信度门槛：只有 ≥ 该值才写进 tracker 历史（低分证据一律丢弃）。
+# 依据（2026.09.21 两段式首轮 A/B）：补检命中 525 次只救回 4 个候选（08.31-3rd ✓），
+# 但在密集出手的 09.04-2nd 上命中 36 次却多带 27 个候选、且扰乱了状态机时序
+# （真球 492.84 被复位掉）。真球在抹黑@1280 下的分通常 0.7+（449.16 那 6 帧 0.48~0.87），
+# 故用 0.5 把"模型自己也不确定"的补检证据挡在门外。
+YOLO_PROBE_CONF = 0.5
+YOLO_IMGSZ_MASK = 1280    # 抹黑画布推理的输入尺寸（球 ~13-20px，与整帧路径同量级）
+YOLO_IMGSZ_CROP = 640     # 真裁剪推理的输入尺寸（缩放 ~1.1，球 ~22-33px）
 YOLO_IMGSZ_FULL = 1280    # 整帧推理的输入尺寸
 
 
@@ -329,13 +352,41 @@ def _yolo_input_box(accept_box, frame_shape, margin=None):
     return x1, y1, x2, y2
 
 
-def _yolo_input(frame, detector):
-    """返回 (待推理图, x 偏移, y 偏移, imgsz)。裁剪关闭时返回整帧。"""
+def _filter_probe_balls(balls, min_conf=None):
+    """补检证据的置信度过滤（纯函数，便于单测）。
+
+    min_conf 默认 None = 取模块常量 YOLO_PROBE_CONF（**不要写成默认参数值**，同 margin）。
+    低于门槛的补检证据一律丢弃：它会让状态机把「本来该否决」的轨迹按通过处理，
+    实测（2026.09.21）在密集出手的场次会多带大量候选、并把真球的时序复位掉。
+    """
+    c = float(YOLO_PROBE_CONF if min_conf is None else min_conf)
+    return [b for b in (balls or ()) if b[6] >= c]
+
+
+def _yolo_input(frame, detector, mode=None):
+    """返回 (待推理图, x 偏移, y 偏移, imgsz)。
+
+    mode 默认 None = 取模块常量 YOLO_INPUT_MODE（**不要写成默认参数值**，同 margin）：
+      'mask' 抹黑画布：整帧画布不动，只把输入框外抹黑；偏移恒为 0（坐标无需换算）
+      'crop' 真裁剪：切出输入框，偏移为框左上角（球被放大但画布变竖版小图，实测硬帧命中 0%）
+      'full' 整帧：不做任何处理
+    输入框由 `_yolo_input_box(accept_box, frame_shape)` 决定，退化（margin<=0 或框无效）时整帧。
+    """
+    m = YOLO_INPUT_MODE if mode is None else str(mode)
+    if m == 'full':
+        return frame, 0, 0, YOLO_IMGSZ_FULL
     box = _yolo_input_box(detector.yolo_accept_box(), frame.shape)
     if box is None:
         return frame, 0, 0, YOLO_IMGSZ_FULL
     x1, y1, x2, y2 = box
-    return frame[y1:y2, x1:x2], x1, y1, YOLO_IMGSZ_CROP
+    if m == 'crop':
+        return frame[y1:y2, x1:x2], x1, y1, YOLO_IMGSZ_CROP
+    masked = frame.copy()
+    masked[:y1, :] = 0
+    masked[y2:, :] = 0
+    masked[:, :x1] = 0
+    masked[:, x2:] = 0
+    return masked, 0, 0, YOLO_IMGSZ_MASK
 
 
 def _shift_balls_to_frame(balls, ox, oy):
@@ -613,6 +664,39 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goals.clear()
             return "❌ 无法从模型类别表识别球类别（model.names 异常），请检查权重文件", False
 
+        # ===== 两段式兜底：装配「备用档补检」 =====
+        # 只在某条轨迹即将被 YOLO 硬否决（整窗无球证据）时补检一次，命中即把证据
+        # 写进 tracker 历史（见 YOLO_PROBE_MODE 与 GoalDetector.yolo_probe 的说明）。
+        # 档位为空、或与默认档相同（补检必然给出同样的"无球"结论）时不装配，
+        # detector.yolo_probe 保持 None → 判定路径与旧版逐字节一致。
+        if YOLO_PROBE_MODE and str(YOLO_PROBE_MODE) != str(YOLO_INPUT_MODE):
+            _probe_gated = [0]      # 被置信度门槛挡下的次数（诊断用）
+
+            def _probe_ball(_frame, _fidx):
+                """备用档补检：抹黑画布@1280（或其他 YOLO_PROBE_MODE 档）。
+
+                只有 conf ≥ YOLO_PROBE_CONF 的证据才返回（否则等同于"没找到球"）。
+                """
+                try:
+                    _pimg, _pox, _poy, _pimgsz = _yolo_input(_frame, detector,
+                                                             mode=YOLO_PROBE_MODE)
+                    _pres = model.predict(_pimg, conf=float(ball_conf), imgsz=_pimgsz,
+                                          classes=_ball_classes, device=_device,
+                                          verbose=False)[0]
+                    _balls = _shift_balls_to_frame(
+                        _ball_boxes_from_result(_pres), _pox, _poy)
+                    _kept = _filter_probe_balls(_balls)
+                    if _balls and not _kept:
+                        _probe_gated[0] += 1
+                    return _kept or None
+                except Exception as e:
+                    # 兜底路径失败不能影响主判定（此刻主判定本就是"否决"）
+                    log.warning(f"[YOLO PROBE] 补检失败（不影响主判定）: {e}")
+                    return None
+
+            detector.yolo_probe = _probe_ball
+            detector._probe_gated_ref = _probe_gated
+
         t0 = time.time()
         t0_str = time.strftime('%H:%M:%S', time.localtime(t0))
         # 统计口径：n_frames 为本次运行待处理帧数（ETA/瞬时速率）；
@@ -693,9 +777,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         # COCO 回退权重=[32] sports ball），不再硬编码 [0]
                         # device 用循环外缓存的 _device：运行中设备不会变化，
                         # 每次推理重新 import torch + is_available 属纯冗余（全程 ~2 万次）
-                        # 输入范围与 imgsz：见上方「裁剪推理」段——只推筐接受框（约
-                        # 430×500）并推 512，球保持 ~20-31px（整帧 1280 时只有
-                        # ~13-20px，历史上正是因为球太小而从 960 提到 1280）。
+                        # 输入范围与 imgsz：见上方「裁剪推理」段——线上走**抹黑画布**
+                        # （整帧画布 + 接受框外抹黑，imgsz 1280，球 ~13-20px）；
+                        # 'crop'/'full' 两档保留用于对照实验。
                         _crop, _ox, _oy, _imgsz = _yolo_input(frame, detector)
                         res = model.predict(_crop, conf=float(ball_conf), imgsz=_imgsz,
                                             classes=_ball_classes,
@@ -703,8 +787,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                         if res.boxes is not None and len(res.boxes) > 0:
                             # 保留全部球框（见 _ball_boxes_from_result 的说明）；
                             # 第一个（最高分）仍是主球，供跳帧复用等读取方使用。
-                            # 裁剪推理的框要平移回整帧坐标，_check_yolo_near_hoop
-                            # 的接受框是整帧坐标。
+                            # 'crop' 模式的框要平移回整帧坐标（抹黑/整帧模式偏移为 0），
+                            # _check_yolo_near_hoop 的接受框是整帧坐标。
                             ball_pos = _shift_balls_to_frame(
                                 _ball_boxes_from_result(res), _ox, _oy) or None
                         _last_ball = (fidx, ball_pos)
@@ -936,6 +1020,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             log.info(f"  YOLO 异常   : {_stat_yolo_failed}/{_stat_yolo_called} 次推理失败（详见 [YOLO ERROR] 日志）")
         log.info(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
                  f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
+        if d.get('probe_called'):
+            _gated = getattr(detector, '_probe_gated_ref', [0])[0]
+            log.info(f"  YOLO 兜底   : {YOLO_PROBE_MODE} 档补检 {d['probe_called']} 次  |  "
+                     f"补检命中 {d.get('probe_confirmed', 0)} 次"
+                     f"（命中率 {100.0 * d.get('probe_confirmed', 0) / max(d['probe_called'], 1):.0f}%）"
+                     f"  |  被 conf<{YOLO_PROBE_CONF} 挡下 {_gated} 次")
         if detector.auto_threshold:
             if detector._auto_threshold_value is not None:
                 if detector._warmup_p95_median is not None:
