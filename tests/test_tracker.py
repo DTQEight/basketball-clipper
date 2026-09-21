@@ -371,12 +371,29 @@ class TestDequeHistory:
         assert len(det.blob_history) == 30
 
     def test_ball_pos_history_window(self):
-        """ball_pos_history 只保留最近 yolo_window_frames 帧。"""
+        """ball_pos_history 只保留最近 yolo_window_frames 帧。
+
+        必须用**移动**的球喂：原地不动的球会被静止球证据门剔除（见下一条用例），
+        那样测的就不是窗口边界了。
+        """
+        det = _detector()
+        for i in range(50):
+            cy = 40 + i * 4
+            det.feed(_ball_pos(cy), i, FPS, frame=_frame_with_ball(cy))
+        cutoff = 49 - det.yolo_window_frames
+        assert det.ball_pos_history[0][0] >= cutoff
+
+    def test_static_ball_not_kept_in_history(self):
+        """原地不动的球超过 STATIC_BALL_SEC 后不再进历史（2026.09.21 静止证据门）。
+
+        旧行为下这里会留下最近 10 条证据，从而让 YOLO 硬否决长期为真——
+        正是 2026.09.21-4th.mp4 那 39 个连续误报的成因。
+        """
         det = _detector()
         for i in range(50):
             det.feed(_ball_pos(40), i, FPS, frame=_frame_with_ball(40))
-        cutoff = 49 - det.yolo_window_frames
-        assert det.ball_pos_history[0][0] >= cutoff
+        assert det.diag['yolo_static_dropped'] > 0
+        assert not det.ball_pos_history, '静止假球不该在窗口里留下任何证据'
 
 
 class TestStateSerialization:
@@ -728,3 +745,86 @@ class TestYoloProbe:
                 goals.append(ts)
         assert goals, '补检命中应把这条轨迹救回（旧行为下必被 YOLO 硬否决）'
         assert det.diag['probe_confirmed'] >= 1
+
+
+class TestStaticBallEvidence:
+    """静止球证据门：原地不动 ≥1s 的「球」不再算 YOLO 证据。
+
+    由来（2026.09.21-4th.mp4 实测）：墙上横幅的圆形图案被判成篮球（旧权重
+    0.79~0.85 / 新权重 0.73~0.80，三种输入档一致），它落在 yolo_accept_box() 内
+    且**静止**，却每帧都被重新检出 → _check_yolo_near_hoop 只问「±0.34s 窗口里
+    有没有球」→ 永远为真 → YOLO 硬否决长期失效 → 筐区任何运动斑块都被确认，
+    87 秒连出 39 个误报（35 个人工标 ×）。修法：球证据必须具备运动性。
+    """
+
+    def test_static_ball_dropped_after_threshold(self):
+        """同一位置持续到阈值 → 判为静止物，不再进证据。"""
+        det = _detector()
+        assert det._drop_static_balls(_ball_pos(100.0), 0), '首次检出必须保留'
+        last = det._drop_static_balls(_ball_pos(100.0), det.static_ball_frames)
+        assert last == [], '持续静止到阈值后必须剔除'
+        assert det.diag['yolo_static_dropped'] > 0
+
+    def test_static_jitter_still_static(self):
+        """原地 ±3px 抖动仍算同一位置（相机噪声/框抖动不该放过它）。"""
+        det = _detector()
+        n = det.static_ball_frames
+        for i in range(n + 1):
+            cy = 100.0 + (3.0 if i % 2 else -3.0)
+            kept = det._drop_static_balls(_ball_pos(cy), i)
+            if i >= n:
+                assert kept == [], '第 %d 帧仍在原地，应判静止' % i
+
+    def test_moving_ball_never_dropped(self):
+        """每次位移都超过容差的真球 → 永不判静止（这一步保证不伤召回）。"""
+        det = _detector()
+        for i in range(120):
+            cy = 60.0 + i * 4.0        # 4px/帧 > STATIC_BALL_TOL_PX(12)
+            assert det._drop_static_balls(_ball_pos(cy), i), '移动的球不能被挡'
+        assert det.diag['yolo_static_dropped'] == 0
+
+    def test_gap_resets_timer(self):
+        """消失超过 STATIC_BALL_GAP_SEC 后再出现 → 重新计时，不误判静止。"""
+        det = _detector()
+        det._drop_static_balls(_ball_pos(100.0), 0)
+        later = det.static_ball_gap_frames + 5
+        assert det._drop_static_balls(_ball_pos(100.0), later), '中断后必须重新计时'
+
+    def test_none_and_empty_are_safe(self):
+        """ball_pos=None（跳帧无 YOLO）必须安全返回可迭代对象，不能抛。"""
+        det = _detector()
+        assert list(det._drop_static_balls(None, 0)) == []
+        assert list(det._drop_static_balls([], 0)) == []
+
+    def test_static_ball_cannot_confirm(self):
+        """静止假球不能当证据 → 判定只能否决（本次误报的直接防线）。"""
+        det = _detector()
+        n = det.static_ball_frames + 5
+        for i in range(n):
+            det._drop_static_balls(_ball_pos(100.0), i)     # 全程被挡在历史之外
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = n
+        assert not det.ball_pos_history        # 静止证据一条都没进窗口
+        assert det._check_yolo_near_hoop() == (False, 'rejected')
+
+    def test_moving_ball_still_confirms(self):
+        """移动的球仍能确认（对照组：门不能把真球也挡掉）。"""
+        det = _detector()
+        for i in range(40):
+            cy = 60.0 + i * 4.0
+            for b in det._drop_static_balls(_ball_pos(cy), i):
+                det.ball_pos_history.append((i, b[0], b[1]))
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 39
+        assert det._check_yolo_near_hoop() == (True, 'confirmed')
+
+    def test_probe_evidence_is_also_gated(self):
+        """备用档补检出的是静止图案时同样不能当证据（两段式不能成为新入口）。"""
+        det = _detector(yolo_probe=lambda f, i: [(float(CX), 100.0, 0, 0, 0, 0, 0.9)])
+        n = det.static_ball_frames + 2
+        for i in range(n):                       # 先把该位置累计成静止
+            det._drop_static_balls([(float(CX), 100.0)], i)
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = n
+        assert det._check_yolo_near_hoop() == (False, 'rejected')
+        assert det.diag['probe_called'] == 1 and det.diag['probe_confirmed'] == 0

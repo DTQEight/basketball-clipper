@@ -29,7 +29,7 @@ from . import state
 from . import video_utils
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
-from tracker import GoalDetector
+from tracker import GoalDetector, STATIC_BALL_SEC
 from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments
 
 log = logging.getLogger("detection")
@@ -1026,6 +1026,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                      f"补检命中 {d.get('probe_confirmed', 0)} 次"
                      f"（命中率 {100.0 * d.get('probe_confirmed', 0) / max(d['probe_called'], 1):.0f}%）"
                      f"  |  被 conf<{YOLO_PROBE_CONF} 挡下 {_gated} 次")
+        if d.get('yolo_static_dropped'):
+            log.info(f"  静止剔除    : {d['yolo_static_dropped']} 条球证据被判为静止物体"
+                     f"（同一位置持续 ≥{STATIC_BALL_SEC:g}s，见 tracker.STATIC_BALL_*）")
         if detector.auto_threshold:
             if detector._auto_threshold_value is not None:
                 if detector._warmup_p95_median is not None:

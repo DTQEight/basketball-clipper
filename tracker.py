@@ -23,6 +23,18 @@ import base64
 # 自适应阈值预热时长（秒）：前 N 秒逐帧收集 diff P95 统计量
 WARMUP_TARGET_SEC = 30.0
 
+# ===== 静止球证据门（2026.09.21）=====
+# 由来：2026.09.21-4th.mp4 墙上横幅的圆形 logo 被球检测器当成篮球（旧权重 0.79~0.85 /
+# 新权重 0.73~0.80，裁剪@640、抹黑@1280、整帧@1280 三档一致），而它落在
+# yolo_accept_box() 内（该场接受框下沿 = 筐下 2.0×筐高 = 558px，海报在 474~487）。
+# 它**静止不动**却被每帧重新检出 → _check_yolo_near_hoop 只问「±0.34s 窗口内有没有球」，
+# 于是永远为真 → YOLO 硬否决长期失效 → 筐区任何运动斑块都被确认成进球，
+# 87 秒里连出 39 个误报（其中 35 个人工标为 ×）。
+# 结论：球证据必须具备运动性。静止物体不作为球证据。
+STATIC_BALL_TOL_PX = 12      # 球心位移 ≤ 该值视为「同一位置」（1080p 下球框约 30~45px）
+STATIC_BALL_SEC = 1.0        # 同一位置持续存在 ≥ 该秒数 → 判为静止物
+STATIC_BALL_GAP_SEC = 2.0    # 超过该秒数没再出现 → 该位置记录作废、重新计时
+
 
 class GoalDetector:
     """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测。"""
@@ -164,6 +176,12 @@ class GoalDetector:
         self.ball_pos_history = deque()
         self.yolo_window_frames = max(5, int(0.34 * self.fps))
 
+        # 静止球证据门：位置(量化) -> [首次帧, 最近帧]，见 STATIC_BALL_* 常量
+        # 不进退点续识别的状态：重放 1 秒即可重新收敛，最多多出 1 个候选
+        self._ball_spot = {}
+        self.static_ball_frames = max(2, int(STATIC_BALL_SEC * self.fps))
+        self.static_ball_gap_frames = max(3, int(STATIC_BALL_GAP_SEC * self.fps))
+
         # 诊断计数器
         self.diag = {
             "cross_above": 0,      # 斑块到达篮筐上方次数
@@ -181,6 +199,7 @@ class GoalDetector:
             "timeout_goal": 0,     # 超时匹配成功
             "yolo_confirmed": 0,   # YOLO 双确认成功
             "yolo_rejected": 0,    # YOLO 双确认失败（diff 触发但 YOLO 没球）
+            "yolo_static_dropped": 0,  # 因「静止物体」被剔除的球证据条数
             "probe_called": 0,     # 备用档补检次数（两段式兜底）
             "probe_confirmed": 0,  # 备用档补检命中并救回判定的次数
             "baseline_updates": 0, # 滚动基准帧更新次数
@@ -406,7 +425,9 @@ class GoalDetector:
         # 冷却刚结束触发的补篮候选需要窗口内有球才能通过 YOLO 确认
         # 本帧全部球位置都写入：_check_yolo_near_hoop 关心的是「筐邻域有没有球」，
         # 只写最高分那一个会让筐边真球被画面上其它球/误报挤掉（见方法 docstring）
-        for _bp in (ball_pos or ()):
+        # 写入前过「静止球证据门」：海报/标志牌上的圆形图案会被认成球且原地不动，
+        # 不挡掉就等于让 YOLO 硬否决长期失效（见 _drop_static_balls）
+        for _bp in self._drop_static_balls(ball_pos, frame_idx):
             self.ball_pos_history.append(
                 (ball_frame if ball_frame is not None else frame_idx,
                  _bp[0], _bp[1]))
@@ -650,6 +671,40 @@ class GoalDetector:
         # y 整体增加（向下）且至少下降 5 像素（放宽，适配斜向运动）
         return (ys[-1] - ys[0]) > 5
 
+    def _drop_static_balls(self, balls, frame_idx):
+        """剔除「静止物体」的球证据，只留会动的（见 STATIC_BALL_* 常量说明）。
+
+        判据：把球心量化到 STATIC_BALL_TOL_PX 的网格，同一格若在
+        STATIC_BALL_SEC 秒内被持续检出（跳帧复用也算在场），即认定该处是静止物体，
+        不再作为球证据。真球在筐区不可能原地不动 ≥1 秒，所以对召回无影响；
+        而海报/标志牌上的圆形图案、墙上的球状装饰、场边静止的球都会被挡掉。
+
+        为什么要在这里挡：_check_yolo_near_hoop 只问「±0.34s 窗口内有没有球」，
+        没有任何运动性要求。一个静止假球每帧都能被重新检出，就足以让 YOLO 硬否决
+        长期失效（2026.09.21-4th.mp4 实测：87 秒连出 39 个误报，35 个人工标 ×）。
+        """
+        if not balls:
+            return ()          # 必须回空元组而非原值：调用处直接 for 迭代（ball_pos 常为 None）
+        tol = STATIC_BALL_TOL_PX
+        out = []
+        for b in balls:
+            key = (int(round(b[0] / tol)), int(round(b[1] / tol)))
+            rec = self._ball_spot.get(key)
+            if rec is None or frame_idx - rec[1] > self.static_ball_gap_frames:
+                rec = [frame_idx, frame_idx]        # 新位置，或中断太久 → 重新计时
+            else:
+                rec[1] = frame_idx                  # 仍在原地 → 延续
+            self._ball_spot[key] = rec
+            if frame_idx - rec[0] >= self.static_ball_frames:
+                self.diag["yolo_static_dropped"] += 1
+                continue
+            out.append(b)
+        # 位置数量天然有限；超限时按最近出现时间保留一半，兜住字典增长
+        if len(self._ball_spot) > 64:
+            kept = sorted(self._ball_spot.items(), key=lambda kv: -kv[1][1])[:32]
+            self._ball_spot = dict(kept)
+        return out
+
     def _probe_missing_yolo(self, frame_idx):
         """两段式兜底：默认档整窗无球证据时，用备用档在当前帧补检一次。
 
@@ -659,6 +714,7 @@ class GoalDetector:
 
         写入的历史项与 feed 同格式 (frame_idx, cx, cy)，因此补检命中后，
         本帧以及时间窗内后续帧的 _check_yolo_near_hoop 都会看到它。
+        补检结果同样过「静止球证据门」：备用档也会把海报类静止图案认成球。
         """
         if self.yolo_probe is None or self._cur_frame is None:
             return False
@@ -673,7 +729,10 @@ class GoalDetector:
             return False
         if not balls:
             return False
-        for _bp in balls:
+        kept = self._drop_static_balls(balls, frame_idx)
+        if not kept:
+            return False
+        for _bp in kept:
             self.ball_pos_history.append((frame_idx, _bp[0], _bp[1]))
         return True
 
