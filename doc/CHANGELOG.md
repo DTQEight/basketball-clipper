@@ -2,6 +2,24 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.21 修复：单球「导出」点了没反应（跨任务后调 `ui.download` 抛 slot 异常）
+
+**现象**：结果卡片上点「导出」，片段其实**已经切好了**（NVENC 跑完、文件已落盘），但浏览器收不到下载，UI 上表现为「点了没反应」。当日日志里该异常出现 **16 次**。
+
+```
+RuntimeError: The current slot cannot be determined because the slot stack for this task is empty.
+This may happen if you try to create UI from a background task.
+```
+
+**根因**：NiceGUI 的 slot 栈按 **asyncio task id** 存（`nicegui/slot.py: Slot.stacks`），而 `asyncio.create_task(_run_export_clip(idx))` 起的是**新任务**，新任务的栈是空的。`ui.download` 内部要 `context.client → slot.parent.client`，必须先能确定当前 slot → 抛异常，下载消息根本没发出去。事件处理器自身是有栈的（`nicegui/events.py: handle_event` 用 `with parent_slot:` 执行处理器），问题只出在**跨任务之后**。
+
+**修法**：照 NiceGUI 自己的做法（`events.py::_await_and_handle_in_context` 同样先捕获 `parent_slot` 再 `with`）——在处理器里取走 `context.slot` 传给任务，任务内 `with slot:` 后再调 `ui.download`。
+
+**验证**：重启服务后再次导出，日志无 slot 异常、片段正常产出（`cache/demo_output/2026.09.21-4th-goal-1273.1s.mp4`）。
+未加单测：该路径需要跑起来的 NiceGUI 应用（本仓库单测均为纯逻辑层），以服务日志实测为准。
+
+main 与分支同源修复（`68c2e8f` / `5d444ca`）。
+
 ### 2026.09.21 A 臂按新球检测权重重抽重训；口径指纹补上 A 臂模型与球检测权重
 
 **背景（含一条方法论纠错）**：见下面 09.21「数据整理」条第二段——原先以为 A 臂特征口径与线上不一致，复核后确认**训练与推理共用同一个 `extract_features.py`，不存在口径错配**。真实耦合是：`extract()` 内部 `model.predict` 用的是**当前球检测权重**，所以换 `weights/*.pt` 会改变 A 臂输入分布，而 `model_lgbm.txt` 是在旧权重特征上训的。
