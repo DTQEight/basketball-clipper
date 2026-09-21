@@ -1442,9 +1442,18 @@ def main_page():
             return
         # 单球导出现场走 ffmpeg（hq 质量 + 集锦前后时长），避免 io_bound 同步阻塞
         import asyncio
-        asyncio.create_task(_run_export_clip(idx))
+        # slot 必须在这里取走：create_task 起的是**新的 asyncio 任务**，而 NiceGUI 的
+        # slot 栈按 task id 存（nicegui/slot.py: Slot.stacks），新任务的栈是空的。
+        # 后台上再调 ui.download（内部要 context.client → slot.parent.client）就会抛
+        # 「The current slot cannot be determined because the slot stack for this task
+        # is empty」，表现就是「点了导出没反应」——而片段其实已经切好了。
+        # 事件处理器里栈是有的（nicegui/events.py: handle_event 用 `with parent_slot:`
+        # 执行处理器），所以此处捕获它、在任务里显式进入，与 NiceGUI 自己的
+        # _await_and_handle_in_context 同一做法。
+        from nicegui import context
+        asyncio.create_task(_run_export_clip(idx, context.slot))
 
-    async def _run_export_clip(idx):
+    async def _run_export_clip(idx, slot):
         # 导出小锁：连点/并发导出共用 nvenc 配额，逐球排队更稳
         if _export_clip_busy["on"]:
             _set_status('正在导出上一球，请稍候...', 'busy')
@@ -1462,8 +1471,9 @@ def main_page():
             path, status = None, f"❌ 单球导出异常: {_e}\n{traceback.format_exc()}"
         finally:
             _export_clip_busy["on"] = False
-        if path and os.path.exists(path):
-            ui.download(path)
+        with slot:                       # 进 slot 后才能调依赖 client 的 UI API
+            if path and os.path.exists(path):
+                ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
     def _on_mark_clip(idx, action):
