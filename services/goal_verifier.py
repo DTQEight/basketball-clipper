@@ -59,6 +59,9 @@ FLOW_SIMCLR_FILE = TRAINING_DIR / "model_flow_simclr.pt"
 FLOW_MODEL = TRAINING_DIR / "model_flow_t.pt"
 VM_MODEL = TRAINING_DIR / "model_vm_lgbm.txt"
 ENSEMBLE_META = TRAINING_DIR / "model_temporal_meta.json"
+# 球检测权重目录：A 臂特征由 extract_features.py 用当前球检测权重逐帧推理得到，
+# 换权重会改变 A 臂输入分布 → 必须计入口径指纹（见 model_fingerprint）
+BALL_WEIGHTS_DIR = _ROOT / "weights"
 
 # 兜底阈值/权重（仅在 ENSEMBLE_META 缺 ensemble 段时生效）
 AUTO_THR = 0.70
@@ -381,22 +384,34 @@ def is_enabled() -> bool:
 
 
 def model_fingerprint() -> str:
-    """当前判定口径的指纹：B 模型文件 + 各权重 + 阈值。
+    """当前判定口径的指纹：各臂模型文件 + 球检测权重 + 集成权重/阈值。
 
     分数只在某一套「模型 + 权重 + 阈值」下有意义。换骨干、调权重、改阈值之后，
     缓存里的旧 score 会和新阈值组合出错误的 √/×，所以必须能识别出"这批分数
     是另一套口径算的"。
+
+    A 臂与球检测权重也必须进指纹（2026.09.21 补）：
+      · A 臂特征由 extract_features.py 用**当前球检测权重**逐帧推理得到，
+        换 weights/*.pt 会改变 A 臂输入分布 → A 臂分变化
+      · 重训 model_lgbm.txt 同样直接改变 A 臂分
+    两者都与阈值组合决定 √/×，漏掉就会出现「新旧口径分数混在一起」的静默错判。
+    球检测权重按目录内全部 *.pt 的 mtime 计入（不加载模型，避开 get_ball_model 的开销）。
     """
     h = hashlib.md5()
     # 必须先刷新 ENS_WEIGHTS/AUTO_THR：否则首次调用会把「代码默认权重」哈希进去，
     # 而下一次调用哈希的是文件里的权重 → 指纹自己就变了（分数被反复误判为过期）
     thr = _read_ensemble()
     for p in (B_SIMCLR_FILE, FLOW_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL,
-              FLOW_MODEL, VM_MODEL):
+              FLOW_MODEL, VM_MODEL, LGBM_MODEL):
         try:
             h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
         except OSError:
             h.update(f"{p.name}:-".encode())
+    try:
+        for p in sorted(BALL_WEIGHTS_DIR.glob("*.pt")):
+            h.update(f"w:{p.name}:{p.stat().st_mtime_ns}".encode())
+    except OSError:
+        h.update(b"w:-")
     h.update(json.dumps(sorted(ENS_WEIGHTS.items())).encode())
     h.update(str(thr).encode())
     return h.hexdigest()[:12]

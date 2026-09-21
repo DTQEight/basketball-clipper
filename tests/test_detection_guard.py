@@ -258,3 +258,49 @@ class TestHistoryMissingScores:
     def test_unknown_record_no_need(self, monkeypatch):
         monkeypatch.setattr(state, "load_history", lambda: [])
         assert detection.history_missing_scores("C:/nope.mp4") == (False, 0, 0)
+
+
+class TestModelFingerprint:
+    """口径指纹必须覆盖「会改变某臂分数」的全部输入。
+
+    漏掉任何一个，换模型/换权重后缓存里的旧 score 不会失效，新旧口径的分数
+    会混在一起出新阈值下的 √/×（静默错判）。2026.09.21 补上 A 臂模型与球检测权重。
+    """
+
+    @staticmethod
+    def _isolate(monkeypatch, tmp_path, lgbm=None, weights_dir=None):
+        """把指纹的输入收窄到临时路径，避免依赖真实权重与标定文件。"""
+        monkeypatch.setattr(goal_verifier, "LGBM_MODEL", lgbm or (tmp_path / "no_lgbm.txt"))
+        monkeypatch.setattr(goal_verifier, "BALL_WEIGHTS_DIR",
+                            weights_dir or (tmp_path / "no_weights"))
+        monkeypatch.setattr(goal_verifier, "_read_ensemble", lambda: 0.7)
+
+    def test_stable_across_calls(self, monkeypatch, tmp_path):
+        """同一批文件连算两次必须一致（否则分数会被反复误判为过期）。"""
+        self._isolate(monkeypatch, tmp_path)
+        assert goal_verifier.model_fingerprint() == goal_verifier.model_fingerprint()
+
+    def test_a_arm_model_change_invalidates(self, monkeypatch, tmp_path):
+        """重训 A 臂（换 model_lgbm.txt）→ 指纹必须变。"""
+        p = tmp_path / "model_lgbm.txt"
+        p.write_text("tree", encoding="utf-8")
+        self._isolate(monkeypatch, tmp_path, lgbm=p)
+        fp1 = goal_verifier.model_fingerprint()
+        os.utime(p, ns=(10 ** 18, 10 ** 18))       # 模拟重训后落盘
+        assert goal_verifier.model_fingerprint() != fp1
+
+    def test_ball_weights_change_invalidates(self, monkeypatch, tmp_path):
+        """换球检测权重 → A 臂特征分布变 → 指纹必须变。"""
+        wd = tmp_path / "weights"
+        wd.mkdir()
+        w = wd / "basketball_ft.pt"
+        w.write_bytes(b"0")
+        self._isolate(monkeypatch, tmp_path, weights_dir=wd)
+        fp1 = goal_verifier.model_fingerprint()
+        os.utime(w, ns=(10 ** 18, 10 ** 18))
+        assert goal_verifier.model_fingerprint() != fp1
+
+    def test_missing_files_do_not_raise(self, monkeypatch, tmp_path):
+        """权重/模型缺失（如 main 线上无 training/）不能抛异常，只降级哈希。"""
+        self._isolate(monkeypatch, tmp_path)
+        assert isinstance(goal_verifier.model_fingerprint(), str)
