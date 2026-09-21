@@ -629,3 +629,102 @@ class TestMotionGateInvariant:
                            diff_threshold=25, min_blob_area=20, search_margin=60,
                            rolling_baseline_sec=0, auto_threshold=False, fps=FPS)
         assert det.has_motion_near_hoop(_base_frame()) is True
+
+
+class TestYoloProbe:
+    """两段式兜底：整窗无球证据时用备用档补检一次（449.16 那类漏检的防线）。
+
+    设计（2026.09.21 定档，见 services/detection.YOLO_PROBE_MODE）：
+    默认档裁剪@640 在真球帧上被系统性压低，只有「整窗一帧都没过阈值」的轨迹会漏；
+    全局换抹黑@1280 效果相同但要 +14.5% 耗时，于是只在判定即将被否决时补检一次。
+    """
+
+    def test_no_probe_keeps_old_behavior(self):
+        """未装配 probe（None）→ 与旧版逐字节一致：直接否决，且不计补检。"""
+        det = _detector()
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 0
+        assert det._check_yolo_near_hoop() == (False, 'rejected')
+        assert det.diag['probe_called'] == 0
+
+    def test_confirmed_window_skips_probe(self):
+        """窗口内本来就有球证据 → 不补检（成本只花在边缘轨迹上）。"""
+        calls = []
+
+        def probe(frame, fidx):
+            calls.append(fidx)
+            return []
+
+        det = _detector(yolo_probe=probe)
+        det.ball_pos_history.append((0, CX, 100.0))
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 2
+        assert det._check_yolo_near_hoop() == (True, 'confirmed')
+        assert calls == []
+
+    def test_probe_hit_confirms_and_writes_history(self):
+        """补检命中（落在接受框内）→ 通过、证据进历史、本帧不再重复补检。"""
+        calls = []
+
+        def probe(frame, fidx):
+            calls.append((frame is not None, fidx))
+            return [(CX, 100.0, 140.0, 94.0, 160.0, 106.0, 0.9)]
+
+        det = _detector(yolo_probe=probe)
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 7
+        assert det._check_yolo_near_hoop() == (True, 'probe')
+        assert det.diag['probe_called'] == 1 and det.diag['probe_confirmed'] == 1
+        assert calls == [(True, 7)]
+        assert (7, CX, 100.0) in det.ball_pos_history
+        # 证据留在窗口里：同一帧再判定走 confirmed，不再补检
+        assert det._check_yolo_near_hoop() == (True, 'confirmed')
+        assert len(calls) == 1
+
+    def test_probe_outside_box_still_rejected(self):
+        """补检给出的球在接受框外 → 仍然否决（补检不是无条件放行）。"""
+        det = _detector(yolo_probe=lambda f, i: [(500.0, 100.0, 0, 0, 0, 0, 0.9)])
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 3
+        assert det._check_yolo_near_hoop() == (False, 'rejected')
+        assert det.diag['probe_called'] == 1 and det.diag['probe_confirmed'] == 0
+
+    def test_probe_at_most_once_per_frame(self):
+        """同一帧最多补检一次；换帧后可再补检（避免同一轨迹反复推理）。"""
+        calls = []
+
+        def probe(frame, fidx):
+            calls.append(fidx)
+            return []
+
+        det = _detector(yolo_probe=probe)
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 5
+        det._check_yolo_near_hoop()
+        det._check_yolo_near_hoop()
+        assert calls == [5]
+        det._cur_frame_idx = 6
+        det._check_yolo_near_hoop()
+        assert calls == [5, 6]
+
+    def test_probe_exception_is_swallowed(self):
+        """补检抛异常不外溢（此刻主判定本就是否决，兜底失败不应改变结果）。"""
+        def boom(frame, fidx):
+            raise RuntimeError('CUDA oops')
+
+        det = _detector(yolo_probe=boom)
+        det._cur_frame = _frame_with_ball(100)
+        det._cur_frame_idx = 1
+        assert det._check_yolo_near_hoop() == (False, 'rejected')
+        assert det.diag['probe_called'] == 1 and det.diag['probe_confirmed'] == 0
+
+    def test_probe_rescues_goal_through_feed(self):
+        """端到端：整程没有 YOLO 证据（feed(None)），补检命中 → 进球仍被登记。"""
+        det = _detector(yolo_probe=lambda f, i: [(CX, 100.0, 0, 0, 0, 0, 0.9)])
+        goals = []
+        for i, cy in enumerate([40, 40, 100, 100, 110, 130]):
+            ts = det.feed(None, i, FPS, frame=_frame_with_ball(cy))
+            if ts is not None:
+                goals.append(ts)
+        assert goals, '补检命中应把这条轨迹救回（旧行为下必被 YOLO 硬否决）'
+        assert det.diag['probe_confirmed'] >= 1
