@@ -80,19 +80,35 @@ class TestPartialDecodeGuard:
     视频全部断点 → 后半段进球永久缺失且无法续跑。判定 partial 时必须保留断点。
     """
 
-    def test_partial_when_fewer_frames_than_interval(self):
-        assert detection._is_partial_decode(300, 900, False) is True
+    def test_partial_when_frame_no_stops_before_end(self):
+        """主循环停止时帧号未推进到区间末尾 → 提前 EOF。"""
+        assert detection._is_partial_decode(300, 900, False, 300) is True
 
-    def test_complete_when_all_frames_processed(self):
-        assert detection._is_partial_decode(900, 900, False) is False
+    def test_complete_when_frame_no_reaches_end(self):
+        """正常跑完（帧号到 end）不得误报——**即使解码计数远小于帧号区间**。
+
+        实测 Y:\\...\\2026.08.31-2nd.mp4：容器时间基异常，解码 13403 帧而帧号跑到
+        3.6 万。若按 processed < (end-start) 判定就会恒判"不完整"（连带不删断点）。
+        """
+        assert detection._is_partial_decode(900, 900, False, 134) is False
 
     def test_cancel_is_not_partial(self):
         """用户取消走取消分支（保存断点 + 丢弃结果），不是"解码不完整"。"""
-        assert detection._is_partial_decode(300, 900, True) is False
+        assert detection._is_partial_decode(300, 900, True, 300) is False
+
+    def test_tail_boundary_within_tolerance(self):
+        """末尾几帧的 pts 取整偏差不算截断（实测 43554 / 43556 → 不是截断）。"""
+        assert detection._is_partial_decode(43554, 43556, False, 43554) is False
+        # 差 10 帧仍在容差内（_PARTIAL_TOL_FRAMES）→ 不判截断
+        assert detection._is_partial_decode(43546, 43556, False, 43546) is False
+
+    def test_large_gap_is_partial(self):
+        """缺口远超容差 → 真截断。"""
+        assert detection._is_partial_decode(13000, 36203, False, 13000) is True
 
     def test_zero_frames_not_partial(self):
         """0 帧由 decode-fail 分支负责（那条不写历史），此处不重复判。"""
-        assert detection._is_partial_decode(0, 900, False) is False
+        assert detection._is_partial_decode(0, 900, False, 0) is False
 
 
 class TestPersistMarksScope:

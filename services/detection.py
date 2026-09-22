@@ -368,17 +368,30 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
 
 # ============ 检测 ============
 
-def _is_partial_decode(processed, n_frames, cancelled):
+# 提前 EOF 判定的末尾容差（帧）：fidx 由 pts 取整算出，区间末尾常有 1~2 帧的
+# 边界偏差（实测 1st quarter vs 悍高.mov: 处理 43554 / 区间 43556），这不是截断。
+_PARTIAL_TOL_FRAMES = 10
+
+
+def _is_partial_decode(next_frame, end_frame, cancelled, processed):
     """本次解码是否提前结束（提前 EOF），而非正常跑完区间 / 用户取消（N1）。
 
     video_io.iter_frames 读到真实数据末尾时（容器层 demux 异常）是静默 return，
-    decode_errors 可能不计数。旧实现只查 processed==0，导致"解出过一部分就已
-    按检测完成收尾"——写历史 + 删掉全部断点，后半段进球永久缺失且无法续跑。
+    decode_errors 甚至不计数。旧实现只查 processed==0，导致"解出过一部分就已按
+    检测完成收尾"——写历史 + 删掉全部断点，后半段进球永久缺失且无法续跑。
     判定为 True 时保留断点并在 UI 标注结果不完整。
 
-    processed>0 才判：一帧都没有的情况由上面的 decode-fail 分支负责（那条不写历史）。
+    **必须用帧号口径判定**：next_frame 是主循环"下一帧待处理帧号"（正常跑完时
+    等于 end_frame），processed 只是已解码帧**计数**。二者在容器时间基异常 / VFR
+    的视频上并不同步——实测 Y:/全场录像/2026.08.31-2nd.mp4 解码 13403 帧但帧号
+    跑到 3.6 万，用 processed < (end-start) 会恒判"不完整"而误报（还会连带不删断点）。
+
+    processed>0 才判：一帧都没有的情况由上游 decode-fail 分支负责（那条不写历史）。
+    末尾留 _PARTIAL_TOL_FRAMES 帧容差（pts 取整造成的 1~2 帧边界偏差不算截断）。
     """
-    return (not cancelled) and processed > 0 and processed < n_frames
+    if cancelled or processed <= 0:
+        return False
+    return next_frame < end_frame - _PARTIAL_TOL_FRAMES
 
 
 def _split_marks_by_source(clips):
@@ -999,15 +1012,16 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                 need_yolo = False
                 _yolo_skipped = False  # 条件跳过标记（用于进度显示）
                 # 预热已在前置 pass 完成，正式阶段从帧 0 直接跑检测（不再跳过前30s YOLO/进球）
-                # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果
-                # 相位按**绝对帧号 fidx** 取模（fidx 是 iter_frames 产出的绝对帧号）。
-                # 断点续跑时 processed 从 0 重新计数，而 start/_resume_frame 是绝对帧号：
-                # 若沿用 processed 取模，续跑后的采样相位相对"从头跑"整体错开
-                # (start % _yolo_step)，边缘事件（恰落在采样帧上的进球）判定可能不同，
-                # 违背"续跑与从头跑同口径"的设计目标。改绝对帧号后二者同相位。
-                # 从头跑（start=0、无断点）时 fidx 与 processed 逐帧同步，故本改动对
-                # 从头跑行为**逐字节等价**，只在续跑时把相位拉回绝对帧网格。
-                need_yolo = ((fidx % _yolo_step) == 0)
+                # 正式检测：每 _yolo_step 帧一次 YOLO，其余帧复用上一帧结果。
+                # 相位用 **processed（本次运行的帧计数）** 而不是 fidx：fidx 由 pts 算出
+                # （video_io: fidx = round((pts-start_pts)*tb*fps)），在 pts 稀疏的视频
+                # 上一个 fidx 会跨过多个解码帧——实测 Y:/全场录像/2026.08.31-2nd.mp4
+                # （13403 帧覆盖 36203 个帧号）改用 fidx 取模后 YOLO 调用从 773 次掉到
+                # 204 次，等于把"进球硬确认"的覆盖率砍掉近 3/4（漏球风险）。
+                # 续跑相位确实会相对从头跑错开 (start % _yolo_step)，但断点按 300 帧
+                # 节流保存、线上 _yolo_step ∈ {2,3} 都整除 300，相位实际仍对齐；
+                # 只有"取消时保存"的断点会错开，属边缘场景。**覆盖率优先**。
+                need_yolo = ((processed % _yolo_step) == 0)
                 # ROI 每帧至多算一次：条件跳过判定与 feed 共用
                 # （旧实现 has_motion_near_hoop 与 feed 内部各算一次，~1-2ms/帧纯浪费）
                 _pending_roi = detector.compute_roi(frame) if (need_yolo and skip_yolo_no_motion) else None
@@ -1163,12 +1177,13 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 且无法续跑，UI 只显示"检测完成 | 处理 N 帧"。
         # 真实成因：截断/拷贝中断的 mp4、VFR、容器 frames 头虚高。
         # 处理：保留断点（用户可续跑补齐），历史照写但显式标注"结果不完整"。
-        _partial_decode = _is_partial_decode(processed, n_frames,
-                                             state.cancel_event.is_set())
+        _partial_decode = _is_partial_decode(_resume_frame, end,
+                                             state.cancel_event.is_set(), processed)
         if _partial_decode:
-            log.error(f"[DECODE PARTIAL] {video_path} 只解到 {processed}/{n_frames} 帧"
-                      f"（decode_errors={getattr(reader, 'decode_errors', 0)}）："
-                      f"疑似视频截断 / 帧数头虚高，保留断点并标注结果不完整")
+            log.error(f"[DECODE PARTIAL] {video_path} 帧号只推进到 {_resume_frame}/{end}"
+                      f"（已解码 {processed} 帧，decode_errors="
+                      f"{getattr(reader, 'decode_errors', 0)}）：疑似视频截断，"
+                      f"保留断点并标注结果不完整")
 
         goals = sorted(detector.goals)
 
@@ -1355,7 +1370,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         if _missing_previews > 0:
             status += f"\n⚠ {_missing_previews} 个进球的预览片段生成失败（集锦将缺少这些球）"
         if _partial_decode:
-            status += (f"\n⚠ 解码不完整：只处理 {processed}/{n_frames} 帧"
+            status += (f"\n⚠ 解码不完整：帧号只推进到 {_resume_frame}/{end}"
                        f"（疑似视频截断或帧数头虚高），后半段结果缺失；"
                        f"断点已保留，可点「继续识别」补齐")
         if detector.auto_threshold and detector._auto_threshold_value is not None:
