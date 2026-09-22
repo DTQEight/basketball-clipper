@@ -2,6 +2,74 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.22 修复：手机 HDR 源（10-bit .mov）的预览片段在浏览器里播不了
+
+**现象**：`E:\ball\1st quarter vs 悍高.mov` 检测跑完（70 个候选中 15 个自动 √）、片段也都切好了（`cache/demo_output/goal_*.mp4`，每个 0.35~0.5MB、PyAV 能正常解 177 帧），但点卡片上的「预览」**什么都不播**——没有报错、没有 404、日志里也查不到任何异常。
+
+**根因**：片段的编码 profile 浏览器不认。源是手机直出的 HDR：
+
+```
+hevc (Main 10), yuv420p10le, bt2020nc/bt2020/arib-std-b67   ← HLG / 10-bit
+```
+
+两个条件同时成立才踩到：① 源是 10-bit HLG；② 本次 NVENC 全程失败（`No capable devices found`，70/70 回退软编）。而 `build_encode_args` 的软编分支只给 `libx264 -crf`、**没有 `-pix_fmt`**，libx264 就按输入位深原样编出：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| profile | **h264 High 10** | h264 High |
+| pix_fmt | **yuv420p10le** | yuv420p |
+| 颜色标记 | bt2020 / arib-std-b67 | bt709 |
+
+Chrome 的 H.264 解码链只吃 8-bit，遇到 High 10 **不报错、只黑屏**。既有的 Y: 盘录像全是 8-bit SDR（`h264 High/Main, yuv420p, bt709`），所以这个问题一直没暴露。对照证据（同一台机器、同一套 UI）：
+
+```
+goal_57_1273s_1790055947.mp4   h264 (Main)     yuv420p     bt709   ← Y盘源，能播
+goal_69_1446s_1790083337.mp4   h264 (High 10)  yuv420p10le HLG     ← 本次 .mov，播不了
+```
+
+**修法**：`build_encode_args` 两条分支统一追加 `-pix_fmt yuv420p`（`cutter/ffmpeg_cutter.py`）；预览切片的 `-vf` 追加新增的模块常量 `SDR_TAG_FILTER`（`setparams=colorspace=bt709:...`）——`-color_primaries/-color_trc` 这两个输出选项在这条链路上不生效（libx264 写进 colr box 的值取自帧属性，会被输入侧 HDR 标记盖住，实测仍是 bt2020/arib-std-b67），只有改帧属性才落地。打点探针的 `-vf` 同步（否则「切片墙钟 − 探针」的编码耗时口径失真）。
+
+**实测**：HDR `.mov` 与 SDR `.mp4` 两条源现在都产出 `yuv420p / High / bt709/bt709/bt709`；已用历史里的精确时间戳按原文件名就地重切这 70 个片段（105s，70/70 成功），服务内存里的 clip 路径不变、点预览即可播。全量测试通过（`build_encode_args` 另有 `TestPreviewTiming` 覆盖）。
+
+**已知取舍**：HLG→SDR 目前是朴素转换（只降位深 + 改标记，没做 tone mapping），画面可能偏灰/偏亮。要做正确映射需按源的 `color_trc` 判定后启用 `zscale`+`tonemap` 链（本机 ffmpeg 带 zscale）；等遇到实际观感投诉再加。
+
+### 2026.09.22 新增：历史记录留档 AI 当次分带（`verify_snapshot`）
+
+**问题**：人工确认（点「预览」即视为复核过，或点 √/×）会把 clips 的 `mark_source` 从 `auto` 提升为 `manual`，随后 `labels.auto_kept` / `auto_rejected` 被整批搬进 `kept` / `deleted`——**模型当次判了什么从此在历史里查不到**。「AI 判对率」只能靠标定前临时抓一份快照，忘了抓就永久丢失（本场 1st quarter vs 悍高.mov 就只剩一次 21:32 的临时快照可比：高带 13/13 全对、低带 41/41 全对、中间带 16 条里 5 真球 11 误报、人工量 70 → 16）。
+
+**修法**：历史记录新增只写一次的 `verify_snapshot` 字段，在 `add_history` 那一刻写入（`detection._build_verify_snapshot`）：
+
+```json
+{"keep_thr": 0.68, "reject_thr": 0.15,
+ "weights": {"lgbm": 0.5, "b": 1.0, "flow": 1.0, "vm": 0.5},
+ "fingerprint": "<model_fingerprint()>",
+ "auto_kept": [...], "auto_rejected": [...],
+ "scores": {"16.373": 0.91, ...}}
+```
+
+- 写在 `add_history` 而不是 `_sync_marks` 之后：那之后 `auto_*` 就已被人工确认搬走了
+- `update_history_labels` 是读-改-写、只动 `labels` 段，所以整个标定过程都不影响这份快照
+- 存**逐片段分数**而非只存两个 ts 列表：以后换 `keep_thr`/`reject_thr` 想回看「换个阈值会怎样」，直接拿分算，不必重跑 7 分钟复核
+- 只认 `mark_source == "auto"`，人工判过的不进模型的成绩单；AI 复核没跑（clips 上没有 `score`）返回 `None`，字段不入库
+- 类型校验放在写入处（`state._cast_verify_snapshot`）：留档字段写坏了要等几个月后跑统计才发现，那时数据已经没了
+- 留档失败只记 warning，不影响检测结果落盘
+
+**回填**：本场（标定已完成，`auto_*` 已被搬走）按 21:32 的临时快照回填了一份，`scores` 为空 + `backfilled: true`（当次分数未落盘，不可恢复）。写入前有 7 项一致性校验（两带条数 13/41、不重叠、都属本场进球、高带 ⊆ kept、低带 ⊆ deleted、13+41+16=70、字段不存在）。
+
+**测试**：新增 5 例（快照在人工确认后仍在 / 非 dict 拒绝 / 三带与分数口径 / AI 未跑返回 None / run_detect 接线守卫），全量 222 passed。
+
+### 2026.09.22 修复：加载 `E:\ball\*.mov` 永久卡死（PyAV 帧线程死锁）+ `start.bat` 输出链路冻住服务
+
+**现象**：选 `E:\ball` 下的 `.mov` 点加载，UI 停在「正在加载 …」不再推进；进程 CPU 0%、日志一行不写、TCP 仍能连上、HTTP 不响应。同一序列里 `.mp4` 都正常。
+
+**根因**：PyAV 帧级多线程解码死锁。用 py-spy 抓 worker 栈停在 `detection.py:2209`，原生栈是 `SleepConditionVariableSRW`（avcodec 帧线程池的条件变量）。二分确认触发条件：**同一进程里先跑过 torch/CUDA 的 YOLO 推理**，再解特定 `.mov`（实测 HEVC/QuickTime 1920x1080）→ 必现；`read_frame`（含 seek）是唯一入口，cv2 无关、`.mp4` 不触发。触发率实测（同序列各重复 4 次）：默认帧线程 **4/4 卡死**、`thread_count=1` → **0/4**。
+
+**修法**：`video_io.read_frame` 里 `stream.codec_context.thread_count = 1`（附现象与实测数据注释）。**检测主路径的 `VideoReader` 未加**——它会从 92 帧/秒降到 40 帧/秒；代价是解这类 `.mov` 会挂进程退出，属已知遗留。
+
+**次因（独立的问题，同一现象加成）**：`start.bat` 用 PowerShell 管道转发 stdout（`& python ... | ForEach-Object { Write-Host $_ }`），控制台一旦停止消费输出（QuickEdit 选中文本、或被不读输出的父进程拉起），python 下次写 stdout 就阻塞——而应用是从事件循环线程记日志的，**整条事件循环随之冻住**：TCP 能连、HTTP 不回、CPU 0%、日志一行都没有。改用 cmd 直接 `>>` 重定向到日志文件，去掉管道耦合（`Tee-Object` 也不可用：PS 5.1 一律写 UTF-16LE）。
+
+**验证**：`read_frame(帧0)` 3/3 正常（0.13s）、完整加载路径正常返回、全量测试通过、服务重启后 HTTP 200。
+
 ### 2026.09.22 四臂 AI 复核合入主线 + 合并代码审核（修 2 处严重问题）
 
 **合并**：特性分支 `feat/4arm-goal-verifier` 整体合入 `main`（双父合并 `0178539`，87 个文件），发布线的检测与 AI 复核自此同属一条代码线，不再需要两处手工同步。冲突只在 5 个文件：doc 四件套共 18 块（两边各自记录了同一批改动，按「增量取并集、块内取分支侧」解）+ `services/detection.py` 1 块（分支新增的三个落盘函数，main 无对应实现）。逐条标题比对 + 16 项内容标记检查确认 **main 侧无内容丢失**。
