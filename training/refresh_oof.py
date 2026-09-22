@@ -122,10 +122,30 @@ def main():
     t0 = time.time()
     events = load_dataset_events()
     y = np.array([1.0 if e["label"] == "pos" else 0.0 for e in events], dtype=np.float32)
+    # 严格人工口径（N4）：auto_kept 是"当次 score >= keep_thr"的产物，把它当正样本
+    # 真值去标定阈值就是循环评估——高分片段必然算 TP，OOF AUC 与 p95 工作点虚高。
+    # 训练仍用全量 y（正样本不够用），但**标定决策必须看 strict 口径**。
+    y_strict = np.array(
+        [1.0 if (e["label"] == "pos"
+                 and (e.get("label_source") or "ui_manual") != "ui_auto") else 0.0
+         for e in events], dtype=np.float32)
+    n_auto_pos = int((y - y_strict).sum())
     games = np.array([norm_game(e["video"]) for e in events])
     folds = build_folds_by_game([e["video"] for e in events])
-    print(f"{len(y)} 事件（正 {int(y.sum())}）  {len(set(games.tolist()))} 比赛日  "
-          f"→ {len(folds)} 折\n")
+    print(f"{len(y)} 事件（正 {int(y.sum())}，其中模型自动 √ {n_auto_pos}）  "
+          f"{len(set(games.tolist()))} 比赛日  → {len(folds)} 折\n")
+    if n_auto_pos:
+        print(f"[口径提醒] 正样本里有 {n_auto_pos}/{int(y.sum())} 个来自模型自动 √"
+              f"（label_source=ui_auto）。全量口径的 AUC / 工作点会虚高，"
+              f"标定 keep_thr 与权重请看 REPORT 里的 strict_* 字段\n")
+
+    def _strict_auc(s):
+        """严格人工口径 AUC（人工 √ + 全部 ×；无样本或单类返回 None）。"""
+        sel = (y_strict == 1) | (y == 0)
+        ys = y_strict[sel]
+        if len(ys) == 0 or ys.sum() == 0 or ys.sum() == len(ys):
+            return None
+        return roc_auc_score(ys, np.asarray(s)[sel])
 
     P = {}
     Xa = load_a(events)
@@ -189,19 +209,38 @@ def main():
     lines = []
     for i, (e, lab) in enumerate(zip(events, y)):
         rec = {"event_id": e["event_id"], "video": e["video"], "ts": e["ts"],
-               "label": int(lab)}
+               "label": int(lab),
+               # 严格人工口径 + 来源：供 recalib_ensemble 区分"人工 √"与"模型自动 √"
+               "label_strict": int(y_strict[i]),
+               "label_source": e.get("label_source")}
         for k, v in P.items():
             if len(v) == len(y):
                 rec[k] = round(float(v[i]), 6)
         lines.append(json.dumps(rec, ensure_ascii=False))
     OOF_OUT.write_text("\n".join(lines), encoding="utf-8")
+
+    def _r_strict(v):
+        a = _strict_auc(v)
+        return round(float(a), 4) if a is not None else None
+
     REPORT.write_text(json.dumps({
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "n_events": int(len(y)), "n_pos": int(y.sum()),
+        "n_auto_pos": n_auto_pos,
         "n_games": len(set(games.tolist())),
         "arm_oof_auc": {k: round(float(roc_auc_score(y, v)), 4) for k, v in P.items()},
         "ensemble_auc": {k: round(float(roc_auc_score(y, v)), 4) for k, v in ens.items()},
         "ensemble_p95": {k: work_point(y, v) for k, v in ens.items()},
+        # 严格人工口径（排除模型自动 √ 正样本）——**标定 keep_thr / 权重请用这组**
+        "arm_oof_auc_strict": {k: _r_strict(v) for k, v in P.items()},
+        "ensemble_auc_strict": {k: _r_strict(v) for k, v in ens.items()},
+        "ensemble_p95_strict": {k: work_point(y_strict[(y_strict == 1) | (y == 0)],
+                                              v[(y_strict == 1) | (y == 0)])
+                                if _strict_auc(v) is not None else None
+                                for k, v in ens.items()},
+        "note_strict": ("strict_* 为严格人工口径（label_source != ui_auto）。"
+                        "上面的全量口径含模型自动 √，AUC/工作点会虚高（循环评估），"
+                        "标定决策请用 strict_*"),
         "weights": W,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n已写出 {OOF_OUT.name} / {REPORT.name}（耗时 {time.time() - t0:.0f}s）")

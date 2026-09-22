@@ -198,7 +198,7 @@ def merge_segments(video_path, timestamps, pre_roll, post_roll, min_gap):
 
 def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
               min_gap: int = 8, output_path=None, ffmpeg_path: str = "",
-              progress_callback=None, cancel_check=None):
+              progress_callback=None, cancel_check=None, stats: dict | None = None):
     """根据进球时间戳剪辑集锦（GPU 硬编加速）。
 
     video_path: 单源模式传路径字符串；
@@ -213,6 +213,9 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
     ffmpeg_path: ffmpeg 可执行文件路径，留空则用 imageio-ffmpeg 自带版本。
     progress_callback: 可选进度回调 (pct, msg)，0-100。
     cancel_check: 可选取消检查函数（返回 True 时中止并清理临时文件）。
+    stats: 可选 dict（向后兼容的新增关键字参数，默认 None）。成功返回时回填
+           {"segments": 期望段数, "written": 实际写入段数, "failed": 切片失败段数}。
+           集锦消息据此展示实际入片段数，避免个别段失败被静默省略（N10）。
     返回: 输出文件路径 / None（无进球、取消或全部失败）
     """
 
@@ -225,6 +228,17 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
 
     def _cancelled():
         return bool(cancel_check and cancel_check())
+
+    def _publish_stats():
+        """把实际写入/失败段数回填到调用方传入的 stats（None 则忽略）。
+
+        failed_segments 原先只写进日志：UI 消息用的是 merge_segments 的期望段数，
+        个别段切片失败被跳过时用户仍以为全部入片。这里把实际值暴露给调用方。
+        """
+        if stats is not None:
+            stats["segments"] = len(segments)
+            stats["written"] = len(clip_files)
+            stats["failed"] = failed_segments
 
     multi = isinstance(video_path, list)
     if multi:
@@ -283,6 +297,11 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             if _src not in view_filters:
                 view_filters[_src] = build_view_filter(_src)
         failed_segments = 0
+        # R4：任一段发生 NVENC → libx264 整体回退后，前段是 h264_nvenc（默认 main）、
+        # 后段是 libx264（默认 high），profile 不一致。concat 的 `-c copy` 不做一致性
+        # 校验，MP4 只写首段 avcC/SPS，后半段按错误 SPS 解码 → 静默花屏。
+        # 置位后拼接阶段跳过流拷贝，直接整体重编码（强制同一套参数）。
+        mixed_encoder = False
         for i, (src, start, end) in enumerate(segments):
             if _cancelled():
                 _log.info("[剪辑] 已取消，清理临时文件")
@@ -324,6 +343,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                     _log.warning(f"[剪辑] NVENC 切片失败，整体回退 libx264 软编"
                                  f"(start={start:.1f}s): {_stderr_tail(e) or e}")
                     use_nvenc = False
+                    mixed_encoder = True   # R4：前后段编码器/profile 不一致，禁流拷贝
                     encode_tag = "libx264 软编(NVENC 回退)"
                     encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=False)
                     try:
@@ -347,6 +367,7 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
                     _log.warning(f"[剪辑] NVENC 切片超时，整体回退 libx264 软编"
                                  f"(start={start:.1f}s)")
                     use_nvenc = False
+                    mixed_encoder = True   # R4：前后段编码器/profile 不一致，禁流拷贝
                     encode_tag = "libx264 软编(NVENC 回退)"
                     encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=False)
                     try:
@@ -395,7 +416,6 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
         # 优先 -c copy 流拷贝（秒级完成、零质量损失）；失败时回退整体重编码兜底。
         # 旧实现无条件 re-encode，拼接时长与集锦总时长成正比（十几分钟集锦需多花
         # 数分钟），且二次编码带来代际质量损失，与"接近无损"目标相悖。
-        _report(90, '正在拼接集锦视频（流拷贝）...')
         concat_copy_cmd = [
             ffmpeg, "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0", "-i", list_path,
@@ -432,6 +452,30 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             except OSError:
                 pass
 
+        if mixed_encoder:
+            # R4：切片中途 NVENC → libx264 回退后各段 profile/SPS 不一致，
+            # `-c copy` 不校验一致性，MP4 只写首段 avcC → 后半段按错误 SPS 解码
+            # （静默花屏）。直接整体重编码，强制同一套参数。
+            _report(90, '正在拼接集锦视频（编码器回退，整体重编码）...')
+            _log.warning("[剪辑] 检测到 NVENC→软编回退，跳过流拷贝直接整体重编码")
+            try:
+                _run_concat_encode()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e3:
+                _log.warning(f"[剪辑] 拼接失败: {_stderr_tail(e3) or e3}")
+                _remove_incomplete_output()
+                return None
+            _report(98, '清理临时文件...')
+            # finally 里的兜底清理照常执行（return 前会跑），这里补统计日志
+            _total_dur = sum(e - s for _src, s, e in segments)
+            _skip_info = (f" | 跳过 {failed_segments} 段失败"
+                          if failed_segments > 0 else "")
+            _log.info(f"集锦已生成: {output_path}（{encode_tag} | 共 "
+                      f"{len(clip_files)}/{len(segments)} 段{_skip_info} | "
+                      f"时长 {_total_dur:.0f}s）")
+            _publish_stats()
+            return output_path
+
+        _report(90, '正在拼接集锦视频（流拷贝）...')
         try:
             # 流拷贝不做编解码，600s 超时已非常宽裕
             subprocess.run(concat_copy_cmd, check=True, capture_output=True, text=True,
@@ -462,4 +506,5 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
     total_dur = sum(e - s for _src, s, e in segments)
     skip_info = f" | 跳过 {failed_segments} 段失败" if failed_segments > 0 else ""
     _log.info(f"集锦已生成: {output_path}（{encode_tag} | 共 {len(clip_files)}/{len(segments)} 段{skip_info} | 时长 {total_dur:.0f}s）")
+    _publish_stats()
     return output_path

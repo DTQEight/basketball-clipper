@@ -177,6 +177,56 @@ class TestHistory:
         assert rec is not None
         assert rec["labels"]["kept"] == [10.2]             # 匹配 1/2 = 50%，保留匹配项
 
+    def test_manual_scope_preserves_labels_outside_scope(self, state_mod):
+        """R1: 人工标签按「覆盖范围」合并——范围外的旧 √/× 必须保留。
+
+        场景：clips 不是该视频全部进球（预览切片失败、片段被 7 天清理后只重建
+        一部分，或重检测后 clips 未回填人工标记）。旧的全量替换会把看不见的
+        旧标签当成"无标记"整批抹掉，用户上一轮标注静默消失。
+        """
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0, 30.0])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0, 30.0], deleted_ts_list=[20.0])
+        # 第二轮只看得见 10.0 这个片段（clips 子集），用户点了 √
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0], deleted_ts_list=[],
+            manual_scope=[10.0])
+        lab = state_mod.load_history()[0]["labels"]
+        assert lab["kept"] == [10.0, 30.0]      # 范围外的 30.0 保住
+        assert lab["deleted"] == [20.0]         # 范围外的 20.0 保住
+
+    def test_manual_scope_still_clears_inside_scope(self, state_mod):
+        """范围内仍以新值为准：取消标记（同一 ts 不再出现）必须生效。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0, 20.0], deleted_ts_list=[])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0], deleted_ts_list=[],
+            manual_scope=[10.0, 20.0])
+        lab = state_mod.load_history()[0]["labels"]
+        assert lab["kept"] == [10.0]            # 20.0 在范围内且未再标 → 撤销
+
+    def test_manual_scope_none_keeps_replace_semantics(self, state_mod):
+        """manual_scope=None（默认）保持老的全量替换语义，不影响既有调用方。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        assert state_mod.update_history_labels("/a.mp4", kept_ts_list=[10.0, 20.0],
+                                               deleted_ts_list=[])
+        assert state_mod.update_history_labels("/a.mp4", kept_ts_list=[10.0],
+                                               deleted_ts_list=[])
+        lab = state_mod.load_history()[0]["labels"]
+        assert lab["kept"] == [10.0]            # 无范围 → 整体替换
+
+    def test_manual_scope_rounds_timestamps(self, state_mod):
+        """范围比较用 round(ts,3) 后的值（与落盘口径一致，避免浮点误差漏合）。"""
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])
+        assert state_mod.update_history_labels("/a.mp4", kept_ts_list=[10.0, 20.0],
+                                               deleted_ts_list=[])
+        assert state_mod.update_history_labels(
+            "/a.mp4", kept_ts_list=[10.0004], deleted_ts_list=[],
+            manual_scope=[10.0004])
+        lab = state_mod.load_history()[0]["labels"]
+        assert 20.0 in lab["kept"]              # 20.0 不在范围（10.0 附近）→ 保留
+
     def test_person_labels_roundtrip(self, state_mod):
         """人物分类：update_history_labels 增量写入 → get_labels 读回（含清除）。"""
         state_mod.add_history("/a.mp4", (1, 2, 3, 4), [10.0, 20.0])

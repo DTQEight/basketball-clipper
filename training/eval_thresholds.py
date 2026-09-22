@@ -4,7 +4,8 @@
 用法：
     env\\python.exe training\\eval_thresholds.py "Y:\\全场录像\\2026.09.01\\2026.09.01-3rd.mp4"
 
-依赖 cache/clip_cache.json（含各片段 score）与 cache/history（人工标签）。
+依赖 cache/clip_cache.json（含各片段 score）与 cache/history 的**人工**标签
+（kept/deleted；模型自动 √/× 刻意不参与，见文件内注释）。
 未打分的片段自动跳过，不会 KeyError。
 """
 import json
@@ -31,7 +32,13 @@ if e is None:
 v = e["video"]
 print(f"视频: {v}")
 lab = state.get_labels(v)
-kept, dele = state.label_sets(lab)   # 人工 ∪ 模型（见 state.label_sets）
+# 严格人工标签：只用 kept/deleted。
+# 不能用 state.label_sets —— 它把 auto_kept/auto_rejected 也并进 √/×，而
+# auto_kept 正是"score >= keep_thr"的产物：拿它当真值去评 score，高分片段必然
+# 算 TP，AUC/精确率虚高（循环评估），据此标定阈值没有意义。
+# 见 state.label_sets 的提示「需要严格只用人工标签时请显式只取 kept/deleted」。
+kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
+dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
 
 y, s = [], []
 skipped = 0
@@ -47,6 +54,10 @@ for c in e["clips"]:
 
 print(f"已标注且有分数 {len(y)} 个（√ {sum(y)} / × {len(y) - sum(y)}）"
       + (f"  跳过未打分 {skipped} 个" if skipped else ""))
+if not y:
+    sys.exit("没有任何人工标签（kept/deleted）——先在 UI 里标 √/× 再跑本脚本")
+if len(set(y)) < 2:
+    sys.exit("人工标签只有单一类别（全 √ 或全 ×），AUC 无定义")
 print("本场 AUC =", round(roc_auc_score(y, s), 4))
 
 # 线上现役阈值作为锚点，避免硬编码漂移

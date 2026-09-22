@@ -46,6 +46,19 @@ from services import state, detection, video_utils, goal_verifier
 # 会被判无效重来，双击等于白跑；任务运行中 >1s 的点击仍是正常取消）。
 _START_STAMP = {"detect": 0.0, "batch": 0.0}
 
+# "取消已请求"标记（模块级，跨页面连接/刷新共享）：
+# 点「取消」后按钮会显示"正在取消..."并 disable，但此刻任务只是收到取消请求、
+# 进度槽仍非空 → 页面 timer 的每 0.4s 同步会把按钮复位回"取消"+enable，防重复
+# 点击的视觉反馈被打断。用本标记把"已请求取消"与"任务运行中"区分开：
+# 标记为真时 timer 只维持"正在取消..."+禁用，直到任务真正结束（进度槽清空）。
+_CANCEL_REQ = {"detect": False, "batch": False}
+
+# 单球「导出」并发小锁（模块级，跨页面连接/刷新共享）：
+# 旧实现是页面函数里的局部 dict —— NiceGUI 每次连接/刷新都独立执行页面函数，
+# 各标签页各持一把锁，多标签可同时导出；进程级 NVENC 信号量虽会兜底排队不失败，
+# 但并发导出会挤占预览片段/集锦的编码配额（驱动只允许 2 路会话），排队时间明显变长。
+_EXPORT_CLIP_BUSY = {"on": False}
+
 # 启动时从磁盘恢复片段缓存
 state.init_clip_cache()
 # 存量人物名单回填：全局名单上线前的旧分类（仅写在各视频 labels.persons）
@@ -361,14 +374,25 @@ def main_page():
                                     'AI 识别（四臂复核）',
                                     value=goal_verifier.is_enabled()).classes('w-full')
 
+                                # "正在程序化同步开关"守卫：开关的实际状态是进程级全局量，
+                                # 而 ui.switch 只在建页时读一次，其他标签页改了之后本页显示
+                                # 会与实际不符 → timer 周期把 value 同步过来。但 NiceGUI 的
+                                # set_value 会真的触发 on_value_change（value_element.py
+                                # _handle_value_change → 调用已注册 handler），不加守卫就会
+                                # 回调进下面的 _on_ai_toggle，造成回环式重入 + 误刷状态栏/卡片。
+                                _syncing_ai_switch = {"on": False}
+
                                 def _on_ai_toggle(e):
+                                    if _syncing_ai_switch["on"]:
+                                        return  # timer 的同步写入，不是用户操作
                                     goal_verifier.set_enabled(bool(e.value))
                                     if e.value:
                                         _set_status('AI 识别已开启：候选将自动分诊（√ / 待确认 / ×）', 'ok')
                                     else:
                                         _set_status('AI 识别已关闭：只做规则检测，候选全部需人工判定', 'info')
                                     # 卡片上的 AI 徽标与分诊计数随开关即时变化
-                                    _refresh_result_cards()
+                                    # （整列表重建较重，交给下一帧做，见 _refresh_result_cards_soon）
+                                    _refresh_result_cards_soon()
                                 ai_verify_switch.on_value_change(_on_ai_toggle)
                                 ui.label('关闭后不跑四臂打分，检测更快；'
                                          '已有分数与历史标签保留，重开即时恢复').classes(
@@ -541,9 +565,6 @@ def main_page():
                 # 底部留白
                 ui.label('').classes('h-4')
 
-    # 单球「导出」并发小锁：现切 ffmpeg 需排队（nvenc 配额有限），避免连点并发
-    _export_clip_busy = {"on": False}
-
     # ====== 事件处理函数 ======
     def _set_status(text, kind='info'):
         """设置结果状态文本并切换颜色（ok=绿 / err=红 / busy=青 / info=灰）。"""
@@ -556,11 +577,20 @@ def main_page():
         result_status.style(f'color: {_color_map.get(kind, "var(--text-secondary)")}')
 
     # ========== 公共辅助：切换右侧视频区可见性（避免每处重复 4 行 classes 切换，也避免遗漏） ==========
+    # 当前右栏显示的面板（页级）：timer 里的"后台任务进度自动接管"要先看它，
+    # 否则每 0.4s 无条件切 progress 会把本页正在播放的片段/集锦顶掉。
+    _right_pane = {"mode": "preview"}
+
     def _show_right_pane(mode):
         """右侧 4 个元素互斥显示：'preview' | 'result' | 'highlights' | 'progress' | None（preview fallback）。"""
         modes = {'preview', 'result', 'highlights', 'progress'}
         if mode not in modes:
             mode = 'preview'
+        if _right_pane["mode"] == mode:
+            # 已是目标态：不再重复下发 classes。timer 每 0.4s 调用一次，
+            # 若无脑重发，前端会持续收到没有变化的样式更新（反复"强制切换"）
+            return
+        _right_pane["mode"] = mode
         # 全部先隐藏（一次性 remove/add，比每处写 4 行稳）
         for el, name in [(preview_image, 'preview'),
                          (result_video_el, 'result'),
@@ -575,6 +605,18 @@ def main_page():
             frame_select_container.classes(remove='hidden')
         else:
             frame_select_container.classes(add='hidden')
+
+    def _auto_show_progress():
+        """timer 里的进度自动接管：用户正看着 result/highlights 时不动右栏。
+
+        进度槽（state.live_progress）是进程级共享的，任何标签页的 timer 都能看到
+        别的页面/刷新前发起任务的进度；若无条件切 progress，他页正在播放的
+        快照片段或集锦就会被每 0.4s 顶掉一次。用户想回进度视图可点左侧迷你进度条
+        （那里是显式的 _show_right_pane('progress')）。
+        """
+        if _right_pane["mode"] in ('result', 'highlights'):
+            return
+        _show_right_pane('progress')
 
     # ====== 帧选择器逻辑 ======
     _frame_sel = {"busy": False, "pending": None}
@@ -608,6 +650,10 @@ def main_page():
             _frame_sel["pending"] = idx
             return
         _frame_sel["busy"] = True
+        # 本次拖动锁定的视频源：preview_frame 是"检查后执行"——它在 worker 线程里
+        # 读 state.video_state 的 path，而 await 期间别的标签页可能已换视频，
+        # 那样解码出来的是另一路视频的画面，会张冠李戴地写进本页预览
+        _src = state.video_state.get("path")
         try:
             from nicegui import run
             while True:
@@ -615,8 +661,13 @@ def main_page():
                 _frame_sel["pending"] = None
                 if target is None:
                     target = idx
+                if state.current_task() is not None or state.video_state.get("path") != _src:
+                    # 任务已启动或视频已被换成别的源：这次读帧对本页已无意义，放弃
+                    break
                 state.video_state["current_frame"] = int(target)
                 result = await run.io_bound(detection.preview_frame, int(target))
+                if state.video_state.get("path") != _src:
+                    break  # await 期间源被换掉：这张属于旧视频，不能贴到新预览上
                 if result is not None and result[0] is not None:
                     preview_image.set_source(video_utils.frame_to_base64(result[0]))
                 if _frame_sel["pending"] is None:
@@ -852,8 +903,9 @@ def main_page():
                 resume_hint.visible = False
         finally:
             # 锁已下沉到 on_batch_load_video 内部 finally（锁归任务本体）：
-            # 未命中片段缓存时后台会跑 ffmpeg 数十秒，页面刷新取消 UI 协程后
-            # 线程仍持锁跑到结束，UI 侧不再提前释放（与 detect/batch/highlights 对齐）
+            # 未命中片段缓存时后台会跑 ffmpeg 数十秒，其间刷新页面只会让新页面
+            # 不再自动刷新（旧页面的元素操作退化为静默 no-op，协程不会被取消），
+            # 后台线程照常持锁跑到结束，所以 UI 侧不能提前释放（与 detect/batch/highlights 对齐）
             _batch_loading = False
 
     def _on_batch_save_calib():
@@ -871,6 +923,7 @@ def main_page():
                 return
             # 批量中点击 → 请求取消，run_batch_detect 轮询后中断
             state.cancel_event.set()
+            _CANCEL_REQ["batch"] = True  # 防 0.4s 的 timer 把按钮复位（见 _CANCEL_REQ 定义）
             batch_run_btn.set_text('正在取消...')
             batch_run_btn.disable()
             return
@@ -882,6 +935,7 @@ def main_page():
             return
         state.cancel_event.clear()
         _START_STAMP["batch"] = time.time()  # 双击去抖基准
+        _CANCEL_REQ["batch"] = False  # 新一轮启动：清掉上一轮残留的取消标记
         batch_progress_strip.classes(remove='hidden')  # 显示常驻迷你进度条
         batch_mini_bar.set_value(0)
         batch_mini_text.set_text('后台识别中')
@@ -935,8 +989,10 @@ def main_page():
             status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"
             ok = False
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
-        # 注意：正常路径锁由 run_batch_detect 内部 finally 释放（锁归任务本体，
-        # 页面刷新取消 UI 协程时后台线程仍持锁跑到结束）
+        # 注意：正常路径锁由 run_batch_detect 内部 finally 释放（锁归任务本体；
+        # 刷新页面只会让新页面不再自动刷这一份 UI，收尾逻辑照常执行——NiceGUI 把
+        # 事件协程调度为全局任务，client 删除不会取消它，元素操作退化为静默 no-op）
+        _CANCEL_REQ["batch"] = False  # 任务真正结束：取消标记随之失效
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
         batch_progress_strip.classes(add='hidden')  # 批量结束，隐藏迷你进度条
@@ -971,9 +1027,23 @@ def main_page():
                 x = max(0, min(x, nat_w - 1))
             if nat_h > 0:
                 y = max(0, min(y, nat_h - 1))
+            # 点击时锁定的源与帧号：click_calibrate 内部读 video_state 的 path/帧号
+            # 并把点写进 state.calib["clicks"]，而上面的 busy 检查到真正写入之间
+            # 不持锁（run.io_bound 排队期间别的标签页可能换视频）→ 两点会落到
+            # 另一个视频的标定上。二次校验放在 worker 线程里做最后一次比对，
+            # 不一致就整个放弃，绝不写入 calib。
+            _src = state.video_state.get("path")
+            _frame = int(state.video_state.get("current_frame") or 0)
             from nicegui import run
-            frame, status = await run.io_bound(detection.click_calibrate, x, y)
-            if frame is not None:
+
+            def _guarded_click():
+                if (state.video_state.get("path") != _src
+                        or int(state.video_state.get("current_frame") or 0) != _frame):
+                    return None, "视频/帧已切换，本次点击未生效，请重新点击标定"
+                return detection.click_calibrate(x, y)
+
+            frame, status = await run.io_bound(_guarded_click)
+            if frame is not None and state.video_state.get("path") == _src:
                 b64 = video_utils.frame_to_base64(frame)
                 preview_image.set_source(b64)
             calib_status.set_text(status)
@@ -989,15 +1059,29 @@ def main_page():
     batch_select.on_value_change(_on_batch_select_change)
 
     async def _on_reset():
+        # 清标定本身是同步的，且紧跟在 busy 检查之后（中间无 await），
+        # 事件循环不会插入其他 handler → 这一步本来就是原子的；需要二次校验的
+        # 只是随后的预览刷新（见下）
         if _refuse_if_busy():
             return
         status = detection.reset_hoop()
         calib_status.set_text(status)
         # 刷新预览（read_frame 走 io_bound，避免大视频上同步解码卡 UI）
-        if state.video_state["path"]:
+        _src = state.video_state["path"]
+        if _src:
             from nicegui import run
-            result = await run.io_bound(detection.preview_frame, state.video_state["current_frame"])
-            if result is not None:
+            _frame = int(state.video_state["current_frame"] or 0)
+
+            def _guarded_preview():
+                # preview_frame 在 worker 线程里读 video_state 的 path：若 await 期间
+                # 别的标签页换了视频，解出来的是另一路画面。path 不一致就直接放弃，
+                # 宁可不刷新，也不把别人的画面贴到本页（否则用户会以为标定丢了）
+                if state.video_state.get("path") != _src:
+                    return None, None
+                return detection.preview_frame(_frame)
+
+            result = await run.io_bound(_guarded_preview)
+            if result is not None and state.video_state.get("path") == _src:
                 frame, _ = result
                 if frame is not None:
                     preview_image.set_source(video_utils.frame_to_base64(frame))
@@ -1010,6 +1094,7 @@ def main_page():
                 return
             # 检测中点击 → 请求取消，run_detect 轮询后中断
             state.cancel_event.set()
+            _CANCEL_REQ["detect"] = True  # 防 0.4s 的 timer 把按钮复位（见 _CANCEL_REQ 定义）
             detect_btn.set_text('正在取消...')
             detect_btn.disable()
             return
@@ -1051,15 +1136,29 @@ def main_page():
                             'background: var(--accent); color: var(--bg-canvas)')
                 # persistent：禁止点遮罩/ESC 关闭；外因关闭（断连等）→ submit None
                 dlg.props('persistent')
-                _resume_choice = await dlg
+                # N12：对话框是普通元素，await 结束后 NiceGUI 只把它 close（hide），
+                # 不回收元素本身 → 每次点「开始识别」都会在页面树里留一个残留 dialog。
+                # 放 finally 里显式 delete：异常路径也回收；delete 会触发
+                # _handle_delete → submitted 置位，await 不会挂死（client 被删时
+                # 该对话框已由 canary 回收，故先判 is_deleted 再删，避免重复删除）。
+                try:
+                    _resume_choice = await dlg
+                finally:
+                    if not dlg.is_deleted:
+                        dlg.delete()
+                if _resume_choice is None:
+                    # 外因关闭（刷新断连 / 对话框被删）：用户**没有**做出选择。
+                    # 绝不能与"用户选从头开始"(False) 混为一谈——那会删掉该视频
+                    # 全部断点，几十分钟进度静默丢失。静默返回，下次仍会弹窗。
+                    return
                 if not _resume_choice:
+                    # 用户明确选「从头开始」：删除该视频所有 checkpoint
                     # B3：对话框等待期间（用户在思考）可能有其他任务启动并在后台
                     # 写该视频的 checkpoint，此刻删断点会与后台写竞态。删之前
                     # 二次确认无任务运行（该检查与下方删除/占锁之间无 await，
                     # 事件循环不会插入其他 handler，判断是原子的）
                     if _refuse_if_busy():
                         return
-                    # 用户选择从头开始（或对话框被外因关闭）：删除该视频所有 checkpoint
                     state.delete_checkpoint(vp)
 
         token = _try_acquire('detect')
@@ -1068,6 +1167,7 @@ def main_page():
         _cards_video["path"] = None  # 单视频检测结果显示在全局模式
         state.cancel_event.clear()
         _START_STAMP["detect"] = time.time()  # 双击去抖基准
+        _CANCEL_REQ["detect"] = False  # 新一轮启动：清掉上一轮残留的取消标记
         detect_btn.set_text('取消')
         detect_btn.enable()
         # 写入共享进度槽：刷新后新页面可恢复"运行中"UI（timer 轮询）
@@ -1108,13 +1208,15 @@ def main_page():
             status = f"❌ 检测异常: {_e}\n{traceback.format_exc()}"
             ok = False
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
-        # 注意：正常路径锁由 run_detect 内部 finally 释放（锁归任务本体）
+        # 注意：正常路径锁由 run_detect 内部 finally 释放（锁归任务本体；
+        # 刷新页面只是新页面不再自动刷新，收尾逻辑照常执行）
         # 隐藏进度条，显示预览图（无论成功/失败/取消，都回到一致的 preview 态，避免视频重叠）
         _show_right_pane('preview')
         if not ok and state.cancel_event.is_set():
             _set_status(status, 'info')  # 用户取消属中性提示，不用红色
         else:
             _set_status(status, 'ok' if ok else 'err')
+        _CANCEL_REQ["detect"] = False  # 任务真正结束：取消标记随之失效
         detect_btn.set_text('开始识别')
         detect_btn.enable()
         state.clear_live('detect')  # 任务结束：进度槽清空，timer 复位运行态 UI
@@ -1129,7 +1231,7 @@ def main_page():
     person_dlg.props('persistent')
     _person_dlg_idx = {"idx": None}
 
-    def _person_apply(name: str):
+    async def _person_apply(name: str):
         """应用人物分类：写 clip + 持久化历史 labels.persons，刷新卡片。"""
         idx = _person_dlg_idx["idx"]
         _person_dlg_idx["idx"] = None
@@ -1139,9 +1241,13 @@ def main_page():
         # 全局模式下有任务运行时拒绝（与 √/× 标记同一规则：避免与检测线程竞态）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        _, status = detection.clip_action(
-            "set_person", idx, video_path=_cards_video["path"], person=name)
-        _refresh_result_cards()
+        vp = _cards_video["path"]  # 取值在 await 之前：后续状态变化不应改变本次操作对象
+        from nicegui import run
+        # M12：clip_action 内的 set_person 要重写整份历史文件（全量读改写 + 全局
+        # 名单落盘），进球多时可达数百 ms；同步跑会冻结事件循环，连累所有标签页
+        _, status = await run.io_bound(
+            detection.clip_action, "set_person", idx, video_path=vp, person=name)
+        _refresh_result_cards_soon()
         _set_status(status, 'info')
 
     def _on_person_clip(idx):
@@ -1200,10 +1306,12 @@ def main_page():
                 new_name = ui.input(placeholder='输入新人物名').props('dense outlined dark').classes(
                     'flex-1').style('color: var(--text-primary)')
 
-                def _add_new():
+                async def _add_new():
+                    # _person_apply 已改成协程（内部走 io_bound 落盘），这里必须 await，
+                    # 否则协程被丢弃：既不落盘也不刷新（RuntimeWarning 之外无任何反馈）
                     name = (new_name.value or '').strip()
                     if name:
-                        _person_apply(name)
+                        await _person_apply(name)
                 ui.button('添加并使用', on_click=_add_new).props('ripple dense').classes(
                     'text-xs no-caps').style('background: var(--accent); color: var(--bg-canvas)')
                 new_name.on('keydown.enter', lambda e: _add_new())
@@ -1223,7 +1331,17 @@ def main_page():
     def _toggle_pending_only():
         """三段分诊：只看中间带（无人工/模型标记的片段）。"""
         _cards_video["pending_only"] = not _cards_video["pending_only"]
-        _refresh_result_cards()
+        _refresh_result_cards_soon()
+
+    def _refresh_result_cards_soon():
+        """把整列表重建推到下一帧（M12）。
+
+        √/× 单击的耗时分两块：落盘（已挪到 io_bound）与整列表元素的删除+重建
+        （进球多时数百 ms，只能在事件循环里做）。用 0 间隔的一次性 timer 让出
+        当前事件循环轮次：状态栏的"已标记"反馈先上屏，重建不在同一轮里挤占；
+        once 的 timer 触发后会自行从父槽移除，不会像 N12 的对话框那样累积元素。
+        """
+        ui.timer(0, _refresh_result_cards, once=True)
 
     def _refresh_result_cards():
         """刷新结果卡片列表。
@@ -1422,17 +1540,25 @@ def main_page():
                         ui.button('导出', on_click=lambda e, idx=i: _on_export_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
 
-    def _on_preview_clip(idx):
+    async def _on_preview_clip(idx):
         # 全局模式下有任务运行时拒绝：检测线程可能正在 clear/extend clips，
         # 与 clip_action 内 len 检查→取值之间竞态（快照模式只读快照，安全）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        path, status = detection.clip_action("preview", idx, video_path=_cards_video["path"])
+        vp = _cards_video["path"]  # 取值在 await 之前：本次操作对象不该被后续状态变化改掉
+        from nicegui import run
+        # M12：clip_action 里"AI 已判的片段预览即记人工复核"会落盘重写历史，
+        # 同步执行在进球多时卡住事件循环
+        path, status = await run.io_bound(detection.clip_action, "preview", idx, video_path=vp)
         if path and os.path.exists(path):
             result_video_el.set_source(path)
             _show_right_pane('result')
             # 自动播放
             result_video_el.run_method('play')
+        else:
+            # N11：clip_action 只按 clip 元数据算出理论路径，片段可能已被缓存驱逐/
+            # 7 天清理删掉——此时若照旧显示"▶ 正在预览"，用户会以为播放器坏了
+            status = '片段已失效，请重新检测/加载'
         _set_status(status, 'info')
 
     def _on_export_clip(idx):
@@ -1455,10 +1581,11 @@ def main_page():
 
     async def _run_export_clip(idx, slot):
         # 导出小锁：连点/并发导出共用 nvenc 配额，逐球排队更稳
-        if _export_clip_busy["on"]:
+        # （模块级：同一进程内所有标签页共用一把，见 _EXPORT_CLIP_BUSY 定义处）
+        if _EXPORT_CLIP_BUSY["on"]:
             _set_status('正在导出上一球，请稍候...', 'busy')
             return
-        _export_clip_busy["on"] = True
+        _EXPORT_CLIP_BUSY["on"] = True
         _set_status('正在按集锦规格导出该球...', 'busy')
         try:
             from nicegui import run
@@ -1470,18 +1597,22 @@ def main_page():
             import traceback
             path, status = None, f"❌ 单球导出异常: {_e}\n{traceback.format_exc()}"
         finally:
-            _export_clip_busy["on"] = False
+            _EXPORT_CLIP_BUSY["on"] = False
         with slot:                       # 进 slot 后才能调依赖 client 的 UI API
             if path and os.path.exists(path):
                 ui.download(path)
         _set_status(status, 'ok' if path and os.path.exists(path) else 'err')
 
-    def _on_mark_clip(idx, action):
+    async def _on_mark_clip(idx, action):
         # 快照模式随时可标（只改快照 dict）；全局模式有任务运行时拒绝（会与检测线程冲突）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        _, status = detection.clip_action(action, idx, video_path=_cards_video["path"])
-        _refresh_result_cards()
+        vp = _cards_video["path"]  # 取值在 await 之前：本次操作对象不该被后续状态变化改掉
+        from nicegui import run
+        # M12：√/× 除了改标记，还要把整份历史标签写回磁盘（全量读改写；
+        # 多标签间还被 _history_io_lock 串行化）——留在事件循环里会让所有页面卡顿
+        _, status = await run.io_bound(detection.clip_action, action, idx, video_path=vp)
+        _refresh_result_cards_soon()  # 整列表重建推到下一帧，先让状态栏反馈上屏
         _set_status(status, 'info')
 
     async def _on_highlights():
@@ -1522,8 +1653,9 @@ def main_page():
                 path, status = None, f"❌ 集锦生成异常: {_e}\n{traceback.format_exc()}"
             finally:
                 # hl_busy 由 generate_highlights 内部 finally 释放（锁归任务本体：
-                # 页面刷新取消 UI 协程时后台线程仍在跑，UI 提前重置会让新页面
-                # 对同一视频再次启动集锦，两线程写同一输出文件）；UI 只收迷你条
+                # 刷新页面只是本页不再自动刷新，后台线程仍在跑——事件协程被调度为
+                # 全局任务，client 删除不会取消它；UI 提前重置会让新页面对同一视频
+                # 再次启动集锦，两线程写同一输出文件）；UI 只收迷你条
                 hl_progress_strip.classes(add='hidden')
                 state.clear_live('hl')
             if path and os.path.exists(path):
@@ -1726,13 +1858,23 @@ def main_page():
                     'background: var(--accent); color: var(--bg-canvas)')
         # persistent：禁止点遮罩/ESC 关闭，避免误触变成「静默不跑」
         dlg.props('persistent')
-        return bool(await dlg)
+        # N12：对话框 await 结束后只会被 close（hide），元素本身留在页面树里
+        # （NiceGUI 文档明说 dialog 是元素，"either create it only once ... or
+        # remove it"）→ 每次加载缺分数的历史记录都会残留一个。放 finally 回收；
+        # client 已被删时该对话框已由 canary 删除，故先判 is_deleted。
+        try:
+            return bool(await dlg)
+        finally:
+            if not dlg.is_deleted:
+                dlg.delete()
 
     async def _on_load_history(rec_video=None):
         """按视频路径加载历史记录（非索引：新检测插入会使索引整体位移，点旧行会加载错记录）。"""
-        # 先问「要不要补跑 AI 复核」——必须放在拿任务锁之前：弹窗等待期间有
-        # await，若客户端此时断开、协程被取消，锁会永久占位（正常路径的锁由
-        # 后台线程归还，而那时后台线程还没启动），之后所有任务都会被拒。
+        # 先问「要不要补跑 AI 复核」——必须放在拿任务锁之前：用户思考弹窗可能几秒
+        # 到几十秒，占着进程级任务锁期间其他页面的检测/加载/集锦全都会被拒。
+        # （注意别把这里理解成"断连会取消协程所以靠取消兜底"：NiceGUI 3.16 把事件
+        # 协程经 background_tasks 调度为全局任务，client 删除不会取消它，协程照常
+        # 走完，只是元素操作退化为静默 no-op；不占锁是唯一正确的理由。）
         ai_backfill = True
         if rec_video and goal_verifier.is_enabled():
             try:
@@ -1804,33 +1946,52 @@ def main_page():
 
     # ===== 运行中任务 UI 恢复（跨刷新） =====
     # NiceGUI 刷新会重建页面并重置所有 UI；任务线程持模块级锁继续跑，进度回调
-    # 写的旧元素已销毁。此处每 0.4s 轮询共享进度槽：任务运行中恢复按钮=取消、
-    # 进度条/迷你条与阶段消息；任务结束（槽清空）自动复位按钮与进度条。
+    # 写的旧元素已不在页面里（对已删 client 的元素操作会静默失效，协程不会被取消）。
+    # 此处每 0.4s 轮询共享进度槽：任务运行中恢复按钮=取消、进度条/迷你条与阶段消息；
+    # 任务结束（槽清空）自动复位按钮与进度条。
+    # 两点克制（都在下面有注释）：①已受理的取消不被复位（_CANCEL_REQ）；
+    # ②只在用户没在看片段/集锦时自动切进度面板（_auto_show_progress）。
     def _sync_live_ui():
         try:
             d = state.live_progress["detect"]
             if d is not None:
-                if detect_btn.text != '取消':
+                if _CANCEL_REQ["detect"]:
+                    # 已请求取消但任务还没结束：维持"正在取消..."+禁用。
+                    # 若在这里复位回"取消"+enable，点过取消后按钮会每 0.4s 变回可点，
+                    # 防重复点击的形状就没了（且用户看不到取消已被受理）
+                    if detect_btn.text != '正在取消...':
+                        detect_btn.set_text('正在取消...')
+                        detect_btn.disable()
+                elif detect_btn.text != '取消':
                     detect_btn.set_text('取消')
                     detect_btn.enable()
-                _show_right_pane('progress')
+                _auto_show_progress()
                 progress_bar.set_value(d["pct"] / 100)
                 progress_text.set_text('检测中...' if d["pct"] < 80 else '生成预览片段...')
                 progress_detail.set_text(d["msg"])
-            elif detect_btn.text in ('取消', '正在取消...'):
-                detect_btn.set_text('开始识别')
-                detect_btn.enable()
+            else:
+                # 任务已真正结束（进度槽清空）：取消标记随之失效，按钮复位
+                _CANCEL_REQ["detect"] = False
+                if detect_btn.text in ('取消', '正在取消...'):
+                    detect_btn.set_text('开始识别')
+                    detect_btn.enable()
             b = state.live_progress["batch"]
             if b is not None:
-                if batch_run_btn.text != '取消':
+                if _CANCEL_REQ["batch"]:
+                    if batch_run_btn.text != '正在取消...':
+                        batch_run_btn.set_text('正在取消...')
+                        batch_run_btn.disable()
+                elif batch_run_btn.text != '取消':
                     batch_run_btn.set_text('取消')
                     batch_run_btn.enable()
                 batch_progress_strip.classes(remove='hidden')
                 batch_mini_bar.set_value(b["pct"] / 100)
                 batch_mini_text.set_text(f"{b['pct']:.0f}%")
-            elif batch_run_btn.text != '批量识别':
-                batch_run_btn.set_text('批量识别')
-                batch_run_btn.enable()
+            else:
+                _CANCEL_REQ["batch"] = False
+                if batch_run_btn.text != '批量识别':
+                    batch_run_btn.set_text('批量识别')
+                    batch_run_btn.enable()
                 batch_progress_strip.classes(add='hidden')
             h = state.live_progress["hl"]
             if h is not None:
@@ -1839,12 +2000,25 @@ def main_page():
                     hl_mini_bar.set_value(h["pct"] / 100)
                     hl_mini_text.set_text(h["msg"])
                 else:
-                    _show_right_pane('progress')
+                    _auto_show_progress()
                     progress_bar.set_value(h["pct"] / 100)
                     progress_text.set_text('正在生成集锦...')
                     progress_detail.set_text(h["msg"])
             else:
                 hl_progress_strip.classes(add='hidden')
+            # L5：AI 开关的实际状态是进程级全局量，ui.switch 只在建页时读一次 →
+            # 其他标签页切换后本页开关显示会与实际不符。timer 顺手同步（仅在
+            # 真的不一致时才写，否则每 0.4s 下发一次无意义的更新；写入期间用
+            # _syncing_ai_switch 挡住 on_change 回环）。同步后卡片上的 AI 徽标/
+            # 分诊计数也要跟着变，否则开关与实际呈现仍不一致。
+            _ai_now = bool(goal_verifier.is_enabled())
+            if bool(ai_verify_switch.value) != _ai_now:
+                _syncing_ai_switch["on"] = True
+                try:
+                    ai_verify_switch.set_value(_ai_now)
+                finally:
+                    _syncing_ai_switch["on"] = False
+                _refresh_result_cards_soon()  # 整列表重建让出本轮 timer
         except Exception:
             pass
 

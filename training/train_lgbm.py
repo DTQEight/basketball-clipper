@@ -69,6 +69,22 @@ def eval_at_precision(y_true, prob, target_p):
     return float(th), float(prec[i]), float(rec[i])
 
 
+def _backup_production_models():
+    """把现役 MODEL_FILE / META_FILE 备份到 training/backup/（带时间戳）。
+
+    R6：这两个文件与线上共用路径，覆盖即换线上模型；无备份时误跑无法回退。
+    """
+    import shutil
+    bdir = TRAINING_DIR / "backup"
+    bdir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for p in (MODEL_FILE, META_FILE):
+        if p.exists():
+            dst = bdir / f"{p.stem}.{stamp}{p.suffix}"
+            shutil.copy2(p, dst)
+            print(f"已备份现役模型: {dst}")
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -141,6 +157,10 @@ def main():
         reg_lambda=1.0, random_state=SEED, verbose=-1,
     )
     final.fit(X, y, sample_weight=w)
+    # R6：覆盖生产模型前先备份。MODEL_FILE 就是 goal_verifier 现役 A 臂文件
+    # （训练脚本与线上共用同一路径），原先无备份直接覆盖——一次误跑（残缺特征、
+    # 参数改错）就换掉线上模型且无法回退。
+    _backup_production_models()
     final.booster_.save_model(str(MODEL_FILE))
 
     # 特征重要性

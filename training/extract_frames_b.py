@@ -49,7 +49,11 @@ def load_dataset_events():
         seen.add(r["event_id"])
         events.append({"event_id": r["event_id"], "video": r["video"],
                        "resolved": resolved, "ts": float(r["ts"]),
-                       "hoop": r["hoop"], "label": "pos" if r["label"] == 1 else "neg"})
+                       "hoop": r["hoop"], "label": "pos" if r["label"] == 1 else "neg",
+                       # 必须带上来源：下游（refresh_oof / recalib_ensemble）要能
+                       # 分出「人工 √」与「模型自动 √」。丢掉它，用 auto_kept 当
+                       # 真值标定阈值就成了循环评估（N4，见 refresh_oof.py 注释）
+                       "label_source": r.get("label_source")})
 
     if HOOP_RECOVERED_FILE.exists() and FEATURES_FILE.exists():
         hoop_map = json.loads(HOOP_RECOVERED_FILE.read_text(encoding="utf-8"))
@@ -69,7 +73,8 @@ def load_dataset_events():
                 events.append({"event_id": r["event_id"], "video": r["video"],
                                "resolved": resolved, "ts": float(r["ts"]),
                                "hoop": hoop_map[r["video"]],
-                               "label": "pos" if r["label"] == 1 else "neg"})
+                               "label": "pos" if r["label"] == 1 else "neg",
+                               "label_source": r.get("label_source")})
                 n_rec += 1
             print(f"[recover] 从 features.jsonl 恢复 {n_rec} 个丢失事件")
     return events

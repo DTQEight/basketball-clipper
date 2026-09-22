@@ -281,6 +281,12 @@ def extract(model, ball_classes, device, events, log_every=20):
                     small = frame[::scale, ::scale]
                     g = small.mean(axis=2)
                     grays.append(g)
+                # 解码产出 0 帧的守卫（N14）：video_io.iter_frames 遇到容器层
+                # demux 失败是**静默 return**，此时 grays 为空，下面的 grays[0]
+                # 会 IndexError 打崩整个特征提取主流程（其余事件一起丢）
+                if not grays:
+                    errors.append((ev["event_id"], "no decoded frames"))
+                    continue
                 # 网区（缩小坐标系）：底角45度机位网兜会向侧向+下方摆动，
                 # ROI 左右各扩 0.25 筐宽、下沿延伸到 2.0 倍筐高
                 hx1, hy1, hx2, hy2 = [float(v) for v in hoop]
@@ -317,6 +323,37 @@ def extract(model, ball_classes, device, events, log_every=20):
     return out, errors
 
 
+def _relabel_features(out_path, new_labels: dict) -> int:
+    """把 features.jsonl 里指定 event_id 的 label 改写成新值（原地原子写），返回改写条数。
+
+    R7：特征与标签无关——同一条轨迹的特征不会因为人工把 √ 改成 × 而变化，
+    所以改标只需改写 label 字段，不必重跑昂贵的特征提取（每事件 ±1.5s 密集 YOLO）。
+    旧实现只按 event_id 跳过已提事件，label 冻结在首次提取时；用户改标 + 重跑
+    export 之后再跑本脚本不会更新标签，train_lgbm 就会用旧标签训练。
+    """
+    lines = out_path.read_text(encoding="utf-8").splitlines()
+    out_lines, n = [], 0
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except Exception:
+            out_lines.append(line)          # 坏行原样保留（不静默丢数据）
+            continue
+        eid = rec.get("event_id")
+        if eid in new_labels and rec.get("label") != new_labels[eid]:
+            rec["label"] = new_labels[eid]
+            n += 1
+        out_lines.append(json.dumps(rec, ensure_ascii=False))
+    if n:
+        tmp = Path(str(out_path) + ".tmp")
+        tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        tmp.replace(out_path)
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个事件（测试用）")
@@ -333,22 +370,30 @@ def main():
         sys.exit(1)
     print(f"device: {device}")
 
-    dataset = json.loads(Path(args.out).parent.joinpath("dataset_v1.json").read_text(encoding="utf-8")) \
-        if False else json.loads(DATASET_FILE.read_text(encoding="utf-8"))
+    dataset = json.loads(DATASET_FILE.read_text(encoding="utf-8"))
+    # 当前数据集里的标签（用于检出"已提特征的 label 已过期"）
+    want_label = {e["event_id"]: e.get("label") for e in dataset}
     events = dataset
     if args.limit:
         events = events[:args.limit]
 
-    # 断点续跑：跳过已提取的
-    done_ids = set()
-    if Path(args.out).exists():
-        for line in Path(args.out).read_text(encoding="utf-8").splitlines():
+    # 断点续跑：跳过已提取的；但**标签变了要改写**（特征不变，不必重算，见 R7）
+    out_path = Path(args.out)
+    done_map = {}                       # event_id -> features.jsonl 里已写的 label
+    if out_path.exists():
+        for line in out_path.read_text(encoding="utf-8").splitlines():
             try:
-                done_ids.add(json.loads(line)["event_id"])
+                rec = json.loads(line)
+                done_map[rec["event_id"]] = rec.get("label")
             except Exception:
                 pass
-        events = [e for e in events if e["event_id"] not in done_ids]
-        print(f"断点续跑：已完成 {len(done_ids)}，本次处理 {len(events)}")
+        stale = {eid for eid, lab in done_map.items()
+                 if eid in want_label and want_label[eid] != lab}
+        if stale:
+            _n = _relabel_features(out_path, {eid: want_label[eid] for eid in stale})
+            print(f"标签更新：改写 {_n} 条已提特征（特征不变，无需重算）")
+        events = [e for e in events if e["event_id"] not in done_map]
+        print(f"断点续跑：已完成 {len(done_map)}，本次处理 {len(events)}")
 
     if not events:
         print("没有待处理事件。")
@@ -363,7 +408,7 @@ def main():
     with open(args.out, "a", encoding="utf-8") as fo:
         for r in feats:
             fo.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"完成：新提取 {len(feats)}，累计 {len(done_ids) + len(feats)}")
+    print(f"完成：新提取 {len(feats)}，累计 {len(done_map) + len(feats)}")
     if errors:
         print(f"错误 {len(errors)} 个（前 10）：")
         for eid, msg in errors[:10]:

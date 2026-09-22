@@ -57,11 +57,16 @@ def zero_err_point(y, s):
 
 
 def collect():
-    """所有「已标注且有全部分数」的场次。"""
+    """所有「已**人工**标注且有全部分数」的场次。
+
+    不用 state.label_sets（人工 ∪ 模型）：auto_kept 是 score>=keep_thr 的产物，
+    拿它当真值会变成循环评估（高分片段必然算 TP），消融对比看着好实际虚高。
+    """
     out = []
     for entry in CACHE:
         lab = state.get_labels(entry["video"])
-        kept, dele = state.label_sets(lab)   # 人工 ∪ 模型（见 state.label_sets）
+        kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
+        dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
         rows = [c for c in entry["clips"]
                 if round(float(c["ts"]), 3) in kept | dele and c.get("score") is not None]
         if rows:

@@ -73,6 +73,68 @@ def test_run_detect_zero_decoded_frames_returns_error(monkeypatch):
         _restore_state(snap)
 
 
+class TestPartialDecodeGuard:
+    """N1: 提前 EOF（只解出部分帧）不得当成"检测完成"。
+
+    旧实现只查 processed==0：一旦解出过任何一帧就按成功收尾，写历史 + 删掉该
+    视频全部断点 → 后半段进球永久缺失且无法续跑。判定 partial 时必须保留断点。
+    """
+
+    def test_partial_when_fewer_frames_than_interval(self):
+        assert detection._is_partial_decode(300, 900, False) is True
+
+    def test_complete_when_all_frames_processed(self):
+        assert detection._is_partial_decode(900, 900, False) is False
+
+    def test_cancel_is_not_partial(self):
+        """用户取消走取消分支（保存断点 + 丢弃结果），不是"解码不完整"。"""
+        assert detection._is_partial_decode(300, 900, True) is False
+
+    def test_zero_frames_not_partial(self):
+        """0 帧由 decode-fail 分支负责（那条不写历史），此处不重复判。"""
+        assert detection._is_partial_decode(0, 900, False) is False
+
+
+class TestPersistMarksScope:
+    """R1: _persist_marks 必须把 clips 的 ts 作为人工标签「覆盖范围」带给 state。
+
+    漏掉 manual_scope 就退回全量替换：clips 外的旧 √/× 被当成"无标记"整批抹掉
+    （预览切片失败、片段被 7 天清理后只重建一部分，或**重检测后 clips 未回填
+    人工标记**——单视频 run_detect 路径就不回填）。用户上一轮标注静默消失。
+    """
+
+    def test_manual_scope_is_passed(self, monkeypatch):
+        captured = {}
+
+        def _fake(vp, **kw):
+            captured.update(kw)
+            return True
+
+        monkeypatch.setattr(state, "update_history_labels", _fake)
+        clips = [{"ts": 10.0, "path": "a.mp4", "idx": 0, "mark": "keep",
+                  "mark_source": "manual"},
+                 {"ts": 20.0, "path": "b.mp4", "idx": 1}]
+        detection._persist_marks("/v.mp4", clips)
+        assert captured["manual_scope"] == [10.0, 20.0]   # 范围=本次看得见的片段
+        assert captured["kept_ts_list"] == [10.0]
+
+    def test_write_manual_false_has_no_scope(self, monkeypatch):
+        """重检测路径（write_manual=False）不碰人工标签，也不该传覆盖范围。"""
+        captured = {}
+
+        def _fake(vp, **kw):
+            captured.update(kw)
+            return True
+
+        monkeypatch.setattr(state, "update_history_labels", _fake)
+        detection._persist_marks(
+            "/v.mp4",
+            [{"ts": 10.0, "path": "a.mp4", "mark": "keep", "mark_source": "auto"}],
+            write_manual=False)
+        assert captured["manual_scope"] is None
+        assert captured["kept_ts_list"] is None
+
+
 class TestExportSingleClipHq:
     """export_single_clip_hq：卡片「导出」按集锦规格现切单球（hq 质量 + 时长）。
 

@@ -1,4 +1,5 @@
 """视频工具函数：帧编码、文件扫描。"""
+import logging
 import os
 import re
 import base64
@@ -6,6 +7,8 @@ import base64
 import cv2
 
 from . import state
+
+_log = logging.getLogger("video_utils")
 
 
 def frame_to_base64(frame) -> "str | None":
@@ -45,7 +48,14 @@ def scan_video_files(folder) -> list:
     if not folder or not os.path.isdir(folder):
         return []
     files = []
-    for name in os.listdir(folder):
+    try:
+        names = os.listdir(folder)
+    except OSError as e:
+        # N9：网络盘（Y:）中途断开 / 权限不足时 listdir 会抛 OSError，旧实现
+        # 让它穿透到 UI 回调（与上面 isdir 的"静默返回空"不一致）。统一按空处理。
+        _log.warning(f"[WARN] 扫描目录失败 {folder}: {e}")
+        return []
+    for name in names:
         ext = os.path.splitext(name)[1].lower()
         # isfile 过滤：扩展名形如 *.mp4 的子目录不应被当作视频返回
         if ext in state.VIDEO_EXTS:

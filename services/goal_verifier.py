@@ -215,8 +215,16 @@ def _load_temporal():
                 b_resnet = b_nets = None
             if b_nets is None:
                 b_resnet = _backbone()
-                b_nets = [_load_net(p) for p in (TEMPORAL_BIGRU, TEMPORAL_POOL)]
                 b_pre = "imagenet"
+                # M1：兜底也要包 try —— 否则这里任一异常会冒泡到外层 except，
+                # 把**完好的 Flow 臂一起禁用**（Flow 自己的兜底只禁本臂，两臂不对称）。
+                # B 臂不可用时只跳过它，其余臂照常打分。
+                try:
+                    b_nets = [_load_net(p) for p in (TEMPORAL_BIGRU, TEMPORAL_POOL)]
+                except Exception as e:
+                    _log.warning("goal_verifier: B 臂 ImageNet 兜底也失败"
+                                 "（该臂禁用）: %s", e)
+                    b_nets = None
 
             # ---- Flow 臂：光流域 SimCLR 骨干优先，缺失退回 ImageNet ----
             flow_resnet = flow_nets = None
@@ -383,6 +391,27 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
+def _available_arms() -> list:
+    """当前可参与打分的臂（只看产物齐备性，不加载模型）。
+
+    R9：指纹必须涵盖**实际参与的臂组合**。缺臂时 combine 会按剩余权重重归一化，
+    算出的分数与四臂全量不是同一口径；若两者共用同一指纹，臂恢复后
+    invalidate_stale 会判"口径未变"而不重算，降级分数就冒充了全量口径
+    （阈值按全组合 OOF 标定，缺臂沿用即错配 → 低带误 × 漏球、高带误 √ 固化）。
+    """
+    arms = []
+    if LGBM_MODEL.exists():
+        arms.append("a")
+    # B 臂：SimCLR 优先，缺失时退 ImageNet 双头兜底
+    if B_SIMCLR_FILE.exists() or (TEMPORAL_BIGRU.exists() and TEMPORAL_POOL.exists()):
+        arms.append("b")
+    if FLOW_SIMCLR_FILE.exists() or FLOW_MODEL.exists():
+        arms.append("flow")
+    if VM_MODEL.exists():
+        arms.append("vm")
+    return arms
+
+
 def model_fingerprint() -> str:
     """当前判定口径的指纹：各臂模型文件 + 球检测权重 + 集成权重/阈值。
 
@@ -414,6 +443,8 @@ def model_fingerprint() -> str:
         h.update(b"w:-")
     h.update(json.dumps(sorted(ENS_WEIGHTS.items())).encode())
     h.update(str(thr).encode())
+    # R9：把「当前可参与的臂组合」计入指纹（缺臂 → 分数是重归一化的另一口径）
+    h.update(",".join(_available_arms()).encode())
     return h.hexdigest()[:12]
 
 
@@ -421,18 +452,25 @@ def invalidate_stale(clips) -> int:
     """丢弃口径已过期的分数（就地）。返回被作废的片段数。
 
     verify_ver 与当前指纹不一致（或旧数据根本没有该字段）→ 清掉 score 及各臂分，
-    调用方的"缺分数"分支就会重跑复核。人工标记 mark/mark_source 不动。
+    调用方的"缺分数"分支就会重跑复核。
+
+    M2：同时清掉**模型来源**的 mark/mark_source —— mark 是旧口径分数分带的产物，
+    留着会在本片段重打分失败时被 _sync_marks 当成有效判断写进历史（口径污染）。
+    人工标记（mark_source == "manual"）永远不动。
     """
     fp = model_fingerprint()
     n = 0
     for c in clips:
-        if "score" not in c:
-            continue
         if c.get("verify_ver") == fp:
             continue
+        if "score" not in c and c.get("mark_source") != "auto":
+            continue                    # 既无分数也无模型标记 → 无事可做
         for k in ("score", "verify_ver", "auto", "auto_reject", "verify_score",
                   "score_lgbm", "score_b", "score_flow", "score_vm"):
             c.pop(k, None)
+        if c.get("mark_source") == "auto":
+            c.pop("mark", None)
+            c.pop("mark_source", None)
         n += 1
     return n
 
@@ -455,6 +493,13 @@ def refresh_auto(clips) -> int:
     n = 0
     for c in clips:
         if "score" not in c:
+            # N6：无分（本轮重打分失败 / 已被 invalidate_stale 清掉）时，残留的
+            # 模型标记必须清掉——它是**旧口径**分带的产物，留着会被 _sync_marks
+            # 当成有效判断写进历史（口径污染）。人工标记不动。
+            if c.get("mark_source") == "auto":
+                c.pop("mark", None)
+                c.pop("mark_source", None)
+                n += 1
             continue
         s = float(c["score"])
         c["verify_score"] = round(s, 3)
@@ -581,18 +626,25 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
             # ---- B 臂：帧特征 → bigru/pool 双头均值 ----
             # 预处理按骨干口径分流：SimCLR 用裸 /255（编码器这么训的），
             # 退回 ImageNet 时才是 mean/std
-            arr = np.concatenate([b[1] for b in chunk]).astype(np.float32) / 255.0
-            arr = arr[..., ::-1]  # BGR→RGB
-            arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))
-            with torch.no_grad():
-                t = torch.from_numpy(arr).to(device)
-                if b_pre == "imagenet":
-                    t = (t - mean) / std
-                feat = b_resnet(t)  # (N*16, 512)
-                for j, (c, _) in enumerate(chunk):
-                    f = feat[j * n_frames:(j + 1) * n_frames].unsqueeze(0)
-                    ps = [float(torch.sigmoid(n(f)).item()) for n in b_nets]
-                    c["score_b"] = round(sum(ps) / len(ps), 3)
+            # 与 Flow 臂对称：本臂不可用（None）或推理失败时只跳过它，不连累其它臂
+            if b_nets:
+                try:
+                    arr = np.concatenate([b[1] for b in chunk]).astype(np.float32) / 255.0
+                    arr = arr[..., ::-1]  # BGR→RGB
+                    arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))
+                    with torch.no_grad():
+                        t = torch.from_numpy(arr).to(device)
+                        if b_pre == "imagenet":
+                            t = (t - mean) / std
+                        feat = b_resnet(t)  # (N*16, 512)
+                        for j, (c, _) in enumerate(chunk):
+                            f = feat[j * n_frames:(j + 1) * n_frames].unsqueeze(0)
+                            ps = [float(torch.sigmoid(n(f)).item()) for n in b_nets]
+                            c["score_b"] = round(sum(ps) / len(ps), 3)
+                except Exception as e:
+                    _log.warning("goal_verifier: B 臂推理失败（跳过该臂）: %s", e)
+                    for c, _ in chunk:
+                        c.pop("score_b", None)
             # ---- Flow 臂：光流幅度序列 → ResNet18 → bigru ----
             # 与 B 臂同理按骨干口径分流：光流 SimCLR 用裸 /255，退回
             # ImageNet 时才是 mean/std（两套口径不能混）
@@ -681,8 +733,13 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None):
         try:
             feats, errors = extract(m, ball_classes, device, events)
         except Exception as e:
-            _log.warning("goal_verifier: A 臂提特征失败（跳过剩余候选）: %s", e)
-            break
+            # N13：单批提特征失败只跳过**这一批**。旧实现 break 会放弃其后全部
+            # 候选的 A 臂打分——部分片段缺 A 臂而其余有，跨候选分数不可比
+            # （combine 对缺臂片段按剩余权重重归一化，等于换了个口径）。
+            _log.warning("goal_verifier: A 臂提特征失败（跳过本批 %d 个候选）: %s",
+                         len(chunk), e)
+            n_err += len(chunk)
+            continue
         n_err += len(errors)
         for row in feats:
             c = clip_by_eid.get(row.get("event_id"))

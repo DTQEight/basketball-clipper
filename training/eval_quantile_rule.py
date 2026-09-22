@@ -28,9 +28,15 @@ FRACS = (0.05, 0.10, 0.15, 0.20)
 
 
 def labelled(entry):
-    """[(ts, score, is_goal)]，只含已标注且有分数的片段（标注取人工 ∪ 模型）。"""
+    """[(ts, score, is_goal)]，只含已**人工**标注且有分数的片段。
+
+    不用 state.label_sets（人工 ∪ 模型）：auto_kept 正是 score>=keep_thr 的产物，
+    拿它当真值评 score 会让高分片段必然算 TP（循环评估），分位数规则看着很准、
+    实际是自证。见 state.label_sets 的提示。
+    """
     lab = state.get_labels(entry["video"])
-    kept, dele = state.label_sets(lab)
+    kept = {round(float(t), 3) for t in (lab.get("kept") or [])}
+    dele = {round(float(t), 3) for t in (lab.get("deleted") or [])}
     out = []
     for c in entry["clips"]:
         ts = round(float(c["ts"]), 3)

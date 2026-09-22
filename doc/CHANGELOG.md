@@ -1286,7 +1286,7 @@ ETA 定版后的增量审查，按优先级修复 P1×4 / P2×3 / P3×3，测试
 #### 🔴 第二轮（`59b098d`）：复审发现的 P0 回归 + 锁机制深化
 
 - **P0（上轮引入的回归）**：`on_batch_load_video` 传 `total=None` 给 `read_frame` 抛 TypeError——**批量切换已标定视频必崩**。修复为 `total=0` + 新增 `test_video_io.py` 契约用例
-- **锁归任务本体（机制改造）**：`try_acquire_task` 返回递增 **token**，`release_task(token)` 校验后释放；`run_detect`/`run_batch_detect`/`generate_highlights` 在**自身 finally** 释放锁——页面刷新取消 UI 协程时后台线程持锁跑到结束，彻底消除"锁已释放、旧线程还在写 state"的并发窗口
+- **锁归任务本体（机制改造）**：`try_acquire_task` 返回递增 **token**，`release_task(token)` 校验后释放；`run_detect`/`run_batch_detect`/`generate_highlights` 在**自身 finally** 释放锁——NiceGUI 事件 handler 的 awaitable 由 `background_tasks.create_or_defer` 调度为全局任务，页面刷新/断开并不会取消它，后台线程照常持锁跑到结束，彻底消除"锁已释放、旧线程还在写 state"的并发窗口
 - 历史加载占任务锁 + 按视频路径查找记录（原仍传渲染时索引，新检测插队后点旧行会加载错记录）
 - tracker `feed()` 检测 fps 变化重算时间窗口（构造默认 30、实际 60fps 的 API 陷阱）
 - NVENC 真实编码探测持信号量（流水线并发下探测撞配额满 → 误判不可用 → 整次集锦静默降软编）

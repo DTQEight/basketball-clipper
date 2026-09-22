@@ -14,7 +14,7 @@
   env\\python.exe training\\annotate.py export
       导出 training/dataset_v1.json（A 阶段可用的格式：事件元信息 + 标签）
 
-数据目录固定：E:\\basketball-project\\training\\（C 盘空间紧张时的安全位置）
+数据目录固定：项目根下 training/（跟着仓库走，不写死盘符）
 """
 from __future__ import annotations
 
@@ -29,13 +29,18 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-# ===== 路径常量（强绑定 E 盘，不受 BBALL_CACHE_ROOT 环境变量影响） =====
+# ===== 路径常量（跟项目根，不受 BBALL_CACHE_ROOT 环境变量影响） =====
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TRAINING_DIR = PROJECT_ROOT / "training"  # 固定：e:\basketball-project\training
+TRAINING_DIR = PROJECT_ROOT / "training"
 CLIPS_DIR = TRAINING_DIR / "clips"
 LABELS_FILE = TRAINING_DIR / "labels.jsonl"
 DATASET_FILE = TRAINING_DIR / "dataset_v1.json"
 HISTORY_FILE = PROJECT_ROOT / "cache" / "detection_history.json"
+
+# 脚本以 `python training/annotate.py` 方式运行时 sys.path[0] 是 training/，
+# 项目根的包（cutter/services/video_io）不在导入路径上——不插入的话
+# `from cutter.ffmpeg_cutter import ...` 会 ImportError，静默退到硬编码兜底参数
+sys.path.insert(0, str(PROJECT_ROOT))
 
 TRAINING_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,11 +127,13 @@ def _ffmpeg_exe():
 def _build_preview_encode_args(ff: str):
     """与 detection._generate_preview_clips 相同：480p + 预览码率。"""
     try:
-        from cutter.ffmpeg_cutter import _build_encode_args
-        return _build_encode_args(ff, quality="preview")
+        from cutter.ffmpeg_cutter import build_encode_args
+        return build_encode_args(ff, quality="preview")
     except Exception:
-        # 兜底，硬编码合理参数
-        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-an"]
+        # 兜底，硬编码合理参数。必须带 -pix_fmt yuv420p：HDR/10bit 源直接交给
+        # libx264 会被原样编成 High10，系统播放器播不出（见 build_encode_args 注释）
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                "-pix_fmt", "yuv420p", "-an"]
 
 
 def _resolve_video_path(target_path: str) -> str | None:
@@ -244,6 +251,14 @@ def cmd_slice(args):
             fps = float(info.get("fps") or fps)
         except Exception:
             pass
+        # 「给人看的」标注片段与预览切片同口径：HDR（手机 .mov，HLG/PQ）压成
+        # BT.709 SDR，SDR 源只钉颜色标记。旧实现固定 scale=-2:480 → HDR 源画面
+        # 偏淡、10bit 还会被直编成 High10 导致系统播放器播不出。按视频算一次。
+        try:
+            from cutter.ffmpeg_cutter import build_view_filter
+            _vf = build_view_filter(resolved_v, scale="scale=-2:480")
+        except Exception:
+            _vf = "scale=-2:480"
         for ts, gi in items:
             out_name = f"{_event_id(orig_v, ts)}.mp4"
             out_path = CLIPS_DIR / out_name
@@ -258,7 +273,7 @@ def cmd_slice(args):
                 _sp.run([ff, "-y", "-loglevel", "error",
                          "-ss", f"{start_sec:.3f}", "-i", resolved_v,
                          "-t", f"{dur_sec:.3f}",
-                         "-vf", "scale=-2:480"] + enc_args +
+                         "-vf", _vf] + enc_args +
                         ["-movflags", "+faststart", str(out_path)],
                         creationflags=SBOX, capture_output=True, timeout=120)
                 ok = out_path.exists() and out_path.stat().st_size > 0

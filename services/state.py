@@ -127,6 +127,10 @@ def _purge_old_clips(max_days=7):
     for fname in os.listdir(out):
         if fname.endswith("-highlights.mp4"):
             continue  # 集锦成品不按临时文件清理
+        # N8：单球导出同样是成品（{源名}-goal-{ts}s.mp4，见 detection.export_single_clip_hq），
+        # 与原预览片段同目录。只豁免集锦的话，用户导出的单球一周后被静默删掉。
+        if fname.endswith(".mp4") and "-goal-" in fname:
+            continue
         fpath = os.path.join(out, fname)
         try:
             if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
@@ -318,17 +322,45 @@ _CHECKPOINT_PARAM_KEYS = (
 )
 
 
+def _ball_weights_fingerprint():
+    """球检测权重（weights/*.pt）的「文件名+mtime」指纹；取不到返回 None。
+
+    N3：换 weights/basketball_ft.pt 是正常工作流，但球检测权重决定检测结果与
+    A 臂特征分布——不纳入指纹的话，"继续识别"会在同一断点前后用两套权重推理，
+    结果口径分裂且无任何提示。AI 侧 model_fingerprint 早已计入，断点侧原先漏了。
+    """
+    try:
+        d = _ROOT / "weights"
+        if not d.is_dir():
+            return None
+        items = [(p.name, int(p.stat().st_mtime)) for p in sorted(d.glob("*.pt"))]
+        return items or None
+    except Exception:
+        return None
+
+
 def _checkpoint_params_fingerprint(params: dict) -> str:
     """计算检测参数的指纹（用于隔离不同参数下的 checkpoint）。
 
     只纳入影响检测结果的关键参数；UI 展示性参数不计入。
+
+    N2：数值统一归一化成 float —— UI 滑块值经 JSON 回传时 2.0 会变成 2，
+    repr 不同 → 指纹不同 → 弹窗说"可继续"而 load_checkpoint 找不到断点，
+    静默从头重跑。bool 在数值分支之前判，避免 True 被折成 1.0 与整数 1 混同。
+    N3：额外纳入球检测权重指纹（换权重后旧断点已无意义）。
     """
     items = []
     for k in _CHECKPOINT_PARAM_KEYS:
         v = params.get(k)
-        if isinstance(v, (list, tuple)):
-            v = tuple(v)  # list 不可 hash，转 tuple
+        if isinstance(v, bool):
+            v = bool(v)
+        elif isinstance(v, (list, tuple)):
+            v = tuple(float(x) if isinstance(x, (int, float)) and not isinstance(x, bool)
+                      else x for x in v)
+        elif isinstance(v, (int, float)):
+            v = float(v)
         items.append((k, v))
+    items.append(("__ball_weights", _ball_weights_fingerprint()))
     raw = repr(items)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
@@ -663,7 +695,13 @@ def load_history() -> list:
     def _sort_key(r):
         ts = r.get("timestamp")
         if ts is not None:
-            return float(ts)
+            # M6：timestamp 非数值（手改 / 外部工具写入）不能让整个 load_history
+            # 抛 ValueError——那会让 add_history 不落盘、get_labels 崩 UI，
+            # 一个坏文件毒化**全部**历史。与下面 time 字符串分支同样容错。
+            try:
+                return float(ts)
+            except (TypeError, ValueError):
+                return 0.0
         # 旧记录只有 time 字符串，解析为时间戳用于排序
         tstr = r.get("time", "")
         try:
@@ -696,32 +734,47 @@ def save_history(records) -> bool:
 
 
 def _find_history_record(records, video_path):
-    """按 video 字段找记录：精确匹配优先，失败后按文件名兜底
-    （视频迁移目录后历史记录里还是旧路径，basename 一致即视为同一条）。
+    """按 video 字段找记录：精确匹配优先，失败后按文件名兜底。
     返回记录下标或 None。
+
+    M5：basename 兜底只在**唯一匹配**时生效。不同目录下的同名视频很常见
+    （多场次都叫 1st.mp4），旧实现取第一个匹配，会把标签/人物分类写进别人的
+    记录并覆盖其 labels。宁可找不到（调用方返回 False），也不猜。
     """
     for i, r in enumerate(records):
         if r.get("video") == video_path:
             return i
     base = os.path.basename(video_path)
-    for i, r in enumerate(records):
-        rv = r.get("video", "")
-        if rv and os.path.basename(rv) == base:
-            return i
-    return None
+    hits = [i for i, r in enumerate(records)
+            if r.get("video") and os.path.basename(r["video"]) == base]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _merge_manual_scope(old_list, new_set, manual_scope):
+    """人工标签的「覆盖范围」合并：范围内以新值为准，范围外保留旧值。
+
+    manual_scope=None → 全量替换（老语义，范围不限）。
+    """
+    if manual_scope is None:
+        return new_set
+    scope = {round(float(t), 3) for t in manual_scope}
+    kept_old = {round(float(t), 3) for t in (old_list or [])}
+    return new_set | {t for t in kept_old if t not in scope}
 
 
 def update_history_labels(video_path, kept_ts_list, deleted_ts_list, person_map=None,
-                          auto_rejected_ts_list=None, auto_kept_ts_list=None):
+                          auto_rejected_ts_list=None, auto_kept_ts_list=None,
+                          manual_scope=None):
     """对已有历史记录打/更新标签（加写锁防与 add_history 全量写竞态）。"""
     with _history_io_lock:
         return _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list,
                                            person_map, auto_rejected_ts_list,
-                                           auto_kept_ts_list)
+                                           auto_kept_ts_list, manual_scope)
 
 
 def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, person_map=None,
-                               auto_rejected_ts_list=None, auto_kept_ts_list=None):
+                               auto_rejected_ts_list=None, auto_kept_ts_list=None,
+                               manual_scope=None):
     """对已有历史记录打/更新标签（增量写，不重建整条记录，不会丢检测元信息）。
 
     **正负样本都按来源分流**，人工与模型各存各的：
@@ -738,6 +791,14 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
 
     auto_* 为 None 表示本次不改该字段（与 kept/deleted 同语义）。
     本次改动之前写入的记录只有 kept/deleted，无法回溯区分来源，一律按人工处理——不猜。
+
+    manual_scope: 人工标签的**覆盖范围**（ts 集合，None = 全量替换）。
+    提供时，范围内按 kept/deleted 新值写，范围外的旧人工标签**原样保留**。
+    为什么要它：调用方手里的 clips 常常不是该视频全部进球——预览切片失败、
+    片段被 7 天清理后只重生成了一部分，或**重检测后 clips 完全没有回填人工标记**
+    （单视频 run_detect 路径就不回填，只有批量/历史路径调 _restore_labels_to_clips）。
+    全量替换会把不在 clips 上的旧 √/× 当成"无标记"整批抹掉，用户上一轮的
+    标注静默消失。给范围即"只对这次看得见的片段负责"，范围外不碰。
 
     person_map: {进球ts: 人物名} 增量合并进 labels["persons"]；值为 "" 清除该 ts
     的分类；None 表示本次不改人物分类。
@@ -756,9 +817,13 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
     target = records[hit_idx]
     labels = dict(target.get("labels") or {})
     if kept_ts_list is not None:
-        labels["kept"] = sorted({round(float(t), 3) for t in kept_ts_list})
+        labels["kept"] = sorted(_merge_manual_scope(
+            labels.get("kept"),
+            {round(float(t), 3) for t in kept_ts_list}, manual_scope))
     if deleted_ts_list is not None:
-        labels["deleted"] = sorted({round(float(t), 3) for t in deleted_ts_list})
+        labels["deleted"] = sorted(_merge_manual_scope(
+            labels.get("deleted"),
+            {round(float(t), 3) for t in deleted_ts_list}, manual_scope))
     if auto_rejected_ts_list is not None:
         labels["auto_rejected"] = sorted({round(float(t), 3)
                                           for t in auto_rejected_ts_list})
@@ -781,7 +846,12 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
     # 保留记录的"检测时间"（time/timestamp）不动：旧实现覆盖成标记时间会让
     # 历史列表按标记时间排序/显示（刚标记的旧记录浮到顶部），"检测时间"
     # 字段语义混淆。标记时间已单独记录在 labels.label_time
-    return save_history(records)
+    #
+    # N17：只写被改的这一条（每条记录本就是独立文件），不要 save_history(records)
+    # 全量重写——那是 O(N) 次原子写，随历史长度线性变慢，还会和并发 get_labels
+    # 抢同一个文件（get_labels 里那段长重试就是为此打的补丁）。
+    _atomic_write_json(_history_file_for(target["video"]), target, indent=2)
+    return True
 
 
 def get_labels(video_path):
@@ -1013,11 +1083,15 @@ def _add_history_impl(video_path, hoop, goals, baseline_idx=-1,
     # 时间戳会偏移，直接沿用旧 ts 会导致加载历史时精确匹配失败，被标记过的
     # 球掉出默认集锦；匹配率过低说明两次检测结果差异过大，旧标签已无意义。
     old_labels = None
-    for r in records:
-        if r.get("video") == video_path and r.get("labels"):
-            old_labels = r.get("labels")
-            break
-    records = [r for r in records if r.get("video") != video_path]
+    # M7：旧记录查找走 _find_history_record（精确优先 + 唯一 basename 兜底）。
+    # 视频迁移目录后历史里仍记着旧路径，旧实现只按精确路径找 → 找不到旧标签，
+    # 结果历史里新旧两条并存（旧的那条永远带着过期标签）。
+    _old_idx = _find_history_record(records, video_path)
+    if _old_idx is not None:
+        old_labels = records[_old_idx].get("labels")
+    # 剔除旧记录：命中的那条 + 任何精确同路径的残留（避免新旧两条并存）
+    records = [r for i, r in enumerate(records)
+               if i != _old_idx and r.get("video") != video_path]
     rec = {
         "video": video_path,
         "video_name": os.path.basename(video_path),

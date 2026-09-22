@@ -57,10 +57,24 @@ def load(path, key="pred"):
     return {r["event_id"]: r[key] for r in read_jsonl(path)}
 
 
+def strict_auc(y_full, y_strict, s):
+    """严格人工口径 AUC（人工 √ + 全部 ×）：无样本或单类返回 None。"""
+    sel = (y_strict == 1) | (y_full == 0)
+    ys = y_strict[sel]
+    if len(ys) == 0 or ys.sum() == 0 or ys.sum() == len(ys):
+        return None
+    return roc_auc_score(ys, s[sel])
+
+
 if ARGS.from_refresh:
     # 刷新数据集后：refresh_oof.jsonl 已是同折同事件集的四臂 OOF，直接用
     _rf = read_jsonl(TR / "refresh_oof.jsonl")
     y = np.array([r["label"] for r in _rf])
+    # 严格人工口径（N4）：label_strict 排除了模型自动 √（ui_auto）正样本。
+    # 用含 auto_kept 的全量口径标定是**循环评估**——auto_kept 本身由
+    # "score >= keep_thr" 产生，高分片段必然算 TP，AUC 与工作点都虚高。
+    _has_strict = any("label_strict" in r for r in _rf)
+    y_s = np.array([r.get("label_strict", r["label"]) for r in _rf])
     P = {k: np.array([r[k] for r in _rf])
          for k in ("a", "b", "flow", "vm_lgbm")}
     P["vm"] = P.pop("vm_lgbm")
@@ -68,7 +82,16 @@ if ARGS.from_refresh:
     print("\n单臂 OOF AUC")
     for _k, _n in (("a", "A(LGBM)"), ("b", "B(SimCLR)"), ("flow", "Flow(SimCLR)"),
                    ("vm", "VM(VideoMAE)")):
-        print(f"  {_n:<20}{roc_auc_score(y, P[_k]):.4f}")
+        _line = f"  {_n:<20}{roc_auc_score(y, P[_k]):.4f}"
+        if _has_strict:
+            _sa = strict_auc(y, y_s, P[_k])
+            _line += f"   严格人工口径 {(_sa if _sa is None else round(_sa, 4))}"
+        print(_line)
+    if _has_strict:
+        _n_auto = int((y - y_s).sum())
+        print(f"\n[标定口径] 排除 {_n_auto} 个模型自动 √ 正样本（循环评估源），"
+              f"用 {len(y_s)} 事件（正 {int(y_s.sum())}）标定权重与阈值")
+        y = y_s     # 后续全体统计（rank/网格/工作点）一律走严格人工口径
 else:
     d = {r["event_id"]: r for r in read_jsonl(TR / "oof_directions.jsonl")}
     new_b = load(TR / "oof_temporal_simclr.jsonl")
