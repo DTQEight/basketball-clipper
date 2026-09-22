@@ -59,11 +59,19 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%BBALL_PORT% " ^| findstr "
 )
 if "!_KILLED!"=="1" timeout /t 2 /nobreak >nul
 
-REM --- Start service (stdout/stderr -> console + log file, PowerShell built-in Tee)
-REM [Console]::OutputEncoding=UTF8 makes PowerShell decode python's UTF-8 output correctly
+REM --- Start service (stdout/stderr -> console + log file)
+REM [Console]::OutputEncoding=UTF8 makes PowerShell decode python's UTF-8 output correctly.
+REM Do NOT use Tee-Object -FilePath: under PowerShell 5.1 it always writes
+REM Unicode (UTF-16LE), which contradicts chcp 65001 and the app's own UTF-8
+REM app.log -- any tool parsing the log as UTF-8 reads mojibake or nothing.
+REM Use a .NET StreamWriter with explicit BOM-less UTF-8 instead; AutoFlush
+REM keeps already-emitted lines on disk when the process is killed.
+REM NOTE: keep every REM/echo line in this file ASCII-only. cmd parses the
+REM batch file in the *current* codepage, so a non-ASCII comment appearing
+REM before `chcp 65001` gets decoded as GBK and executed as a command.
 cd /d "%SCRIPT_DIR%"
 echo Starting service...
-powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '%PYTHON%' -u demo_nicegui.py 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
+powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $enc=New-Object System.Text.UTF8Encoding $false; $w=New-Object System.IO.StreamWriter('%LOG_FILE%',$true,$enc); $w.AutoFlush=$true; & '%PYTHON%' -u demo_nicegui.py 2>&1 | ForEach-Object { Write-Host $_; $w.WriteLine($_) }; $w.Dispose()"
 
 echo.
 echo Service stopped. Press any key to exit.

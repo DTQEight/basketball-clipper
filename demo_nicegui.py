@@ -2,7 +2,7 @@
 
 功能：
   1. 输入视频文件路径 → 加载
-  2. 滑动到含篮筐的帧，点击画面 2 个点标定篮筐
+  2. 滑动到含篮筐的帧，点击画面 2 个点框住篮筐 + 篮网（标定）
   3. 设置起止帧、置信度、最小进球间隔
   4. 点击「开始检测」→ diff + YOLO 双确认检测进球
   5. 每个进球生成独立预览片段，人工确认保留/删除
@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from nicegui import ui
 
-from services import state, detection, video_utils
+from services import state, detection, video_utils, goal_verifier
 
 # 主按钮启动时刻（模块级，跨页面连接/刷新共享）：
 # 用于 1s 双击去抖——启动后 1s 内再次点击"开始识别/批量识别"是双击误触，
@@ -354,6 +354,25 @@ def main_page():
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
                             with ui.column().classes('gap-1 w-full p-1 max-h-[300px] overflow-y-auto'):
+                                # AI 识别总开关：关闭后不跑四臂复核（检测更快），
+                                # 候选不带任何分数与自动标记，全部留人工判定。
+                                # value 取当前运行时状态：页面重连后与其他客户端一致。
+                                ai_verify_switch = ui.switch(
+                                    'AI 识别（四臂复核）',
+                                    value=goal_verifier.is_enabled()).classes('w-full')
+
+                                def _on_ai_toggle(e):
+                                    goal_verifier.set_enabled(bool(e.value))
+                                    if e.value:
+                                        _set_status('AI 识别已开启：候选将自动分诊（√ / 待确认 / ×）', 'ok')
+                                    else:
+                                        _set_status('AI 识别已关闭：只做规则检测，候选全部需人工判定', 'info')
+                                    # 卡片上的 AI 徽标与分诊计数随开关即时变化
+                                    _refresh_result_cards()
+                                ai_verify_switch.on_value_change(_on_ai_toggle)
+                                ui.label('关闭后不跑四臂打分，检测更快；'
+                                         '已有分数与历史标签保留，重开即时恢复').classes(
+                                    'text-gray-500 text-[10px] -mt-1 mb-1')
                                 yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=True).classes('w-full')
                                 ui.label('默认每3帧（推荐, 提速）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=True).classes('w-full')
@@ -698,7 +717,7 @@ def main_page():
             # 加载失败也必须刷新卡片（state 已在 load_video 里清空，UI 要同步显示空列表）
             _refresh_result_cards()
         info_text.set_text(info)
-        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点标定篮筐' if frame is not None else info)
+        calib_status.set_text('拖动滑块选择帧，点击画面 2 个点框住篮筐+篮网' if frame is not None else info)
         # 更新断点续识别提示
         if frame is not None and state.video_state["path"]:
             _cp = state.load_checkpoint(state.video_state["path"])
@@ -735,7 +754,8 @@ def main_page():
 
     # 当前结果卡片显示的视频：None=全局模式（单视频/批量最后结果）
     # 非空=批量快照模式（流水线：后台检测继续跑，前台确认该视频的快照结果）
-    _cards_video = {"path": None}
+    # path: 批量快照查看的视频；pending_only: 三段分诊的「只看待确认」开关
+    _cards_video = {"path": None, "pending_only": False}
     # 流水线集锦小锁在 services.state（跨页面连接共享），此处不再用页面局部 dict
 
     async def _on_batch_load_video(path=None):
@@ -1200,6 +1220,11 @@ def main_page():
                     'text-xs').style('color: var(--text-secondary)')
         person_dlg.open()
 
+    def _toggle_pending_only():
+        """三段分诊：只看中间带（无人工/模型标记的片段）。"""
+        _cards_video["pending_only"] = not _cards_video["pending_only"]
+        _refresh_result_cards()
+
     def _refresh_result_cards():
         """刷新结果卡片列表。
 
@@ -1221,16 +1246,31 @@ def main_page():
                     ui.label('该视频暂无片段').classes('text-gray-400 text-xs text-center w-full')
                 else:
                     ui.label('暂无进球结果').classes('text-gray-300 text-xs text-center w-full py-4')
-                    ui.label('请先加载视频 → 标定篮筐 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
+                    ui.label('请先加载视频 → 框住篮筐+篮网 → 开始识别').classes('text-gray-400 text-xs text-center w-full')
             export_row.classes(add='hidden')  # 无结果时隐藏导出按钮
             _set_func_collapsed(False)  # 列表为空时展开功能区
             return
         export_row.classes(remove='hidden')  # 有结果时显示导出按钮
         _set_func_collapsed(True)  # 进球列表出来后自动折叠顶部功能区，把空间让给列表
         # 顶部统计行：√ / × / 待标 + 人物分类 + 导出说明
-        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
-        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
+        # AI 识别关闭时，模型自己打的分诊标记（mark_source == "auto"）一律按
+        # 「未判定」呈现：只改显示，不动缓存分数与历史标签，重开即时恢复。
+        _ai_on = goal_verifier.is_enabled()
+
+        def _eff_mark(c):
+            m = c.get("mark")
+            if not _ai_on and c.get("mark_source") == "auto":
+                return None
+            return m
+
+        n_keep = sum(1 for c in clips if _eff_mark(c) == "keep")
+        n_reject = sum(1 for c in clips if _eff_mark(c) == "reject")
         n_pending = len(clips) - n_keep - n_reject
+        # 三段分诊：自动 √（高带）/ 自动 ×（低带）分别计数，人工只需看中间带
+        n_auto_keep = sum(1 for c in clips if _ai_on and c.get("mark") == "keep"
+                          and c.get("mark_source") == "auto")
+        n_auto_rej = sum(1 for c in clips if _ai_on and c.get("mark") == "reject"
+                         and c.get("mark_source") == "auto")
         person_counts = {}
         for c in clips:
             p = c.get("person")
@@ -1267,9 +1307,21 @@ def main_page():
                 ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                     'text-xs font-bold w-full pb-1').style('color: var(--accent)')
             with ui.row().classes('w-full items-center gap-2 px-1 pb-2 flex-wrap'):
-                ui.label(f'√ {n_keep}').classes('text-xs font-bold').style('color: #22c55e')
-                ui.label(f'× {n_reject}').classes('text-xs font-bold').style('color: var(--err)')
-                ui.label(f'待标 {n_pending}').classes('text-xs').style('color: var(--text-secondary)')
+                ui.label(f'√ {n_keep}' + (f'（AI {n_auto_keep}）' if n_auto_keep else '')
+                         ).classes('text-xs font-bold').style('color: #22c55e')
+                ui.label(f'× {n_reject}' + (f'（AI {n_auto_rej}）' if n_auto_rej else '')
+                         ).classes('text-xs font-bold').style('color: var(--err)')
+                ui.label(f'待确认 {n_pending}' if n_pending else '全部已判定').classes(
+                    'text-xs font-bold' if n_pending else 'text-xs').style(
+                    'color: #f59e0b' if n_pending else 'color: var(--text-secondary)')
+                _ponly = _cards_video["pending_only"]
+                ui.button('显示全部' if _ponly else '只看待确认',
+                          on_click=_toggle_pending_only).props(
+                    'ripple flat dense no-caps').classes(
+                    'text-[10px] rounded-full px-2 py-0').style(
+                    f'color: {"#f59e0b" if _ponly else "var(--text-secondary)"}; '
+                    f'border: 1px solid {"rgba(245, 158, 11, 0.6)" if _ponly else "var(--border-subtle)"}; '
+                    f'background: {"rgba(245, 158, 11, 0.12)" if _ponly else "transparent"}')
                 if person_counts:
                     for p, n in sorted(person_counts.items()):
                         _c = person_colors.get(p, _PERSON_PALETTE[0])
@@ -1277,7 +1329,12 @@ def main_page():
                             'text-xs font-bold rounded-full px-2 py-0.5').style(
                             f'color: {_c[0]}; background: {_c[1]}; border: 1px solid {_c[0]}')
                 ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
+        n_hidden = 0
         for i, clip in enumerate(clips):
+            # 三段分诊：只看待确认时隐藏已判定（人工或模型）的片段
+            if _cards_video["pending_only"] and _eff_mark(clip):
+                n_hidden += 1
+                continue
             ts = clip["ts"]
             # 预览片段为进球时刻 ±PREVIEW_CLIP_HALF_SEC（与 _generate_preview_clips 同一常量，
             # 旧实现两处各写一个 3，改一处必漏另一处）
@@ -1286,7 +1343,7 @@ def main_page():
             end_ts = ts + half
             t_min, t_sec = int(start_ts // 60), start_ts % 60
             end_min, end_sec = int(end_ts // 60), end_ts % 60
-            mark = clip.get("mark")
+            mark = _eff_mark(clip)
             # 卡片视觉状态：√ 绿框 / × 红框半透明
             card_style = 'margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'
             if mark == 'keep':
@@ -1301,6 +1358,42 @@ def main_page():
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
+                        # AI 复核：分数始终显示，便于与人工标记对照。
+                        # 不能再用「mark is None」做门——标完之后正好是最需要复核
+                        # 对照的时候，一标就全没了（用户实测反馈）。
+                        _ai_score = clip.get("score")
+                        # AI 识别关闭时不显示徽标（分数仍在 clip 里，只是不参与呈现）
+                        if _ai_on and _ai_score is not None:
+                            _ai_auto = bool(clip.get("auto"))
+                            _ai_rej = bool(clip.get("auto_reject"))
+                            _thr_hi = goal_verifier.auto_threshold()
+                            _thr_lo = goal_verifier.reject_threshold()
+                            if _ai_auto:
+                                _badge, _bstyle, _btip = (
+                                    f'AI ✓ {_ai_score:.2f}',
+                                    'color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.5); '
+                                    'background: rgba(34, 197, 94, 0.12)',
+                                    f'四臂集成分 {clip.get("verify_score")} ≥ {_thr_hi:.2f}'
+                                    f' → 自动确认，人工可直接跳过')
+                            elif _ai_rej:
+                                _badge, _bstyle, _btip = (
+                                    f'AI × {_ai_score:.2f}',
+                                    'color: var(--err); '
+                                    'border: 1px solid rgba(239, 68, 68, 0.45); '
+                                    'background: rgba(239, 68, 68, 0.10)',
+                                    f'四臂集成分 {clip.get("verify_score")} < {_thr_lo:.2f}'
+                                    f' → 模型判为误报，人工可直接跳过')
+                            else:
+                                _badge, _bstyle, _btip = (
+                                    f'AI ? {_ai_score:.2f}',
+                                    'color: #f59e0b; '
+                                    'border: 1px solid rgba(245, 158, 11, 0.55); '
+                                    'background: rgba(245, 158, 11, 0.12)',
+                                    f'四臂集成分 {clip.get("verify_score")} 落在 '
+                                    f'{_thr_lo:.2f}–{_thr_hi:.2f} 之间 → 中间带，需人工确认')
+                            ui.label(_badge).classes(
+                                'text-[10px] px-2 py-0.5 rounded-full font-bold'
+                            ).style(_bstyle).tooltip(_btip)
                         person = clip.get("person")
                         _pc = person_colors.get(person) if person else None
                         ui.button((f'👤 {person}' if _pc else '👤 分类'),
@@ -1611,8 +1704,43 @@ def main_page():
                     ui.label(name).classes('text-xs flex-1 truncate').style('color: var(--text-primary)')
                     ui.label(f'{goals}球').classes('text-xs font-mono').style('color: var(--text-secondary)')
 
+    async def _ask_ai_backfill(video_path, n_missing, n_total):
+        """历史记录片段缺 AI 分数时，先问用户要不要现在补跑四臂复核。
+
+        补跑是分钟级开销（A 臂逐帧 YOLO 约 6.5 秒/候选），静默跑会让界面看着
+        像卡死；不补跑也能正常看结果，只是片段全部要人工判定。
+        对话框被外因关闭（页面断开等）时返回 False：宁可少跑，不可乱跑。
+        """
+        from nicegui import ui
+        _eta_min = max(1, int(round(n_missing * 6.5 / 60)))
+        with ui.dialog() as dlg, ui.card().classes('p-4 gap-3'):
+            ui.label('是否补跑 AI 识别').classes('text-lg font-bold')
+            ui.label(f'{os.path.basename(video_path)}\n'
+                     f'该记录 {n_total} 个片段里有 {n_missing} 个还没有 AI 分数。\n'
+                     f'补跑四臂复核约需 {_eta_min} 分钟；不补跑则片段全部需人工判定，\n'
+                     f'之后重开这条记录仍可补跑。').classes('text-sm whitespace-pre-line')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('直接加载', on_click=lambda: dlg.submit(False)).props('ripple').style(
+                    'background: var(--bg-elevated); color: var(--text-secondary)')
+                ui.button('补跑 AI', on_click=lambda: dlg.submit(True)).props('ripple').style(
+                    'background: var(--accent); color: var(--bg-canvas)')
+        # persistent：禁止点遮罩/ESC 关闭，避免误触变成「静默不跑」
+        dlg.props('persistent')
+        return bool(await dlg)
+
     async def _on_load_history(rec_video=None):
         """按视频路径加载历史记录（非索引：新检测插入会使索引整体位移，点旧行会加载错记录）。"""
+        # 先问「要不要补跑 AI 复核」——必须放在拿任务锁之前：弹窗等待期间有
+        # await，若客户端此时断开、协程被取消，锁会永久占位（正常路径的锁由
+        # 后台线程归还，而那时后台线程还没启动），之后所有任务都会被拒。
+        ai_backfill = True
+        if rec_video and goal_verifier.is_enabled():
+            try:
+                _need, _n_miss, _n_tot = detection.history_missing_scores(rec_video)
+            except Exception:
+                _need = False
+            if _need:
+                ai_backfill = await _ask_ai_backfill(rec_video, _n_miss, _n_tot)
         token = _try_acquire('load')
         if not token:
             return
@@ -1648,6 +1776,7 @@ def main_page():
         try:
             result = await run.io_bound(detection.on_load_history,
                                          records.index(rec), _progress_callback,
+                                         ai_backfill=ai_backfill,
                                          task_token=token)
             frame, info, status = result
         except Exception as _e:

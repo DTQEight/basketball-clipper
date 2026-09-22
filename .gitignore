@@ -18,6 +18,24 @@ train_data_manual/
 runs/
 demo_output/
 
+# 训练中间产物：帧块 / 各臂特征（约 3.5 GB，可由 training/ 下脚本重生成）
+# 只忽略特征与帧块；训练产物本身仍入库（dataset_v1.json / refresh_*.json / oof_*.jsonl / model_*）
+training/frames_b/
+training/frames_b_feat/
+training/frames_b_feat_simclr/
+training/frames_c/
+training/flow_b/
+training/flow_feat_simclr/
+training/tracks_c/
+training/traj_c/
+training/vm_feat/
+training/vm_feat_t/
+training/feat_c_ball/
+training/feat_c_glob/
+training/feat_flow/
+training/feat_traj/
+training/features.jsonl
+
 # 视频文件（太大）
 *.mp4
 *.avi

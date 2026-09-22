@@ -27,6 +27,7 @@ if str(_ROOT) not in sys.path:
 
 from . import state
 from . import video_utils
+from . import goal_verifier
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector, STATIC_BALL_SEC
@@ -110,7 +111,11 @@ def preview_frame(frame_idx):
 
 
 def click_calibrate(x, y):
-    """点击标定篮筐。"""
+    """点击标定：2 个点为对角，框住**篮筐 + 篮网**（不是只框筐圈）。
+
+    框的语义贯穿三处：状态机的「上方 / 筐内 / 下方」以框边为准（球在框内
+    需停留 2~4 帧）、AI 三臂裁剪取 3.2 × 框高、YOLO 接受范围按框宽高外扩。
+    """
     if state.video_state["path"] is None:
         return None, "请先加载视频"
     frame_idx = state.video_state["current_frame"]
@@ -128,7 +133,7 @@ def click_calibrate(x, y):
         if frame is not None:
             state.calib["baseline_frame"] = frame  # read_frame 返回全新数组，无需 copy
             state.calib["baseline_idx"] = int(frame_idx)
-        status = f"篮筐已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
+        status = f"篮筐+篮网已标定: ({x1},{y1}) - ({x2},{y2}) | 基准帧: 第 {int(frame_idx)} 帧"
         state.calib["clicks"] = []
     if frame is None:
         return None, status
@@ -142,10 +147,54 @@ def reset_hoop():
     state.calib["hoop"] = None
     state.calib["baseline_frame"] = None
     state.calib["baseline_idx"] = -1
-    return "已重置，请重新点击 2 个点标定篮筐"
+    return "已重置，请重新点击 2 个点框住篮筐+篮网"
 
 
 # ============ 预览片段生成 ============
+
+# ===== 预览切片的打点开关（诊断用，默认关）=====
+# 背景：预览片段的每片段成本约 6~9s（与视频长短无关），但不知道钱花在哪——
+# 等 NVENC 会话配额？读网络盘源？1080p 解码？480p 编码？
+# PREVIEW_PROFILE=True  → 逐片段打印明细（等锁/ffmpeg/回退）
+# PREVIEW_PROBE_N>0    → 对前 N 个片段额外跑一次「只读源+解码、不编码」探针，
+#                        用「ffmpeg 墙钟 − 探针」近似拆出编码占比（每个探针多花约 1s）
+# 无论开关如何，每场都会在日志里留一行汇总（等锁/ffmpeg 的中位与最大、回退次数）。
+PREVIEW_PROFILE = False
+PREVIEW_PROBE_N = 0
+
+
+def _preview_timing_summary(records):
+    """把逐片段打点汇总成一行摘要（纯函数，便于单测）。
+
+    records: [{"wait": 等锁秒, "wall": ffmpeg 墙钟秒, "probe": 只读+解码秒|None,
+               "fallback": bool}, ...]
+    """
+    if not records:
+        return '预览打点: 无片段'
+    def _med(vals):
+        s = sorted(v for v in vals if v is not None)
+        return s[len(s) // 2] if s else float('nan')
+    wall = [r.get('wall') for r in records]
+    wait = [r.get('wait') or 0.0 for r in records]
+    probe = [r.get('probe') for r in records if r.get('probe') is not None]
+    n_fb = sum(1 for r in records if r.get('fallback'))
+    tot_wall = sum(v for v in wall if v)
+    tot_wait = sum(wait)
+    parts = ['预览打点: %d 片段 | ffmpeg 合计 %.1fs | 等锁合计 %.1fs（%.0f%%）'
+             % (len(records), tot_wall, tot_wait,
+                100 * tot_wait / max(tot_wall + tot_wait, 1e-9))]
+    parts.append('等锁 中位/最大 %.2f/%.2fs' % (_med(wait), max(wait) if wait else 0.0))
+    if any(v for v in wall):
+        parts.append('ffmpeg 中位/最大 %.2f/%.2fs'
+                     % (_med(wall), max(v for v in wall if v)))
+    if probe:
+        mp, mw = _med(probe), _med(wall)
+        parts.append('探针(只读+解码) 中位 %.2fs → 编码约占 %.0f%%'
+                     % (mp, 100 * max(0.0, mw - mp) / max(mw, 1e-9)))
+    if n_fb:
+        parts.append('NVENC 回退 %d 次' % n_fb)
+    return ' | '.join(parts)
+
 
 def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                             progress_callback=None, cancel_check=None):
@@ -176,6 +225,8 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     clip_half = int(fps * PREVIEW_CLIP_HALF_SEC)
     # 软编回退参数：NVENC 运行时失败（驱动/会话配额）时单段重切用
     _enc_x264 = None if not _is_nvenc else build_encode_args(ff, quality="preview", use_nvenc=False)
+    # 打点记录（多线程 append，CPython 下 list.append 原子，无需加锁）
+    _preview_recs = []
 
     def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
         return [ff, "-y", "-loglevel", "error",
@@ -184,21 +235,46 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                 "-vf", "scale=-2:480"] + enc_args + \
                ["-movflags", "+faststart", clip_path]
 
+    def _probe_decode(seg_start_sec, seg_dur_sec):
+        """只读源 + 解码 + 缩放、不编码（输出丢到 null），返回墙钟秒。
+
+        与真实切片走同样的 -ss/-i/-vf，只把「编码+写盘」换成 null muxer，
+        因此「切片墙钟 − 探针」近似就是编码+写盘那段。
+        """
+        cmd = [ff, "-loglevel", "error",
+               "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
+               "-t", f"{seg_dur_sec:.3f}",
+               "-vf", "scale=-2:480", "-f", "null", "-"]
+        _t = time.time()
+        _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
+                text=True, timeout=60)
+        return time.time() - _t
+
     def _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args):
-        """跑一次 ffmpeg 切片。失败抛异常（含 stderr 尾部）。"""
-        # NVENC 会话配额（消费卡限 2 路）：与集锦 cut_clips 共用信号量排队
+        """跑一次 ffmpeg 切片。失败抛异常（含 stderr 尾部）。
+
+        返回 (等锁秒, ffmpeg 墙钟秒)。等锁 = NVENC 信号量排队时间（软编恒为 0）
+        ——信号量把整条 ffmpeg（含读源/解码）都圈在里面，所以等锁与执行互斥。
+        """
+        cmd = _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args)
+        wait = 0.0
         if "h264_nvenc" in enc_args:
+            _t0 = time.time()
             with state.nvenc_semaphore:
-                _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
-                             creationflags=state.SBOX, capture_output=True,
+                wait = time.time() - _t0
+                _t1 = time.time()
+                _r = _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                              text=True, timeout=60)
+                wall = time.time() - _t1
         else:
-            _r = _sp.run(_cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args),
-                         creationflags=state.SBOX, capture_output=True,
+            _t1 = time.time()
+            _r = _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                          text=True, timeout=60)
+            wall = time.time() - _t1
         if _r.returncode != 0:
             tail = (_r.stderr or "")[-1500:].strip()
             raise RuntimeError(f"ffmpeg exit {_r.returncode}: {tail}")
+        return wait, wall
 
     def _cut_one(gi, gts):
         """切单个片段，成功返回 clip dict，失败/取消返回 None（异常不外抛）。
@@ -217,27 +293,49 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
         seg_start_sec = seg_start / fps
         seg_dur_sec = (seg_end - seg_start) / fps
         enc_args = _enc
-        for _attempt in range(2):  # 第 2 次 = NVENC 失败后软编重试
-            try:
-                _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args)
-                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                    return {"ts": gts, "path": clip_path, "idx": gi}
-                log.warning(f"[WARN] 预览片段生成空文件 ({gts:.1f}s)，跳过")
-                return None
-            except Exception as e:
-                if _attempt == 0 and _enc_x264 is not None:
-                    log.warning(f"[WARN] 预览片段 NVENC 失败 ({gts:.1f}s)，回退软编重切: {e}")
-                    enc_args = _enc_x264
-                    continue
-                log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
-                # 清理失败残留的半截文件（旧实现留着 0 字节文件占目录）
+        # 打点：wait/wall 为两次尝试（含回退）的累计值
+        rec = {"gi": gi, "ts": gts, "wait": 0.0, "wall": 0.0,
+               "probe": None, "fallback": False, "ok": False}
+        try:
+            for _attempt in range(2):  # 第 2 次 = NVENC 失败后软编重试
                 try:
-                    if os.path.exists(clip_path):
-                        os.remove(clip_path)
-                except OSError:
-                    pass
-                return None
-        return None
+                    _wait, _wall = _run_cut(clip_path, seg_start_sec, seg_dur_sec, enc_args)
+                    rec["wait"] += _wait
+                    rec["wall"] += _wall
+                    if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                        if PREVIEW_PROBE_N > 0 and gi < PREVIEW_PROBE_N:
+                            try:
+                                rec["probe"] = _probe_decode(seg_start_sec, seg_dur_sec)
+                            except Exception as _pe:
+                                log.warning(f"[WARN] 预览打点探针失败 ({gts:.1f}s): {_pe}")
+                        rec["ok"] = True
+                        return {"ts": gts, "path": clip_path, "idx": gi}
+                    log.warning(f"[WARN] 预览片段生成空文件 ({gts:.1f}s)，跳过")
+                    return None
+                except Exception as e:
+                    if _attempt == 0 and _enc_x264 is not None:
+                        log.warning(f"[WARN] 预览片段 NVENC 失败 ({gts:.1f}s)，回退软编重切: {e}")
+                        rec["fallback"] = True
+                        enc_args = _enc_x264
+                        continue
+                    log.warning(f"[WARN] 预览片段生成失败 ({gts:.1f}s): {e}")
+                    # 清理失败残留的半截文件（旧实现留着 0 字节文件占目录）
+                    try:
+                        if os.path.exists(clip_path):
+                            os.remove(clip_path)
+                    except OSError:
+                        pass
+                    return None
+            return None
+        finally:
+            # 取消/空文件/失败也留档——这些才是「为什么慢」的高价值样本
+            _preview_recs.append(rec)
+            if PREVIEW_PROFILE:
+                log.info('[打点] 片段 %d ts=%.1fs 等锁 %.2fs ffmpeg %.2fs%s%s%s'
+                         % (gi, gts, rec['wait'], rec['wall'],
+                            '' if rec['probe'] is None else ' 探针 %.2fs' % rec['probe'],
+                            ' 回退' if rec['fallback'] else '',
+                            '' if rec['ok'] else ' 失败'))
 
     clips = []
     _done = 0
@@ -258,10 +356,80 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
                                   f'生成片段 {_done}/{len(goals)} | 预计剩余 {_eta_sec:.0f}s')
     # as_completed 完成顺序乱，按进球序恢复，保证卡片时间戳顺序稳定
     clips.sort(key=lambda c: c["idx"])
+    # 每场固定留一行打点（含失败/回退片段），用于定性「钱花在等锁/IO/解码/编码哪一段」
+    log.info(_preview_timing_summary(sorted(_preview_recs, key=lambda r: r["gi"])))
     return clips
 
 
 # ============ 检测 ============
+
+def _split_marks_by_source(clips):
+    """把片段标记按**来源**分成 4 组 ts，返回 (人工√, 人工×, 模型√, 模型×)。
+
+    落盘口径的唯一出口：人工 √/× 进 kept/deleted（训练集读它），模型自动 √/× 进
+    auto_kept/auto_rejected。任何"把 clips 上的 mark 写回历史"的地方都必须走这里
+    ——少一处就会相互撤销：人工点一次卡片就把模型的判断洗成人工标签（正样本自证），
+    或把模型判的 × 混进 deleted（负样本闭环）。
+
+    人工侧用 `!= "auto"` 而不是 `== "manual"`：极少数老片段没有 mark_source，
+    宁可算人工，也不能让它两侧都不落被凭空丢掉。
+    """
+    def _ts(mark, auto):
+        return [c["ts"] for c in clips
+                if c.get("mark") == mark
+                and (c.get("mark_source") == "auto") is auto]
+
+    return _ts("keep", False), _ts("reject", False), _ts("keep", True), _ts("reject", True)
+
+
+def _persist_marks(video_path, clips, write_manual=True):
+    """把 clips 上的标记**按来源**落盘。
+
+    人工 √/× → kept/deleted（训练集读它）；模型 √/× → auto_kept/auto_rejected。
+    落盘口径的唯一出口：任何"把 clips 上的 mark 写回历史"的地方都走这里——少一处
+    就会相互撤销（人工点一次卡片把模型的判断洗成人工标签，或把模型判的 × 混进
+    deleted 形成负样本闭环）。
+
+    write_manual=False 只写模型标签、**不动** kept/deleted：run_detect 的重检测路径
+    必须用它。那次运行的 clips 是本次新生成的、不带任何 mark，若照常写就会把空的
+    人工列表当成"清空"覆盖掉 add_history 刚按容差重映射保住的人工标注（用户上一轮
+    的 √/× 全丢）。人工标签在那条路径上只由 add_history 的重映射负责。
+
+    kept 索引由调用方按各自语义同步（clip_action 只取 √；_sync_marks 在"完全无标记"
+    时要保持全选，语义不同）。不抛异常——标记是增强功能，写盘失败只记日志。
+    """
+    manual_keep, manual_rej, auto_keep, auto_rej = _split_marks_by_source(clips)
+    try:
+        state.update_history_labels(
+            video_path,
+            kept_ts_list=manual_keep if write_manual else None,
+            deleted_ts_list=manual_rej if write_manual else None,
+            auto_kept_ts_list=auto_keep,
+            auto_rejected_ts_list=auto_rej,
+        )
+    except Exception as e:
+        log.warning(f"[MARKS] 标记落盘失败（不影响本次结果）: {e}")
+
+
+def _sync_marks(video_path, clips, write_manual=True):
+    """自动标记之后的收尾：同步 kept 索引 + 把标记落盘到历史记录。
+
+    - kept_goal_indices：与 clip_action 同口径（有任何标记时只保留 √ 的索引；
+      完全无标记时保持"全选"，导出集锦不过滤，老行为不变）
+    - update_history_labels：add_history 只保留磁盘上已有的人工标签，从不读
+      clips 上的 mark；自动 √ 不单独写一次，重读历史时标记就全丢了
+    - 正负样本都按来源分流（见 _persist_marks）
+    - write_manual=False 见 _persist_marks 的说明（run_detect 重检测路径专用）
+    返回 (n_keep, n_reject)。不抛异常——标记是增强功能，失败必须静默降级。
+    """
+    marks = [c.get("mark") for c in clips]
+    n_keep = sum(1 for m in marks if m == "keep")
+    n_reject = sum(1 for m in marks if m == "reject")
+    state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
+                               if (n_keep or n_reject) else set(range(len(clips))))
+    _persist_marks(video_path, clips, write_manual=write_manual)
+    return n_keep, n_reject
+
 
 def _ball_boxes_from_result(res):
     """把 YOLO 推理结果转成候选球框列表（按置信度降序），无检出返回 []。
@@ -418,7 +586,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         return "❌ 请先加载视频", False
     if state.calib["hoop"] is None:
         _release_lock()
-        return "❌ 请先点击画面标定篮筐", False
+        return "❌ 请先点击画面框住篮筐+篮网（2 个点）", False
     if state.calib["baseline_frame"] is None:
         _release_lock()
         return "❌ 基准帧差法需要基准帧，请重新标定", False
@@ -907,6 +1075,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
 
         goals = sorted(detector.goals)
 
+        # 分桶计时：_t1 之后的三段成本必须分开记。旧口径把「切片 + AI 复核 +
+        # 收尾」合并成一个 preview 桶，导致 4~6 分钟的复核被读成「切片慢」
+        # （08.31-2nd: preview 5.2 min 里 4.6 min 是复核、切片只占 0.6 min）
+        _t_slice_done = _t1
+        _t_verify_done = _t1
+
         # ===== 预览片段生成（B7 取消语义）=====
         # 主循环被取消（_cancelled_in_loop）时不再花数分钟生成预览片段——
         # 生成完也会在下方取消分支被全部删除，纯属浪费，直接走取消收尾。
@@ -926,6 +1100,36 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                                         fps, total, _stamp, progress_callback=_report,
                                         cancel_check=state.cancel_event.is_set)
             )
+            _t_slice_done = time.time()
+
+            # ===== AI 复核：四臂集成判分，高分候选自动标记「自动通过」=====
+            # 只加 clip["auto"] / clip["verify_score"]（及各臂分），不删除任何候选，
+            # 召回不受影响（低分候选照常人工确认，灰区全部保留）。
+            # 模型缺失/加载失败/推理异常时静默降级，不影响检测结果。
+            # UI 关闭「AI 识别」时整段跳过：候选不带任何分数与自动标记，
+            # 全部留给人工判定（同时省掉 A 臂逐帧 YOLO 的数分钟开销）。
+            if state.last_goal_clips and goal_verifier.is_enabled():
+                _report(85, 'AI 复核（四臂集成）...')
+                _t_verify = time.time()
+
+                def _verify_progress(frac, stage):
+                    # A 臂逐帧 YOLO 是瓶颈（约 6.5s/候选），必须持续刷进度，
+                    # 否则复核这几分钟界面完全静止，看起来像卡死
+                    _report(85 + 14 * min(max(frac, 0.0), 1.0),
+                            f'AI 复核 {stage}')
+
+                _n_auto = goal_verifier.mark_auto(
+                    state.last_goal_clips, video_path, hoop,
+                    progress=_verify_progress)
+                _verify_sec = time.time() - _t_verify
+                if _n_auto:
+                    log.info(f"[VERIFY] 自动通过 {_n_auto}/{len(state.last_goal_clips)} "
+                             f"个候选（阈值 {goal_verifier.auto_threshold():.3f}，"
+                             f"耗时 {_verify_sec:.0f}s）")
+                else:
+                    log.info(f"[VERIFY] 无自动通过候选（{goal_verifier.unavailable_reason()}，"
+                             f"耗时 {_verify_sec:.0f}s）")
+            _t_verify_done = time.time()
         else:
             # 主循环被取消：不生成预览，列表保持为空（下方取消分支清空并保存断点）
             state.last_goal_clips.clear()
@@ -997,7 +1201,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         _t2 = time.time()
         # 全程口径：断点续跑时叠加断点前累计耗时，与从头跑同字段可比（L2）
         _total_elapsed = _prev_elapsed + (_t2 - t0)
-        _preview_elapsed = _t2 - _t1
+        _preview_elapsed = _t_slice_done - _t1            # 仅切片
+        _verify_elapsed = _t_verify_done - _t_slice_done  # 仅 AI 复核（四臂）
+        _tail_elapsed = _t2 - _t_verify_done              # 缓存落盘/断点清理/统计
         _detect_total = _prev_elapsed + _detect_elapsed
         _proc_fps = (_done_before + processed) / max(_detect_total, 0.001)
         _end_str = time.strftime('%H:%M:%S', time.localtime(_t2))
@@ -1006,7 +1212,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         log.info("")
         log.info("=" * 68)
         log.info(f"[DETECT  END] {_end_str}")
-        log.info(f"  Timing      : detect {_detect_total/60:.1f} min + preview {_preview_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
+        log.info(f"  Timing      : detect {_detect_total/60:.1f} min + preview {_preview_elapsed/60:.1f} min + verify {_verify_elapsed/60:.1f} min + tail {_tail_elapsed/60:.1f} min = {_total_elapsed/60:.1f} min total")
         log.info(f"  Speed       : {_proc_fps:.1f} frames/sec  (video {video_dur_min:.1f} min / detect {_detect_total/60:.1f} min = {video_dur_min/max(_detect_total/60,0.001):.2f}x vs realtime)")
         log.info(f"  Goals       : {len(goals)} detected")
         if goals:
@@ -1135,6 +1341,15 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           auto_threshold_value=_auto_thr_for_history,
                           warmup_p95_median=_warmup_p95_for_history,
                           warmup_sample_count=_warmup_count_for_history)
+        # ===== AI 自动 √ 落盘 =====
+        # 必须放在 add_history 之后：add_history 只保留磁盘上已有人工标签、
+        # 从不读 clips 上的 mark，先写会被随后的整条记录覆盖掉。
+        # write_manual=False：本次 clips 是新生成的、不带人工标记，只能写 auto_*；
+        # 人工标签归 add_history 的重映射（否则空列表会被当成"清空"抹掉上一轮的 √/×）。
+        if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+            _k, _r = _sync_marks(video_path, state.last_goal_clips, write_manual=False)
+            log.info(f"[VERIFY] 自动 √ 已同步（√ {_k} · × {_r} / "
+                     f"{len(state.last_goal_clips)} 个片段）")
         if _saved_record is None:
             # 磁盘/权限问题导致未落盘：显式告知（旧实现静默，用户下次启动才发现历史缺失）
             status += "\n⚠ 历史记录写入失败（磁盘/权限问题），本次结果未持久化"
@@ -1190,7 +1405,19 @@ def clip_action(action, idx, video_path=None, person=None):
     if idx < 0 or idx >= len(clips):
         return None, ""
     if action == "preview":
-        return clips[idx]["path"], f"▶ 正在预览第 {idx+1} 个片段"
+        clip = clips[idx]
+        _note = ""
+        # **点「预览」= 人工复核这个片段**：AI 已判的片段，看过之后没改 → 记为人工
+        # 确认（改了的话走 √/× 分支，本来也就是人工来源）。用户不必为了"记一笔"
+        # 多点一次，也不用重复点两下。仅在「AI 识别」开着时生效——那时卡片上才看得到
+        # AI 标记，预览才算"看了 AI 的判断"；关掉开关时标记不参与呈现，不该被顺带确认
+        if goal_verifier.is_enabled() and clip.get("mark") in ("keep", "reject") \
+                and clip.get("mark_source") == "auto":
+            clip["mark_source"] = "manual"
+            _persist_marks(video_path if video_path else state.video_state["path"], clips)
+            _sym = "√" if clip["mark"] == "keep" else "×"
+            _note = f" | 已记为人工复核（{_sym}）"
+        return clip["path"], f"▶ 正在预览第 {idx+1} 个片段{_note}"
     elif action == "export":
         return clips[idx]["path"], f"已导出: {clips[idx]['path']}"
     elif action == "set_person":
@@ -1228,20 +1455,12 @@ def clip_action(action, idx, video_path=None, person=None):
         # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）
         kept.clear()
         kept.update(i for i, c in enumerate(clips) if c.get("mark") == "keep")
-        # 标签飞轮：√ → kept_ts_list（正样本），× → deleted_ts_list（负样本）
-        kept_ts = [c["ts"] for c in clips if c.get("mark") == "keep"]
-        reject_ts = [c["ts"] for c in clips if c.get("mark") == "reject"]
-        try:
-            state.update_history_labels(
-                video_path if video_path else state.video_state["path"],
-                kept_ts_list=kept_ts,
-                deleted_ts_list=reject_ts,
-            )
-        except Exception:
-            pass
+        # 标签飞轮：按来源分流落盘（与 _sync_marks 同一个出口，见 _persist_marks）
+        _persist_marks(video_path if video_path else state.video_state["path"], clips)
         sym = {"keep": "√ 确认", "reject": "× 误报"}.get(clip["mark"], "已取消标记")
-        n_keep = len(kept_ts)
-        n_reject = len(reject_ts)
+        # 提示里的计数含模型判定（人工只需知道"这一场现在有多少 √ / ×"）
+        n_keep = sum(1 for c in clips if c.get("mark") == "keep")
+        n_reject = sum(1 for c in clips if c.get("mark") == "reject")
         msg = (f"第 {idx+1} 个片段（{ts:.1f}s）{sym} | "
                f"√ {n_keep} · × {n_reject} · 待标 {len(clips) - n_keep - n_reject}")
         return None, msg
@@ -1443,10 +1662,13 @@ def _clips_from_record(r):
 
     整场导出只需要进球时间戳 + 标记 + 人物分类，不需要预览片段文件；
     直接从记录的 goals + labels 重建，避免逐视频跑 ffmpeg。
+
+    正负样本都取**人工 ∪ 模型**（`state.label_sets`）：单视频路径里模型自动 √ 也是 √
+    （卡片绿标、参与"有 √ 只导 √"），整场导出必须同口径，否则同一批球单场有、整场没有。
+    （历史遗留数据里同一 ts 可能同时落在 √/× 两侧，沿用原有优先级：√ 先判。）
     """
     labels = r.get("labels") or {}
-    kept = {float(t) for t in (labels.get("kept") or [])}
-    deleted = {float(t) for t in (labels.get("deleted") or [])}
+    kept, deleted = state.label_sets(labels)
     persons = {}
     for k, v in (labels.get("persons") or {}).items():
         try:
@@ -1583,8 +1805,43 @@ def generate_highlights_fullgame(person_filter, pre_roll, post_roll, min_gap,
             state.release_task(task_token)
 
 
-def on_load_history(idx_choice, progress_callback=None, task_token=0):
+def history_missing_scores(video_path):
+    """这条历史记录的片段是否缺 AI 分数（加载前问用户「要不要补跑复核」用）。
+
+    只读历史记录 + 片段缓存，不生成预览、不碰 GPU，秒回。返回
+    (need_ai, n_missing, n_total)：
+      - 缓存未命中（片段要重新生成）→ 分数必然全缺
+      - 缓存命中 → 按已存 score 统计缺几个
+      - 无该记录 / 无进球 / 读取异常 → 一律 (False, 0, 0)：
+        宁可少问一次，也不能让弹窗挡住正常加载
+    """
+    try:
+        records = state.load_history()
+        r = next((x for x in records if x.get("video") == video_path), None)
+        if r is None:
+            return False, 0, 0
+        goals = [float(t) for t in r.get("goals", [])]
+        if not goals:
+            return False, 0, 0
+        cached = state.clip_cache.get(state.clip_cache_key(video_path, goals))
+        # 与 _on_load_history_impl 的 cache_hit 同口径：片段文件缺失时
+        # 缓存会被判定失效、全部重新生成，那分数一样是全缺
+        if not cached or not all(os.path.exists(c["path"]) for c in cached):
+            return True, len(goals), len(goals)
+        n_missing = sum(1 for c in cached if "score" not in c)
+        return n_missing > 0, n_missing, len(cached)
+    except Exception as e:
+        log.warning(f"[LOAD] 检查 AI 分数缺失失败（按不弹窗处理）: {e}")
+        return False, 0, 0
+
+
+def on_load_history(idx_choice, progress_callback=None, task_token=0,
+                    ai_backfill=True):
     """从历史记录加载。
+
+    ai_backfill: 片段缺 AI 分数时是否补跑四臂复核。由 UI 弹窗征求用户意见后
+    传入（补跑是分钟级开销，静默跑会让界面看着像卡死）；False 时只加载不补跑，
+    片段全部留人工判定，历史标签与缓存分数都不动，之后重开该记录仍可补跑。
 
     task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体：
     未命中片段缓存时本函数会跑 ffmpeg 生成预览（可达数十秒），
@@ -1592,13 +1849,13 @@ def on_load_history(idx_choice, progress_callback=None, task_token=0):
     锁必须等线程真正结束才释放）。
     """
     try:
-        return _on_load_history_impl(idx_choice, progress_callback)
+        return _on_load_history_impl(idx_choice, progress_callback, ai_backfill)
     finally:
         if task_token:
             state.release_task(task_token)
 
 
-def _on_load_history_impl(idx_choice, progress_callback):
+def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
     """on_load_history 的实际实现（锁由外层 wrapper 管理）。"""
     def _report(pct, msg):
         if progress_callback:
@@ -1687,17 +1944,25 @@ def _on_load_history_impl(idx_choice, progress_callback):
         c.pop("mark_source", None)
         c.pop("person", None)
 
-    # 若历史里已有人工标签（kept=√ / deleted=× / persons=人物分类），恢复而非清空
+    # 若历史里已有标签（人工 kept=√ / deleted=×，模型 auto_kept / auto_rejected，
+    # persons=人物分类），恢复而非清空。**来源要一并恢复**：模型自动 √ 不能被当成
+    # 人工 √（否则重读一次历史就把模型的判断洗成人工标签，再回灌训练集）
     labels = state.get_labels(video_path)
     deleted_set = set(labels["deleted"]) if labels.get("deleted") else set()
     kept_set = set(labels["kept"]) if labels.get("kept") else set()
+    auto_kept_set = set(labels["auto_kept"]) if labels.get("auto_kept") else set()
+    auto_rej_set = set(labels["auto_rejected"]) if labels.get("auto_rejected") else set()
     persons_map = labels.get("persons") or {}
     log.info(f"[LOAD] labels: kept={len(kept_set)} deleted={len(deleted_set)} "
+             f"auto_kept={len(auto_kept_set)} auto_rejected={len(auto_rej_set)} "
              f"persons={len(persons_map)} label_time={labels.get('label_time')}")
-    if deleted_set or kept_set:
+    if kept_set or deleted_set or auto_kept_set or auto_rej_set:
         kept_indices = []
         n_match_keep = 0
         n_match_reject = 0
+        n_auto = 0
+        # 优先级：人工 × > 人工 √ > 模型 √ > 模型 ×。跨轮次留下的陈旧标签可能
+        # 同时命中两个集合（如某 ts 早先被模型判 ×、后来人工改成 √），人工优先
         for idx, c in enumerate(state.last_goal_clips):
             ts = round(float(c["ts"]), 3)
             if ts in deleted_set:
@@ -1709,9 +1974,21 @@ def _on_load_history_impl(idx_choice, progress_callback):
                 c["mark_source"] = "manual"
                 kept_indices.append(idx)
                 n_match_keep += 1
+            elif ts in auto_kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "auto"
+                c["auto"] = True
+                kept_indices.append(idx)
+                n_auto += 1
+            elif ts in auto_rej_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "auto"
+                c["auto_reject"] = True
+                n_auto += 1
         state.kept_goal_indices = set(kept_indices)
         log.info(f"[LOAD] matched: keep={n_match_keep} reject={n_match_reject} "
-                 f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject})")
+                 f"auto={n_auto} "
+                 f"(unmatched={len(state.last_goal_clips) - n_match_keep - n_match_reject - n_auto})")
     else:
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
     # 人物分类回填（键为 round(ts,3) 精确匹配，与 mark 回填同一口径）
@@ -1724,6 +2001,48 @@ def _on_load_history_impl(idx_choice, progress_callback):
                 n_person += 1
         if n_person:
             log.info(f"[LOAD] persons matched: {n_person}")
+
+    # ===== AI 复核：历史片段缺分数时补跑四臂集成打分 =====
+    # 片段缓存历史上只存 ts/path/idx（旧条目连 score 都没有），历史回读若拿到
+    # 无分片段，卡片就没有「AI 自动通过」徽标。这里就地补跑一次并回写缓存，
+    # 补过之后分数随 put_clip_cache 落盘，后续重启/再读历史都不会再丢。
+    # UI 关闭「AI 识别」时整段跳过：不补跑、不重推阈值、不自动打标记，
+    # 卡片上的 AI 标记只在重新开启后由缓存分数即时重推（缓存与历史标签都不动）。
+    # ai_backfill=False（用户在弹窗里选了「直接加载」）同样跳过。
+    if state.last_goal_clips and hoop and ai_backfill \
+            and goal_verifier.is_enabled():
+        # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值组合会给出
+        # 错误判决，先作废再走重算分支
+        _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
+        if _n_stale:
+            log.info(f"[LOAD] AI 判定口径已变更（ver={goal_verifier.model_fingerprint()}），"
+                     f"作废 {_n_stale} 个片段的旧分数")
+        _n_missing = sum(1 for c in state.last_goal_clips if "score" not in c)
+        if _n_missing:
+            _report(70, f'AI 复核（{_n_missing}/{len(state.last_goal_clips)} '
+                        f'个片段缺分数）...')
+            _t_verify = time.time()
+
+            def _verify_progress(frac, stage):
+                _report(70 + 25 * min(max(frac, 0.0), 1.0), f'AI 复核 {stage}')
+
+            _n_auto = goal_verifier.mark_auto(
+                state.last_goal_clips, video_path, hoop,
+                progress=_verify_progress)
+            log.info(f"[LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
+                     f"自动通过 {_n_auto}/{len(state.last_goal_clips)} "
+                     f"（耗时 {time.time() - _t_verify:.0f}s）")
+        else:
+            # 分数已就绪：按当前阈值重推 auto 并自动 √（阈值可被手改，缓存里的旧标记会过时）
+            _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
+            log.info(f"[LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
+                     f"/{len(state.last_goal_clips)}"
+                     f"（阈值 {goal_verifier.auto_threshold():.3f}）")
+        state.put_clip_cache(cache_key, state.last_goal_clips)
+        # 自动 √ 同步进 kept 索引 + 历史标签（否则重读历史时标记又没了）
+        if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+            _k, _r = _sync_marks(video_path, state.last_goal_clips)
+            log.info(f"[LOAD] AI 自动 √ 已同步（√ {_k} · × {_r}）")
 
     frame = read_frame(video_path, 0, total=total, fps=fps)
     preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else None
@@ -1763,13 +2082,17 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
         labels = None
     deleted_set = set()
     kept_set = set()
+    auto_kept_set = set()
+    auto_rej_set = set()
     persons_map = {}
     if labels:
         deleted_set = {float(t) for t in (labels.get("deleted") or [])}
         kept_set = {float(t) for t in (labels.get("kept") or [])}
+        auto_kept_set = {float(t) for t in (labels.get("auto_kept") or [])}
+        auto_rej_set = {float(t) for t in (labels.get("auto_rejected") or [])}
         persons_map = labels.get("persons") or {}
     kept_idx = []
-    has_marks = bool(deleted_set or kept_set)
+    has_marks = bool(deleted_set or kept_set or auto_kept_set or auto_rej_set)
     for idx, c in enumerate(clips):
         ts = round(float(c["ts"]), 3)
         manual = c.get("mark_source") == "manual" and c.get("mark") in ("keep", "reject")
@@ -1780,6 +2103,7 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
         else:
             c["mark"] = None
             c["mark_source"] = None
+            # 与 _on_load_history_impl 同口径、同优先级（人工 > 模型）
             if ts in deleted_set:
                 c["mark"] = "reject"
                 c["mark_source"] = "manual"
@@ -1787,6 +2111,15 @@ def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
                 c["mark"] = "keep"
                 c["mark_source"] = "manual"
                 kept_idx.append(idx)
+            elif ts in auto_kept_set:
+                c["mark"] = "keep"
+                c["mark_source"] = "auto"
+                c["auto"] = True
+                kept_idx.append(idx)
+            elif ts in auto_rej_set:
+                c["mark"] = "reject"
+                c["mark_source"] = "auto"
+                c["auto_reject"] = True
         # 人物分类独立回填：已有保留、缺失才补历史值
         if not c.get("person") and persons_map.get(ts):
             c["person"] = persons_map[ts]
@@ -1943,6 +2276,48 @@ def _on_batch_load_video_impl(selected, progress_callback):
         state.kept_goal_indices = (_restored_kept if _has_marks
                                    else set(range(len(state.last_goal_clips))))
 
+        # ===== AI 复核：批量回看同样要补分数 / 按当前阈值重推 auto =====
+        # 批量识别本身走 run_detect，已在检测时就打过复核；但这条路是「重开
+        # 程序后从历史回看」：命中片段缓存的分是旧阈值算的，未命中缓存重新
+        # 生成的片段则一个分数都没有 → 流水线确认界面看不到任何 AI 徽标。
+        # 与单视频历史加载（_on_load_history_impl）保持同一口径。
+        # UI 关闭「AI 识别」时整段跳过，理由同该处。
+        _hoop = state.calib["hoop"]
+        if state.last_goal_clips and _hoop and goal_verifier.is_enabled():
+            # 判定口径变更（换 B 骨干 / 调权重 / 改阈值）→ 旧分数与新阈值
+            # 组合会给出错误判决，先作废再走重算分支
+            _n_stale = goal_verifier.invalidate_stale(state.last_goal_clips)
+            if _n_stale:
+                log.info(f"[BATCH LOAD] AI 判定口径已变更"
+                         f"（ver={goal_verifier.model_fingerprint()}），"
+                         f"作废 {_n_stale} 个片段的旧分数")
+            _n_missing = sum(1 for c in state.last_goal_clips if "score" not in c)
+            if _n_missing:
+                _report(70, f'AI 复核（{_n_missing}/{len(state.last_goal_clips)} '
+                            f'个片段缺分数）...')
+                _t_verify = time.time()
+
+                def _verify_progress(frac, stage):
+                    _report(70 + 25 * min(max(frac, 0.0), 1.0), f'AI 复核 {stage}')
+
+                _n_auto = goal_verifier.mark_auto(
+                    state.last_goal_clips, video_path, _hoop,
+                    progress=_verify_progress)
+                log.info(f"[BATCH LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
+                         f"自动通过 {_n_auto}/{len(state.last_goal_clips)}"
+                         f"（耗时 {time.time() - _t_verify:.0f}s）")
+            else:
+                _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
+                log.info(f"[BATCH LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
+                         f"/{len(state.last_goal_clips)}"
+                         f"（阈值 {goal_verifier.auto_threshold():.3f}）")
+            # 分数随缓存落盘，下次回看不再重算
+            state.put_clip_cache(cache_key, state.last_goal_clips)
+            # 自动 √ 同步进 kept 索引 + 历史标签（人工标记优先，不被覆盖）
+            if any(c.get("mark_source") == "auto" for c in state.last_goal_clips):
+                _k, _r = _sync_marks(video_path, state.last_goal_clips)
+                log.info(f"[BATCH LOAD] AI 自动 √ 已同步（√ {_k} · × {_r}）")
+
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
                   f"进球: {len(all_goals)} 个\n"
@@ -1950,7 +2325,7 @@ def _on_batch_load_video_impl(selected, progress_callback):
     else:
         # 未检测过：函数入口已统一清空 state，这里只写状态文本，无需再清
         status = (f"已加载: {os.path.basename(video_path)}\n"
-                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点标定'}")
+                  f"{'已标定' if video_path in state.batch_calibs else '未标定，请点击画面 2 个点框住篮筐+篮网'}")
     return preview, info_str, status
 
 
@@ -2003,7 +2378,7 @@ def on_batch_save_calib():
     if state.batch_current_video is None:
         return "请先从列表选择视频"
     if state.calib["hoop"] is None or state.calib["baseline_frame"] is None:
-        return "请先标定篮筐"
+        return "请先标定篮筐+篮网"
     state.batch_calibs[state.batch_current_video] = {
         "hoop": state.calib["hoop"],
         "baseline_idx": state.calib["baseline_idx"],

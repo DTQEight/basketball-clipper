@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 import services.detection as detection
-from services import state
+from services import state, goal_verifier
 
 
 class _EmptyReader:
@@ -169,3 +169,138 @@ class TestExportSingleClipHq:
             assert "请先加载视频" in status
         finally:
             _restore_state(snap)
+
+
+class TestAiVerifySwitch:
+    """AI 识别总开关：关闭后四臂复核整段跳过（不产分数、不打自动标记）。
+
+    关闭是"不再跑"，不是"清掉已有结果"——缓存分数与历史标签都不动，
+    卡片上的 AI 徽标由 UI 在显示层屏蔽，重开即时恢复。
+    """
+
+    def test_mark_auto_noop_when_disabled(self):
+        clips = [{"ts": 10.0, "path": "p.mp4", "idx": 0}]
+        prev = goal_verifier.is_enabled()
+        try:
+            goal_verifier.set_enabled(False)
+            assert goal_verifier.is_enabled() is False
+            # 视频路径不存在：若真进了打分流程会去读视频，返回 0 且不落任何字段
+            assert goal_verifier.mark_auto(
+                clips, "C:/fake/none.mp4", [0, 0, 10, 10]) == 0
+            assert "score" not in clips[0]
+            assert "auto" not in clips[0]
+            assert "mark" not in clips[0]
+        finally:
+            goal_verifier.set_enabled(prev)
+
+    def test_disable_keeps_existing_scores_and_marks(self):
+        clips = [{"ts": 10.0, "score": 0.9, "verify_score": 0.9, "auto": True,
+                  "mark": "keep", "mark_source": "auto"}]
+        prev = goal_verifier.is_enabled()
+        try:
+            goal_verifier.set_enabled(False)
+            assert goal_verifier.mark_auto(
+                clips, "C:/fake/none.mp4", [0, 0, 10, 10]) == 0
+            assert clips[0]["score"] == 0.9
+            assert clips[0]["mark"] == "keep"
+            assert clips[0]["mark_source"] == "auto"
+        finally:
+            goal_verifier.set_enabled(prev)
+
+
+class TestHistoryMissingScores:
+    """加载历史前的「要不要补跑 AI 复核」判断：只查记录 + 片段缓存，不碰 GPU。
+
+    返回 (need_ai, n_missing, n_total)。缓存未命中（片段要重新生成）时分数
+    必然全缺；读取异常一律按「不问」处理，宁可少问一次也不能挡加载。
+    """
+
+    def teardown_method(self, method):
+        state.clip_cache.clear()
+
+    def _setup(self, monkeypatch, tmp_path, goals, cached_clips):
+        video = str(tmp_path / "v.mp4")
+        (tmp_path / "v.mp4").write_bytes(b"x")
+        monkeypatch.setattr(state, "load_history",
+                            lambda: [{"video": video, "goals": goals}])
+        state.clip_cache.clear()
+        if cached_clips is not None:
+            state.clip_cache[state.clip_cache_key(video, goals)] = cached_clips
+        return video
+
+    def test_cache_miss_needs_ai(self, monkeypatch, tmp_path):
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], None)
+        assert detection.history_missing_scores(video) == (True, 2, 2)
+
+    def test_all_scored_no_need(self, monkeypatch, tmp_path):
+        clip = tmp_path / "c.mp4"
+        clip.write_bytes(b"x")
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], [
+            {"ts": 10.0, "path": str(clip), "idx": 0, "score": 0.9},
+            {"ts": 20.0, "path": str(clip), "idx": 1, "score": 0.1}])
+        assert detection.history_missing_scores(video) == (False, 0, 2)
+
+    def test_partial_missing_needs_ai(self, monkeypatch, tmp_path):
+        clip = tmp_path / "c.mp4"
+        clip.write_bytes(b"x")
+        video = self._setup(monkeypatch, tmp_path, [10.0, 20.0], [
+            {"ts": 10.0, "path": str(clip), "idx": 0},
+            {"ts": 20.0, "path": str(clip), "idx": 1, "score": 0.1}])
+        assert detection.history_missing_scores(video) == (True, 1, 2)
+
+    def test_missing_clip_file_needs_ai(self, monkeypatch, tmp_path):
+        """片段文件被清理掉 → 加载时会全部重新生成，分数同样是全缺。"""
+        video = self._setup(monkeypatch, tmp_path, [10.0], [
+            {"ts": 10.0, "path": str(tmp_path / "gone.mp4"), "idx": 0,
+             "score": 0.9}])
+        assert detection.history_missing_scores(video) == (True, 1, 1)
+
+    def test_unknown_record_no_need(self, monkeypatch):
+        monkeypatch.setattr(state, "load_history", lambda: [])
+        assert detection.history_missing_scores("C:/nope.mp4") == (False, 0, 0)
+
+
+class TestModelFingerprint:
+    """口径指纹必须覆盖「会改变某臂分数」的全部输入。
+
+    漏掉任何一个，换模型/换权重后缓存里的旧 score 不会失效，新旧口径的分数
+    会混在一起出新阈值下的 √/×（静默错判）。2026.09.21 补上 A 臂模型与球检测权重。
+    """
+
+    @staticmethod
+    def _isolate(monkeypatch, tmp_path, lgbm=None, weights_dir=None):
+        """把指纹的输入收窄到临时路径，避免依赖真实权重与标定文件。"""
+        monkeypatch.setattr(goal_verifier, "LGBM_MODEL", lgbm or (tmp_path / "no_lgbm.txt"))
+        monkeypatch.setattr(goal_verifier, "BALL_WEIGHTS_DIR",
+                            weights_dir or (tmp_path / "no_weights"))
+        monkeypatch.setattr(goal_verifier, "_read_ensemble", lambda: 0.7)
+
+    def test_stable_across_calls(self, monkeypatch, tmp_path):
+        """同一批文件连算两次必须一致（否则分数会被反复误判为过期）。"""
+        self._isolate(monkeypatch, tmp_path)
+        assert goal_verifier.model_fingerprint() == goal_verifier.model_fingerprint()
+
+    def test_a_arm_model_change_invalidates(self, monkeypatch, tmp_path):
+        """重训 A 臂（换 model_lgbm.txt）→ 指纹必须变。"""
+        p = tmp_path / "model_lgbm.txt"
+        p.write_text("tree", encoding="utf-8")
+        self._isolate(monkeypatch, tmp_path, lgbm=p)
+        fp1 = goal_verifier.model_fingerprint()
+        os.utime(p, ns=(10 ** 18, 10 ** 18))       # 模拟重训后落盘
+        assert goal_verifier.model_fingerprint() != fp1
+
+    def test_ball_weights_change_invalidates(self, monkeypatch, tmp_path):
+        """换球检测权重 → A 臂特征分布变 → 指纹必须变。"""
+        wd = tmp_path / "weights"
+        wd.mkdir()
+        w = wd / "basketball_ft.pt"
+        w.write_bytes(b"0")
+        self._isolate(monkeypatch, tmp_path, weights_dir=wd)
+        fp1 = goal_verifier.model_fingerprint()
+        os.utime(w, ns=(10 ** 18, 10 ** 18))
+        assert goal_verifier.model_fingerprint() != fp1
+
+    def test_missing_files_do_not_raise(self, monkeypatch, tmp_path):
+        """权重/模型缺失（如 main 线上无 training/）不能抛异常，只降级哈希。"""
+        self._isolate(monkeypatch, tmp_path)
+        assert isinstance(goal_verifier.model_fingerprint(), str)
