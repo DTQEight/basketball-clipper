@@ -136,6 +136,15 @@ def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
     try:
         container = av_open(path)
         stream = container.streams.video[0]
+        # 关闭帧级多线程解码：这是一个必现死锁的规避（2026.09.22 定位）。
+        # 现象：同一进程里先跑过 torch/CUDA 的 YOLO 推理后，再解某些 .mov
+        # （实测 E:\ball\*.mov，HEVC/QuickTime 1920x1080），会永久卡在 avcodec
+        # 帧线程池的条件变量上（原生栈 SleepConditionVariableSRW；服务端表现为
+        # 「加载视频」永远转圈、TCP 可连但 HTTP 不响应、CPU 0%）。
+        # 实测（同序列各重复 4 次）：默认帧线程 4/4 卡死；thread_count=1 → 0/4。
+        # 单帧解码本身是毫秒级，关掉线程无可见代价；批量解码走 VideoReader
+        # （检测主路径，285 帧/秒），不在此处，不受影响。
+        stream.codec_context.thread_count = 1
         if not fps or fps <= 0:
             fps = float(stream.average_rate) if stream.average_rate else 30.0
         tb = float(stream.time_base) if stream.time_base else 1.0 / fps
