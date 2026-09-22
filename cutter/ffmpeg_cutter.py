@@ -23,6 +23,12 @@ except Exception:
 # Windows 沙箱规避标志（CREATE_NO_WINDOW）
 _SBOX = 0x08000000 if os.name == "nt" else 0
 
+# 与 build_encode_args 的 `-pix_fmt yuv420p` 配套的帧级颜色标记改写。
+# 输出选项 -color_primaries/-color_trc 在这条链路上不生效（libx264 写进 colr
+# box 的值取自帧属性，会被输入侧 HDR 标记盖掉，实测仍是 bt2020/arib-std-b67），
+# 改帧属性才落地：实测 primaries/trc 变成 bt709。用于「要在浏览器里播」的片段。
+SDR_TAG_FILTER = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+
 # 缓存根目录 / NVENC 会话信号量：复用 services.state 的单一实现
 # （各自维护一份环境变量回退逻辑会漂移；信号量与预览片段线程池共用驱动配额）
 from services.state import CACHE_ROOT as _CACHE_ROOT, nvenc_semaphore
@@ -83,6 +89,13 @@ def build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
     返回: (编码器参数列表，含 codec/preset/rc 质量参数)
     （公开 API：services/detection.py 生成预览片段也用同一套参数）
     """
+    # 输出统一钉死「浏览器能播的 8-bit SDR」：
+    # 手机直出的 HDR 源（实测 E:\ball\*.mov：HEVC Main10 + yuv420p10le +
+    # bt2020nc/bt2020/arib-std-b67）在软编回退 libx264 时**不会被自动降位深**，
+    # 直接编成 h264 High 10 / yuv420p10le —— 浏览器 <video> 不认这个 profile
+    # （Chrome 的 H.264 解码链只吃 8-bit），不报错、只黑屏，症状就是
+    # 「检测跑完了、片段也在，但点预览播不出来」。
+    sdr_out = ["-pix_fmt", "yuv420p"]
     if use_nvenc is None:
         use_nvenc = _detect_nvenc(ffmpeg)
     if use_nvenc:
@@ -90,11 +103,11 @@ def build_encode_args(ffmpeg, quality="hq", use_nvenc=None):
         # GTX 1650 有 1 个 NVENC 编码器，可大幅加速
         cq = "20" if quality == "hq" else "26"
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
-                "-cq", cq, "-b:v", "0", "-spatial_aq", "1"]
+                "-cq", cq, "-b:v", "0", "-spatial_aq", "1"] + sdr_out
     else:
         # 软编回退
         crf = "18" if quality == "hq" else "26"
-        return ["-c:v", "libx264", "-preset", "fast", "-crf", crf]
+        return ["-c:v", "libx264", "-preset", "fast", "-crf", crf] + sdr_out
 
 
 def _cleanup_tmp(clip_files, list_path, tmp_dir=None):

@@ -31,7 +31,7 @@ from . import goal_verifier
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector, STATIC_BALL_SEC
-from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments
+from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments, SDR_TAG_FILTER
 
 log = logging.getLogger("detection")
 
@@ -229,10 +229,12 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     _preview_recs = []
 
     def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
+        # SDR_TAG_FILTER: HDR 源（手机 .mov，HLG/BT.2020）的颜色标记也是 HDR 的，
+        # 光靠 -pix_fmt 只降位深、标记还在；预览是给浏览器播的，标记必须落到 bt709
         return [ff, "-y", "-loglevel", "error",
                 "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                 "-t", f"{seg_dur_sec:.3f}",
-                "-vf", "scale=-2:480"] + enc_args + \
+                "-vf", f"scale=-2:480,{SDR_TAG_FILTER}"] + enc_args + \
                ["-movflags", "+faststart", clip_path]
 
     def _probe_decode(seg_start_sec, seg_dur_sec):
@@ -244,7 +246,7 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
         cmd = [ff, "-loglevel", "error",
                "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                "-t", f"{seg_dur_sec:.3f}",
-               "-vf", "scale=-2:480", "-f", "null", "-"]
+               "-vf", f"scale=-2:480,{SDR_TAG_FILTER}", "-f", "null", "-"]
         _t = time.time()
         _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                 text=True, timeout=60)
@@ -380,6 +382,53 @@ def _split_marks_by_source(clips):
                 and (c.get("mark_source") == "auto") is auto]
 
     return _ts("keep", False), _ts("reject", False), _ts("keep", True), _ts("reject", True)
+
+
+def _build_verify_snapshot(clips):
+    """AI 复核当次分带的留档快照（写进历史的 verify_snapshot，只写一次）。
+
+    为什么需要：人工确认（点「预览」即视为复核过，或点 √/×）会把 clips 上的
+    mark_source 从 auto 提升为 manual，随后 labels.auto_kept / auto_rejected
+    被整批搬进 kept / deleted——模型当次判了什么，从此在历史里查不到，
+    「AI 判对率」只能靠标定前临时抓的快照，忘了抓就永久丢失（2026.09.22
+    1st quarter vs 悍高.mov 就只剩一次 21:32 的临时快照可比）。
+
+    所以在写记录的同一刻把「当次口径 + 逐片段分数 + 当次两带 ts」存一份，
+    之后任何人工操作都不会碰它（update_history_labels 是读-改-写，只动
+    labels 段）。存逐片段分数而不只存两个 ts 列表：以后能按任意阈值离线重算
+    分带，不必为了换阈值再跑一遍复核。
+
+    返回 None：AI 复核没跑（clips 上没有 score）→ add_history 跳过该字段。
+    """
+    try:
+        scored = [c for c in clips if c.get("score") is not None]
+        if not scored:
+            return None
+        scores = {}
+        for c in scored:
+            v = c.get("verify_score")
+            scores[str(round(float(c["ts"]), 3))] = float(
+                c["score"] if v is None else v)
+
+        def _band(mark):
+            # 只认 mark_source == "auto"：人工 √/× 优先，不混进模型的成绩单
+            return sorted(round(float(c["ts"]), 3) for c in scored
+                          if c.get("mark") == mark
+                          and c.get("mark_source") == "auto")
+
+        return {
+            "keep_thr": round(float(goal_verifier.auto_threshold()), 4),
+            "reject_thr": round(float(goal_verifier.reject_threshold()), 4),
+            "weights": {k: float(v) for k, v in goal_verifier.ENS_WEIGHTS.items()},
+            "fingerprint": goal_verifier.model_fingerprint(),
+            "auto_kept": _band("keep"),
+            "auto_rejected": _band("reject"),
+            "scores": scores,
+        }
+    except Exception as e:
+        # 留档失败绝不能连累检测结果落盘
+        log.warning(f"[WARN] AI 分带留档快照构建失败（本次不写该字段）: {e}")
+        return None
 
 
 def _persist_marks(video_path, clips, write_manual=True):
@@ -1340,7 +1389,12 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           # ===== 自适应阈值详情 =====
                           auto_threshold_value=_auto_thr_for_history,
                           warmup_p95_median=_warmup_p95_for_history,
-                          warmup_sample_count=_warmup_count_for_history)
+                          warmup_sample_count=_warmup_count_for_history,
+                          # ===== AI 复核当次分带留档（只写一次）=====
+                          # 必须在这里写：下面那次 _sync_marks 之后，人工一旦确认
+                          # （点预览或 √/×），auto_* 就被搬进 kept/deleted，
+                          # 模型当次判了什么就查不回来了（见 _build_verify_snapshot）
+                          verify_snapshot=_build_verify_snapshot(state.last_goal_clips))
         # ===== AI 自动 √ 落盘 =====
         # 必须放在 add_history 之后：add_history 只保留磁盘上已有人工标签、
         # 从不读 clips 上的 mark，先写会被随后的整条记录覆盖掉。

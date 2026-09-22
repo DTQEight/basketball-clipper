@@ -850,6 +850,19 @@ def label_sets(labels: dict):
 # add_history 可选字段表：字段名 -> (类型转换函数, 四舍五入位数或 None)
 # 新增字段只需在此表加一行（旧实现要同时改签名/赋值块/调用方三处）。
 # diff_threshold 例外：可能为 int 或 str 'auto'，原样保存，不入表。
+
+
+def _cast_verify_snapshot(value):
+    """verify_snapshot 校验：必须是 dict（形状见 detection._build_verify_snapshot）。
+
+    这类留档字段写错类型时不会有人当场发现——要等到几个月后跑趋势统计，
+    那时原始数据已经丢了。宁可在写入处就拒绝。
+    """
+    if not isinstance(value, dict):
+        raise TypeError(f"verify_snapshot 必须是 dict，收到 {type(value).__name__}")
+    return dict(value)
+
+
 _HISTORY_FIELD_CASTS = {
     # 核心检测参数
     "ball_conf": (float, None),
@@ -894,6 +907,9 @@ _HISTORY_FIELD_CASTS = {
     "auto_threshold_value": (int, None),
     "warmup_p95_median": (float, 1),
     "warmup_sample_count": (int, None),
+    # AI 复核当次分带留档（只写一次；人工确认会把 labels.auto_* 搬走，见
+    # detection._build_verify_snapshot —— 这份快照不受影响，用于事后回算判对率）
+    "verify_snapshot": (_cast_verify_snapshot, None),
 }
 
 

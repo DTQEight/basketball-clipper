@@ -477,6 +477,74 @@ class TestHistory:
         with open(detection.__file__, encoding="utf-8") as f:
             assert "write_manual=False" in f.read()
 
+    def test_verify_snapshot_survives_human_confirmation(self, state_mod):
+        """模型当次分带必须留档：人工确认把 auto_* 搬进 kept/deleted 后仍可回溯。
+
+        人工点「预览」（视为复核过）或 √/× 后，labels.auto_kept/auto_rejected
+        会被整批搬走。没有 verify_snapshot 的话，「AI 当次判了什么」永久丢失，
+        判对率趋势无从统计——这正是加这个字段的原因。
+        """
+        snap = {"keep_thr": 0.68, "reject_thr": 0.15, "fingerprint": "fp1",
+                "weights": {"lgbm": 0.5, "b": 1.0},
+                "auto_kept": [1.0], "auto_rejected": [2.0],
+                "scores": {"1.0": 0.9, "2.0": 0.1}}
+        state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0, 2.0],
+                              verify_snapshot=snap)
+        # 人工逐条确认后的落盘：auto_* 被清空（搬进 kept/deleted）
+        state_mod.update_history_labels("/a.mp4", kept_ts_list=[1.0],
+                                        deleted_ts_list=[2.0],
+                                        auto_kept_ts_list=[], auto_rejected_ts_list=[])
+        labels = state_mod.get_labels("/a.mp4")
+        assert labels["auto_kept"] == [] and labels["auto_rejected"] == []
+        rec = state_mod.get_record("/a.mp4")
+        assert rec["verify_snapshot"] == snap, "人工确认把模型当次分带覆盖/吃掉了"
+
+    def test_verify_snapshot_rejects_non_dict(self, state_mod):
+        """形状错误必须在写入处就拒绝（留档数据事后才被读，坏数据发现不了）。"""
+        with pytest.raises(TypeError):
+            state_mod.add_history("/a.mp4", (1, 2, 3, 4), [1.0],
+                                  verify_snapshot=[1.0, 2.0])
+
+    def test_build_verify_snapshot_bands_and_scores(self, monkeypatch):
+        """留档内容：当次口径 + 三带划分 + 逐片段分数；人工标记不混进模型成绩单。"""
+        from services import detection, goal_verifier
+        monkeypatch.setattr(goal_verifier, "auto_threshold", lambda: 0.68)
+        monkeypatch.setattr(goal_verifier, "reject_threshold", lambda: 0.15)
+        monkeypatch.setattr(goal_verifier, "ENS_WEIGHTS", {"lgbm": 0.5, "b": 1.0})
+        monkeypatch.setattr(goal_verifier, "model_fingerprint", lambda: "fp1")
+        clips = [
+            {"ts": 1.0, "score": 0.9, "verify_score": 0.9,
+             "mark": "keep", "mark_source": "auto"},
+            {"ts": 2.0, "score": 0.4, "verify_score": 0.4},          # 中间带：无标记
+            {"ts": 3.0, "score": 0.05, "verify_score": 0.05,
+             "mark": "reject", "mark_source": "auto"},
+            {"ts": 4.0, "score": 0.99, "verify_score": 0.99,
+             "mark": "keep", "mark_source": "manual"},               # 人工 √
+        ]
+        snap = detection._build_verify_snapshot(clips)
+        assert snap["auto_kept"] == [1.0]          # 4.0 是人工的，不进模型成绩单
+        assert snap["auto_rejected"] == [3.0]
+        assert snap["scores"] == {"1.0": 0.9, "2.0": 0.4, "3.0": 0.05, "4.0": 0.99}
+        assert snap["keep_thr"] == 0.68 and snap["reject_thr"] == 0.15
+        assert snap["weights"] == {"lgbm": 0.5, "b": 1.0}
+        assert snap["fingerprint"] == "fp1"
+
+    def test_build_verify_snapshot_none_when_ai_off(self):
+        """AI 复核没跑（没有 score）→ 返回 None，add_history 跳过该字段。"""
+        from services import detection
+        assert detection._build_verify_snapshot([{"ts": 1.0}, {"ts": 2.0}]) is None
+        assert detection._build_verify_snapshot([]) is None
+
+    def test_run_detect_archives_verify_snapshot(self):
+        """接线守卫：run_detect 必须把当次分带快照写进历史记录。
+
+        漏掉这条接线的表现是「一切正常，只是数据悄悄没了」——行为测试要跑完整条
+        run_detect（含 GPU）才覆盖得到，成本过高。
+        """
+        from services import detection
+        with open(detection.__file__, encoding="utf-8") as f:
+            assert "verify_snapshot=_build_verify_snapshot(" in f.read()
+
     def test_restore_labels_keeps_source(self, state_mod, monkeypatch, tmp_path):
         """批量回看恢复标记必须带来源：模型自动 √ 不能被洗成人工 √。"""
         from services import detection
