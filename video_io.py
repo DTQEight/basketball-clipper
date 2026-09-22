@@ -116,6 +116,37 @@ def get_video_info(path: str) -> dict:
     }
 
 
+# PyAV 的 color_trc 取值（AVColorTransferCharacteristic）里的两种 HDR 传递特性
+#   16 = SMPTE 2084（PQ）  ·  18 = ARIB STD B67（HLG）
+_HDR_COLOR_TRC = (16, 18)
+
+
+def is_hdr_source(path: str) -> bool:
+    """源视频是不是 HDR（HLG / PQ）。
+
+    只给「产出一个给人看的文件」的路径用（预览片段 / 集锦导出）——这类文件要能在
+    浏览器里正常显示，得把 HDR 先压到 BT.709 SDR。**检测与特征抽取一律照旧直接
+    读源文件**，不做任何转换（口径一动，历史分数/缓存就全失去可比性）。
+
+    老录像都是 8-bit BT.709（color_trc=1）→ False。读不到/未知/异常一律当 SDR：
+    误判成 False 只是画面偏淡（HLG 向后兼容，能看），误判成 True 会把 SDR 当 HDR
+    压暗，所以异常侧保守。
+    """
+    try:
+        c = av_open(path)
+    except Exception:
+        return False
+    try:
+        if not c.streams.video:
+            return False
+        trc = c.streams.video[0].codec_context.color_trc
+        return trc is not None and int(trc) in _HDR_COLOR_TRC
+    except Exception:
+        return False
+    finally:
+        c.close()
+
+
 def read_frame(path: str, idx: int, total: int = 0, fps: float = 30.0):
     """读取指定帧（按帧号 seek），返回 BGR ndarray 或 None。
 

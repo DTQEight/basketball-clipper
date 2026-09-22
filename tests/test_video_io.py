@@ -1,4 +1,6 @@
 """video_io 契约测试：read_frame 参数边界（P0-1 回归防护）。"""
+import subprocess
+
 import pytest
 from fractions import Fraction
 
@@ -6,7 +8,7 @@ av = pytest.importorskip("av")
 cv2 = pytest.importorskip("cv2")
 import numpy as np
 
-from video_io import get_video_info, read_frame, VideoReader, _stream_start_pts
+from video_io import get_video_info, read_frame, VideoReader, _stream_start_pts, is_hdr_source
 
 
 @pytest.fixture(scope="module")
@@ -67,6 +69,58 @@ class TestReadFrameContract:
             idxs = [i for i, _ in r.iter_frames(batch=1)]
         assert idxs
         assert r.decode_errors == 0
+
+
+@pytest.fixture(scope="module")
+def sdr_and_hdr_clips(tmp_path_factory):
+    """合成一对 0.3s 纯色片：8-bit BT.709 与 10-bit HLG（带真实 colr 标记）。"""
+    try:
+        import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pytest.skip("无可用 ffmpeg（当前解释器未装 imageio_ffmpeg）")
+    d = tmp_path_factory.mktemp("hdr")
+    # 颜色标记一律用 setparams 写帧属性：输出选项 -color_trc/-color_primaries
+    # 在 libx264 上会被输入侧标记盖掉，落地不了（见 cutter.SDR_TAG_FILTER 注释）
+    specs = {
+        "sdr.mp4": ("setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+                    ["-pix_fmt", "yuv420p"]),
+        "hlg.mp4": ("setparams=colorspace=bt2020nc:color_primaries=bt2020:"
+                    "color_trc=arib-std-b67",
+                    ["-pix_fmt", "yuv420p10le", "-profile:v", "high10"]),
+    }
+    out = {}
+    for name, (vf, extra) in specs.items():
+        p = d / name
+        r = subprocess.run(
+            [ff, "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "color=c=gray:s=320x240:d=0.3", "-vf", vf,
+             "-c:v", "libx264", "-preset", "ultrafast"] + extra + [str(p)],
+            capture_output=True, text=True, errors="replace")
+        if r.returncode:
+            pytest.skip("合成测试片失败（该 ffmpeg 建不带 10-bit x264？）: "
+                        f"{(r.stderr or '')[-200:]}")
+        out[name] = str(p)
+    return out["sdr.mp4"], out["hlg.mp4"]
+
+
+class TestHdrSource:
+    """is_hdr_source：只决定「给人看的切片」要不要做 HDR→SDR 映射，检测不受影响。
+
+    HDR 判定错一边都有代价：判成 True 而其实是 SDR → 整场画面被压暗；判成 False
+    而其实是 HDR → 预览/集锦画面偏淡（HLG 向后兼容，还能看）。所以异常侧一律 False。
+    """
+
+    def test_sdr_false_hdr_true(self, sdr_and_hdr_clips):
+        sdr, hdr = sdr_and_hdr_clips
+        assert is_hdr_source(sdr) is False
+        assert is_hdr_source(hdr) is True
+
+    def test_missing_and_garbage_are_false(self, tmp_path):
+        assert is_hdr_source(str(tmp_path / "nope.mp4")) is False
+        bad = tmp_path / "notavideo.mp4"
+        bad.write_bytes(b"not a video")
+        assert is_hdr_source(str(bad)) is False
 
 
 class TestIterFramesDemuxTolerance:

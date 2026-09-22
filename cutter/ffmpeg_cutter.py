@@ -29,12 +29,48 @@ _SBOX = 0x08000000 if os.name == "nt" else 0
 # 改帧属性才落地：实测 primaries/trc 变成 bt709。用于「要在浏览器里播」的片段。
 SDR_TAG_FILTER = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
 
+# HDR（HLG/PQ）→ BT.709 SDR 的映射链。参数是在 1st quarter vs 悍高.mov（24 分钟
+# 1080p，HEVC Main10 + HLG/BT.2020）上实测挑的（同屏对比见 CHANGELOG「手机 HDR 源」条）：
+#   zscale=t=linear:npl=400 —— 按 400nit 峰值进线性光。教科书常用的 npl=1000
+#                              会把中间调压到均值 63/255（明显偏暗），npl=100 等于不压
+#                              （高光爆到 17% 像素 ≥250），400 是这片场地的平衡点
+#   format=gbrpf32le + tonemap=hable —— 浮点线性域做高光滚降，保住顶棚灯的结构
+#   zscale=t=bt709:m=bt709:r=tv —— 回 BT.709 传递/矩阵（顺带把 BT.2020 原色真转过来，
+#                              否则球场青/粉会明显偏淡）
+#   curves=all='0/0 0.5/0.62 1/1' —— 提中间调。用 curves 而不是 eq=gamma：后者会把
+#                              黑场一起抬起（实测 p1 从 12 抬到 36，暗部发灰）
+HDR_TO_SDR_FILTER = (
+    "zscale=t=linear:npl=400,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,"
+    "curves=all='0/0 0.5/0.62 1/1',format=yuv420p"
+)
+
+
 # 缓存根目录 / NVENC 会话信号量：复用 services.state 的单一实现
 # （各自维护一份环境变量回退逻辑会漂移；信号量与预览片段线程池共用驱动配额）
 from services.state import CACHE_ROOT as _CACHE_ROOT, nvenc_semaphore
 
+# HDR 判定（决定切片要不要做 HDR→SDR 映射）：与 read_frame 共用同一份 PyAV 探测
+from video_io import is_hdr_source
+
 
 _log = logging.getLogger("cutter")
+
+
+def build_view_filter(src_path, scale: str | None = None) -> str:
+    """构建「给人看」的切片滤镜链（预览片段 / 集锦导出用），返回 -vf 参数值。
+
+    源是 HDR（HLG/PQ）→ 走 HDR_TO_SDR_FILTER 压成 BT.709 SDR；否则不动画面、只把
+    容器里的颜色标记钉到 bt709（SDR_TAG_FILTER）。**检测/特征一律不经过这里**。
+
+    scale: 形如 'scale=-2:480' 的缩放滤镜，None 表示保持原分辨率（集锦保持原画质）。
+    返回空串表示不需要 -vf（SDR 源 + 不缩放：老录像本来就是 bt709/yuv420p，
+    保持「不加滤镜」这条既有路径，避免给集锦导出引入无谓的滤镜与风险）。
+    """
+    if is_hdr_source(src_path):
+        parts = [scale] if scale else []
+        return ",".join(parts + [HDR_TO_SDR_FILTER])
+    return f"{scale},{SDR_TAG_FILTER}" if scale else ""
 
 
 def _stderr_tail(e, limit=2000):
@@ -239,6 +275,13 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
         #       NVENC 运行时失败（驱动/会话配额/显存）→ 整体切换软编重切该段
         # ⚠️ use_nvenc 复用已探测结果，避免 build_encode_args 内部再开子进程
         encode_args = build_encode_args(ffmpeg, quality="hq", use_nvenc=use_nvenc)
+        # HDR 判定按「源」缓存：一次导出里同一个源会被切成几十上百段，逐段重开容器
+        # 探测纯属白花时间（实测本地 14~18ms/次、网络盘 47~123ms/次）。SDR 源在这里
+        # 拿到的就是空串 → 命令与改动前完全一致，不加任何滤镜、不影响编码速度。
+        view_filters = {}
+        for _src, _s, _e in segments:
+            if _src not in view_filters:
+                view_filters[_src] = build_view_filter(_src)
         failed_segments = 0
         for i, (src, start, end) in enumerate(segments):
             if _cancelled():
@@ -247,13 +290,17 @@ def cut_clips(video_path, timestamps, pre_roll: int = 5, post_roll: int = 5,
             _report(15 + 70 * i / len(segments), f'剪切片段 {i+1}/{len(segments)}...')
             clip_path = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
             duration = end - start
+            # 集锦/单球导出是给人看的：HDR 源（手机 HLG/PQ）先压成 BT.709 SDR。
+            # 多源导出时各节可能混着老 SDR 录像，所以按源取值而不是全程一个。
+            view_filter = view_filters[src]
 
             def _build_cmd(e_args):
-                return [
-                    ffmpeg, "-y", "-loglevel", "error",
-                    "-ss", f"{start:.3f}", "-i", src,
-                    "-t", f"{duration:.3f}",
-                ] + e_args + [
+                cmd = [ffmpeg, "-y", "-loglevel", "error",
+                       "-ss", f"{start:.3f}", "-i", src,
+                       "-t", f"{duration:.3f}"]
+                if view_filter:
+                    cmd += ["-vf", view_filter]
+                return cmd + e_args + [
                     "-c:a", "aac", "-b:a", "128k",
                     "-movflags", "+faststart",
                     clip_path,

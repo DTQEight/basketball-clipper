@@ -83,6 +83,49 @@ def _fake_run_factory(monkeypatch, fail_first_nvenc=0):
     return calls
 
 
+class TestViewFilter:
+    """切片滤镜选择：HDR 源压成 BT.709 SDR，SDR 源不动画面。
+
+    这里锁的是「HDR→SDR 只发生在给人看的产物上」这条边界：预览片段与集锦导出
+    走 build_view_filter，检测/特征抽取直接读源文件、永不经过它。
+    """
+
+    def _cutter(self, monkeypatch, hdr):
+        from cutter import ffmpeg_cutter as fc
+        monkeypatch.setattr(fc, "is_hdr_source", lambda _p: hdr)
+        return fc
+
+    def test_hdr_preview_scales_then_tonemaps(self, monkeypatch):
+        fc = self._cutter(monkeypatch, True)
+        vf = fc.build_view_filter("/x.mov", scale="scale=-2:480")
+        assert vf.startswith("scale=-2:480,")          # 先缩小再映射，省算力
+        assert fc.HDR_TO_SDR_FILTER in vf
+        assert "tonemap=" in vf and "zscale=" in vf
+
+    def test_hdr_highlights_keeps_resolution(self, monkeypatch):
+        fc = self._cutter(monkeypatch, True)
+        assert fc.build_view_filter("/x.mov") == fc.HDR_TO_SDR_FILTER
+
+    def test_sdr_preview_only_rewrites_tags(self, monkeypatch):
+        fc = self._cutter(monkeypatch, False)
+        assert fc.build_view_filter("/x.mp4", scale="scale=-2:480") \
+            == f"scale=-2:480,{fc.SDR_TAG_FILTER}"
+
+    def test_sdr_highlights_adds_no_filter(self, monkeypatch):
+        """老录像本来就是 bt709/yuv420p：集锦导出保持「不加滤镜」的既有路径。"""
+        fc = self._cutter(monkeypatch, False)
+        assert fc.build_view_filter("/x.mp4") == ""
+
+    def test_preview_path_uses_shared_builder(self, _preview_env, monkeypatch):
+        """接线守卫：预览切片必须走 build_view_filter（漏掉就退回「画面偏淡」）。"""
+        monkeypatch.setattr(detection, "build_view_filter",
+                            lambda _p, scale=None: "SENTINEL_FILTER")
+        calls = _fake_run_factory(monkeypatch)
+        detection._generate_preview_clips(
+            "src.mp4", [1.0], 0, 10, 30.0, 300, "stamp")
+        assert any("SENTINEL_FILTER" in c for c in calls)
+
+
 class TestPreviewTimingWiring:
     def test_summary_logged_and_records_collected(self, _preview_env, monkeypatch, caplog):
         _fake_run_factory(monkeypatch)

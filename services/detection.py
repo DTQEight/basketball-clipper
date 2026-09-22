@@ -31,7 +31,7 @@ from . import goal_verifier
 from video_io import get_video_info, read_frame, VideoReader
 from app import get_ball_model, get_device, get_ball_class_ids
 from tracker import GoalDetector, STATIC_BALL_SEC
-from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments, SDR_TAG_FILTER
+from cutter.ffmpeg_cutter import cut_clips, build_encode_args, merge_segments, build_view_filter
 
 log = logging.getLogger("detection")
 
@@ -228,13 +228,16 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
     # 打点记录（多线程 append，CPython 下 list.append 原子，无需加锁）
     _preview_recs = []
 
+    # 预览是给人（浏览器）看的：HDR 源（手机 .mov，HLG/PQ）先压成 BT.709 SDR，
+    # 否则画面偏淡；SDR 源只钉颜色标记。**检测本身照旧直接读源文件**，不受影响。
+    # 只探测一次（PyAV 开容器，几十毫秒），线程池里复用同一串滤镜。
+    _view_vf = build_view_filter(video_path, scale="scale=-2:480")
+
     def _cut_cmd(clip_path, seg_start_sec, seg_dur_sec, enc_args):
-        # SDR_TAG_FILTER: HDR 源（手机 .mov，HLG/BT.2020）的颜色标记也是 HDR 的，
-        # 光靠 -pix_fmt 只降位深、标记还在；预览是给浏览器播的，标记必须落到 bt709
         return [ff, "-y", "-loglevel", "error",
                 "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                 "-t", f"{seg_dur_sec:.3f}",
-                "-vf", f"scale=-2:480,{SDR_TAG_FILTER}"] + enc_args + \
+                "-vf", _view_vf] + enc_args + \
                ["-movflags", "+faststart", clip_path]
 
     def _probe_decode(seg_start_sec, seg_dur_sec):
@@ -246,7 +249,7 @@ def _generate_preview_clips(video_path, goals, start, end, fps, total, stamp,
         cmd = [ff, "-loglevel", "error",
                "-ss", f"{seg_start_sec:.3f}", "-i", video_path,
                "-t", f"{seg_dur_sec:.3f}",
-               "-vf", f"scale=-2:480,{SDR_TAG_FILTER}", "-f", "null", "-"]
+               "-vf", _view_vf, "-f", "null", "-"]
         _t = time.time()
         _sp.run(cmd, creationflags=state.SBOX, capture_output=True,
                 text=True, timeout=60)
