@@ -2,6 +2,25 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.22 四臂 AI 复核合入主线 + 合并代码审核（修 2 处严重问题）
+
+**合并**：特性分支 `feat/4arm-goal-verifier` 整体合入 `main`（双父合并 `0178539`，87 个文件），发布线的检测与 AI 复核自此同属一条代码线，不再需要两处手工同步。冲突只在 5 个文件：doc 四件套共 18 块（两边各自记录了同一批改动，按「增量取并集、块内取分支侧」解）+ `services/detection.py` 1 块（分支新增的三个落盘函数，main 无对应实现）。逐条标题比对 + 16 项内容标记检查确认 **main 侧无内容丢失**。
+
+**审核**：合入时做了三路并行代码审核（四臂模块 / `training/` 脚本 / 合并自洽性）。合并本身自洽（无重名定义、无悬空引用、无循环导入），但查出并修掉 4 处，其中 2 处严重：
+
+| # | 性质 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | **数据丢失** | `run_detect` 先在 `add_history` 按 0.5s 容差重映射保住人工 √/×，随后又调 `_sync_marks` —— 而本次新生成的片段不带任何 mark，`_split_marks_by_source` 返回**空的人工列表**，`update_history_labels` 把 `[]` 当「清空」写回 → **重检测一个已标注视频（且 AI 开关打开）会抹掉用户上一轮的全部人工标注** | `_persist_marks` / `_sync_marks` 加 `write_manual` 开关，`run_detect` 只写 `auto_*`；人工标签归 `add_history` 的重映射。附隔离复现用例 + 「接线守卫」测试（防参数被移除后静默回归） |
+| 2 | **生产状态** | `training/train_temporal.py` 整表覆盖 `model_temporal_meta.json`，写的新 dict 没有 `ensemble` 段 → 服务端回落到**未标定**的代码默认值（`0.70` / `b0.5+vm1.0`，标定值 `0.68` / `b1.0+vm0.5`）；裸跑一次即静默改变线上三带分诊 | 改读-改-写（保留其它键）+ 原子替换 |
+| 3 | 显示不一致 | `invalidate_stale` 清了 `auto` 却漏 `auto_reject` → 口径变更后残留「AI ×」徽标却没有分数 | 补进作废列表 |
+| 4 | 训练集污染 | `build_dataset.to_rows` 把 `from_history` 标好的 `label_source` 写死成 `"ui"` → 本文件承诺的「按 `label_source == "ui_manual"` 过滤纯人工正样本」失效，**模型自动 √ 静默混进真值** | 透传 `label_source`（缺省 `ui_manual`，与「不猜」策略一致） |
+
+**验证**：全量测试通过（新增 2 例）、语法检查通过、服务 HTTP 200、四臂可用且阈值/权重从 `ensemble` 段正确读出。
+
+**审核发现、记录不修**（后续按优先级处理）：`training/` 有 4 个脚本无开关直接覆盖生产权重（`train_lgbm` / `train_pool_final` / `train_b_simclr` / `train_flow_simclr`）；`train_final_models` 覆盖生产 VM 权重却不更新 `ensemble`，并产出 3 个全仓无人读的孤儿产物；`annotate.py export` 与 `build_dataset` 争用 `dataset_v1.json` 且 event_id 口径不同（跑一次会作废全部已抽特征）；四臂「缺臂降级后仍套四臂标定阈值」与「口径指纹不含 SimCLR/ImageNet 兜底」两处口径风险。
+
+**一条审核建议被否决**：建议把 `refresh_auto` 的 `mark_source == "manual"` 改成 `!= "auto"` 以与落盘侧对齐——新片段 `mark_source` 为 `None`，照改后 AI 将**永远标不上任何候选**。两处问的是不同问题（「要不要覆盖」vs「算不算人工」），不能统一。
+
 ### 2026.09.21 修复：连续 87 秒的误报——静止假球让 YOLO 硬否决长期失效
 
 **现象**：`2026.09.21-4th.mp4` 在 **281~368s 连续 87 秒出 39 个候选**（人工标了 35 个 ×），几乎每 2.1 秒一个，正好贴着 `min_gap_sec=2.0`。
