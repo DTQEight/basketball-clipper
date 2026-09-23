@@ -130,11 +130,15 @@ def _normalize_toc(toc_list):
 a.datas = _normalize_toc(list(a.datas))
 a.binaries = _normalize_toc(list(a.binaries))
 
-# ---- 体积优化：剔除 YOLO 推理不用的 CUDA 库 ----
-# 经测试可安全删除（不影响 torch 加载和 YOLO CNN 推理）：
+# ---- 体积优化：剔除推理确实不用的 CUDA 库 ----
+# ⚠ cudnn_adv64_9.dll **不能删**（311MB）。四臂里的 B/Flow 臂用 torch.nn.GRU
+#   （bigru 头），cuDNN 的 RNN 实现落在 cudnn_adv 里；缺它时 exe 会在加载 B/Flow
+#   臂的瞬间硬崩（实机日志：Could not locate cudnn_adv64_9.dll /
+#   Invalid handle. Cannot load symbol cudnnCreateRNNDescriptor，进程以
+#   0xC0000409 退出，try/except 拦不住）。旧版"实测可删"只在 YOLO（纯卷积）
+#   路径下成立——那时 exe 里根本没有四臂。
 _EXCLUDE_DLLS = {
-    "cudnn_adv64_9.dll",                  # 230MB cuDNN 高级算子(RNN/attention)
-    "cusolverMg64_11.dll",                # 73MB  多 GPU 求解器
+    "cusolverMg64_11.dll",                # 145MB 多 GPU 求解器
 }
 # 注：其余 CUDA 库经本轮实测**都不可删**（torch 的加载链相互依赖，缺一即
 # WinError 126 或 CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED）：
