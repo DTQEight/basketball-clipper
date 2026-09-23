@@ -1,11 +1,11 @@
-﻿; ============================================================
+; ============================================================
 ;  篮球进球集锦助手 - Inno Setup 安装脚本
 ;
 ;  用法:
 ;    ISCC.exe installer\basketball-clipper.iss
 ;
 ;  产物:
-;    dist\installer\BasketballClipper-Setup-1.0.1.exe
+;    dist\installer\BasketballClipper-Setup-1.1.0.exe
 ;
 ;  说明:
 ;    载荷使用 dist\basketball-clipper\ (PyInstaller onedir 目录版)
@@ -13,7 +13,7 @@
 ; ============================================================
 
 #define MyAppName        "篮球进球集锦助手"
-#define MyAppVersion     "1.0.1"
+#define MyAppVersion     "1.1.0"
 #define MyAppPublisher   "DTQEight"
 #define MyAppURL         "https://github.com/DTQEight/basketball-clipper"
 #define MyAppExeName     "basketball-clipper.exe"
@@ -78,6 +78,14 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 ; CUDA 预热状态判断（warmup_status.log）和历史记录
 Source: "..\dist\basketball-clipper\*"; DestDir: "{app}"; \
     Excludes: "\cache\*,__pycache__\*"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+
+; VM 臂（VideoMAE）的 HuggingFace 本地缓存，约 330MB。
+; 代码里强制 HF_HUB_OFFLINE=1（服务进程不允许联网下载），不把这份缓存带过去
+; 目标机上 VM 臂必然加载失败。只取 hub 子树，其余 cache（日志/历史/clips）仍排除。
+; 目标路径必须与 state._get_cache_root() 一致：冻结模式取「exe 同级 cache」，
+; 而 goal_verifier._load_vm 把 HF_HOME 指到 CACHE_ROOT/hf。
+Source: "..\cache\hf\hub\*"; DestDir: "{app}\cache\hf\hub"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

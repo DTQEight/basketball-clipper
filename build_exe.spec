@@ -40,12 +40,19 @@ if wdir.exists():
 # 定位。不打包进来的话四臂会静默加载失败——exe 版只剩「检测+剪辑」，没有
 # AI 自动 √/×。只打包运行必需的几个文件（约 90MB）；frames_b / flow_b /
 # features.jsonl 等几 GB 训练中间产物不打（运行不需要）。
+# 注意后半段是**脚本**而不是权重：goal_verifier 用 importlib 按文件路径
+# （_MEIPASS/training/xxx.py）加载它们，缺一个就整条臂加载失败——只打模型文件
+# 不够。A 臂靠 extract_features，B/Flow 靠 train_temporal + extract_frames_b
+# （train_temporal 顶层 `from training.extract_frames_b import ...`），
+# VM 臂靠 extract_videomae。这几个文件合计约 55KB。
 tdir = ROOT / "training"
 if tdir.exists():
     for _name in ("model_lgbm.txt", "model_b_simclr.pt", "model_flow_simclr.pt",
                   "model_vm_lgbm.txt", "model_temporal_meta.json",
                   "model_meta.json", "model_b_simclr_meta.json",
-                  "model_flow_simclr_meta.json"):
+                  "model_flow_simclr_meta.json",
+                  "extract_features.py", "extract_frames_b.py",
+                  "train_temporal.py", "extract_videomae.py"):
         _f = tdir / _name
         if _f.exists():
             datas.append((str(_f), "training"))

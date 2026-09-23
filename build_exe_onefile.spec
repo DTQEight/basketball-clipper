@@ -24,8 +24,14 @@ collect_all_packages = [
 # ---- 额外数据文件 ----
 datas = []
 wdir = ROOT / "weights"
+# 只打运行时真正加载的球检测权重。temporal_ft.pt / temporal_simclr.pt 是旧一代
+# 时序模型的留档，生产代码里没有任何引用（只有 training/ 脚本引用同名的
+# oof_*.jsonl 明细），打进去纯让 exe 白胖 86MB。
+_WEIGHTS_SKIP = {"temporal_ft.pt", "temporal_simclr.pt"}
 if wdir.exists():
     for pt in wdir.glob("*.pt"):
+        if pt.name in _WEIGHTS_SKIP:
+            continue
         datas.append((str(pt), "weights"))
 
 # 四臂 AI 复核的模型与配置：goal_verifier 用 Path(__file__).parent.parent/"training"
@@ -33,12 +39,19 @@ if wdir.exists():
 # exe 版就只剩「检测+剪辑」，没有 AI 自动 √/×（这是上一版 exe 的实际情况）。
 # 只打包运行必需的这几个文件（约 90MB）；frames_b / flow_b / features.jsonl 等
 # 几 GB 的训练中间产物不打（运行不需要）。
+# 注意后半段是**脚本**而不是权重：goal_verifier 用 importlib 按文件路径
+# （_MEIPASS/training/xxx.py）加载它们，缺一个就整条臂加载失败——只打模型文件
+# 不够。A 臂靠 extract_features，B/Flow 靠 train_temporal + extract_frames_b
+# （train_temporal 顶层 `from training.extract_frames_b import ...`），
+# VM 臂靠 extract_videomae。这几个文件合计约 55KB。
 tdir = ROOT / "training"
 if tdir.exists():
     for _name in ("model_lgbm.txt", "model_b_simclr.pt", "model_flow_simclr.pt",
                   "model_vm_lgbm.txt", "model_temporal_meta.json",
                   "model_meta.json", "model_b_simclr_meta.json",
-                  "model_flow_simclr_meta.json"):
+                  "model_flow_simclr_meta.json",
+                  "extract_features.py", "extract_frames_b.py",
+                  "train_temporal.py", "extract_videomae.py"):
         _f = tdir / _name
         if _f.exists():
             datas.append((str(_f), "training"))
@@ -123,6 +136,13 @@ _EXCLUDE_DLLS = {
     "cudnn_adv64_9.dll",                  # 230MB cuDNN 高级算子(RNN/attention)
     "cusolverMg64_11.dll",                # 73MB  多 GPU 求解器
 }
+# 注：其余 CUDA 库经本轮实测**都不可删**（torch 的加载链相互依赖，缺一即
+# WinError 126 或 CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED）：
+#   cublas64_12    ← 依赖 cublasLt64_12
+#   cusolver64_11  ← 依赖 cusparse64_12
+#   caffe2_nvrtc   ← 依赖 nvrtc64_120_0
+#   cudnn 的卷积路径 ← 依赖 cudnn_engines_precompiled64_9（504MB）
+# 逐个改名实测均失败，故保持原样（详见上轮打包记录）。
 _before = len(a.binaries)
 a.binaries = [
     b for b in a.binaries
