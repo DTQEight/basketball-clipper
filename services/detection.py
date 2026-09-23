@@ -413,6 +413,21 @@ def _split_marks_by_source(clips):
     return _ts("keep", False), _ts("reject", False), _ts("keep", True), _ts("reject", True)
 
 
+def _describe_bands(clips, n_auto):
+    """AI 复核日志的后半句：把「模型分带」与「本轮新增自动 √」分开说。
+
+    mark_auto / refresh_auto 的返回值只统计**本轮新增**的自动 √——已有人工标记
+    的片段按"人工优先"直接跳过、不计入（见 goal_verifier.refresh_auto）。只打这
+    一个数会被读成"模型一个都没通过"：实测踩过——历史里 28/29 个片段带人工标记
+    时，日志恒为「自动通过 0/29」，而落盘的 auto=True 其实有 14 个。
+    """
+    n_hi = sum(1 for c in clips if c.get("auto"))
+    n_lo = sum(1 for c in clips if c.get("auto_reject"))
+    return (f"模型分带 高 {n_hi} / 中间 {len(clips) - n_hi - n_lo} / 低 {n_lo}；"
+            f"本轮新增自动通过 {n_auto}"
+            f"（高带里 {n_hi - n_auto} 个已有人工标记，按人工优先未改）")
+
+
 def _build_verify_snapshot(clips):
     """AI 复核当次分带的留档快照（写进历史的 verify_snapshot，只写一次）。
 
@@ -2190,13 +2205,13 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
                 state.last_goal_clips, video_path, hoop,
                 progress=_verify_progress)
             log.info(f"[LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
-                     f"自动通过 {_n_auto}/{len(state.last_goal_clips)} "
+                     f"{_describe_bands(state.last_goal_clips, _n_auto)} "
                      f"（耗时 {time.time() - _t_verify:.0f}s）")
         else:
             # 分数已就绪：按当前阈值重推 auto 并自动 √（阈值可被手改，缓存里的旧标记会过时）
             _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
-            log.info(f"[LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
-                     f"/{len(state.last_goal_clips)}"
+            log.info(f"[LOAD] AI 复核分数已就绪 → "
+                     f"{_describe_bands(state.last_goal_clips, _n_auto)}"
                      f"（阈值 {goal_verifier.auto_threshold():.3f}）")
         state.put_clip_cache(cache_key, state.last_goal_clips)
         # 分带同步进 kept 索引 + 历史标签（否则重读历史时标记又没了）
@@ -2467,12 +2482,12 @@ def _on_batch_load_video_impl(selected, progress_callback):
                     state.last_goal_clips, video_path, _hoop,
                     progress=_verify_progress)
                 log.info(f"[BATCH LOAD] AI 复核补跑：{_n_missing} 个片段缺分数 → "
-                         f"自动通过 {_n_auto}/{len(state.last_goal_clips)}"
+                         f"{_describe_bands(state.last_goal_clips, _n_auto)}"
                          f"（耗时 {time.time() - _t_verify:.0f}s）")
             else:
                 _n_auto = goal_verifier.refresh_auto(state.last_goal_clips)
-                log.info(f"[BATCH LOAD] AI 复核分数已就绪 → 自动通过 {_n_auto}"
-                         f"/{len(state.last_goal_clips)}"
+                log.info(f"[BATCH LOAD] AI 复核分数已就绪 → "
+                         f"{_describe_bands(state.last_goal_clips, _n_auto)}"
                          f"（阈值 {goal_verifier.auto_threshold():.3f}）")
             # 分数随缓存落盘，下次回看不再重算
             state.put_clip_cache(cache_key, state.last_goal_clips)
