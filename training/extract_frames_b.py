@@ -111,7 +111,11 @@ def crop_hoop(frame: np.ndarray, hoop, zoom: float = ZOOM, size: int = SIZE):
 
 def main():
     events = load_dataset_events()
-    events = [e for e in events if e.get("label") in ("pos", "neg") and e.get("hoop")]
+    # dataset_v1.json 的 label 是 0/1（int）；旧格式才是 "pos"/"neg" 字符串。
+    # 只认字符串会让本脚本一个事件都筛不出来（静默 "events: 0"），
+    # B 臂因此永远重训不了。两种格式都接受。
+    events = [e for e in events
+              if e.get("label") in (0, 1, "pos", "neg") and e.get("hoop")]
     print(f"events: {len(events)}")
 
     done = 0

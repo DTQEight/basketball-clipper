@@ -61,6 +61,20 @@ def _load_history():
     顺序不保证，调用方在 _collect_events 自行按时间戳排序。
     """
     all_records = []
+    # 生产存储是「每视频一个 JSON」（cache/history/<视频名>.json）。旧实现只读
+    # 单文件 cache/detection_history.json —— 主程序改存储格式后这里恒读到 0 条，
+    # scan/slice/label 三个命令全部静默失效（表现为"历史记录: 0 条"，不报错）。
+    # 统一走 state.load_history()：与主程序共用同一份读取逻辑（路径解析、
+    # GBK 损坏备份、时间字段兼容、去重），避免两处口径再次漂移。
+    try:
+        from services import state as _state
+        recs = _state.load_history()
+        if recs:
+            all_records.extend(recs)
+            print(f"[HIST] state.load_history(): {len(recs)} 条")
+    except Exception as e:
+        print(f"[WARN] state.load_history() 不可用，回退旧单文件: {e}")
+    # 兼容旧单文件格式（历史备份 / 早期导出）
     sources = [HISTORY_FILE] + _EXTRA_HISTORY_FILES
     for src in sources:
         if not src.exists():

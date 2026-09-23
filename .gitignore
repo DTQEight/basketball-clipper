@@ -48,6 +48,14 @@ training/features.jsonl
 weights/*.pt
 *.pt
 
+# 本地模型快照目录（训练前/训练后留档，含大权重；只留本地，不进仓库）
+training/_model_backup_*/
+training/_model_trained_*/
+training/backup/
+training/*.bak
+# YOLO 裁剪数据集（由 build_yolo_crop_dataset.py 生成，可重建）
+training/yolo_crop_data*/
+
 # 缓存目录（项目根目录下的 cache/，内含 detection_history.json、preview 片段、输出缓存）
 cache/
 .cache/

@@ -196,15 +196,22 @@ def main():
                 if l.strip())}
         common = [i for i in ids if i in old]
         m = np.isin(ids, common)
-        print(f"\n新旧数据集共有事件 {len(common)} 个，在该子集上对比 OOF AUC：")
-        print(f"  {'臂':<16}{'刷新前':>9}{'刷新后':>9}")
-        for k, ok in (("a", "pred_a"), ("b", "pred_b"), ("flow", "pred_flow_t"),
-                      ("vm_lgbm", "pred_vm")):
-            if k not in P:
-                continue
-            yo = np.array([old[i]["label"] for i in common])
-            print(f"  {k:<16}{roc_auc_score(yo, [old[i][ok] for i in common]):>9.4f}"
-                  f"{roc_auc_score(y[m], P[k][m]):>9.4f}")
+        # event_id 口径变更过（旧=视频id_帧号，新=视频id_毫秒），跨代数据集可能
+        # 一个共有 id 都没有——那时 roc_auc_score 收到空数组会直接抛
+        # ValueError(0 sample)，把整条刷新流程打断（A/B/Flow/VM 已经算完的
+        # OOF 全部白跑）。空交集时跳过这段对比即可。
+        if not common:
+            print("\n[跳过] 与旧 OOF 无共有 event_id（口径已变更），不做同子集对比")
+        else:
+            print(f"\n新旧数据集共有事件 {len(common)} 个，在该子集上对比 OOF AUC：")
+            print(f"  {'臂':<16}{'刷新前':>9}{'刷新后':>9}")
+            for k, ok in (("a", "pred_a"), ("b", "pred_b"), ("flow", "pred_flow_t"),
+                          ("vm_lgbm", "pred_vm")):
+                if k not in P:
+                    continue
+                yo = np.array([old[i]["label"] for i in common])
+                print(f"  {k:<16}{roc_auc_score(yo, [old[i][ok] for i in common]):>9.4f}"
+                      f"{roc_auc_score(y[m], P[k][m]):>9.4f}")
 
     lines = []
     for i, (e, lab) in enumerate(zip(events, y)):
