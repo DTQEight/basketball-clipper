@@ -28,6 +28,21 @@ if wdir.exists():
     for pt in wdir.glob("*.pt"):
         datas.append((str(pt), "weights"))
 
+# 四臂 AI 复核的模型与配置：goal_verifier 用 Path(__file__).parent.parent/"training"
+# 定位（onefile 下即 _MEIPASS/training）。不打包进来的话四臂会静默加载失败——
+# exe 版就只剩「检测+剪辑」，没有 AI 自动 √/×（这是上一版 exe 的实际情况）。
+# 只打包运行必需的这几个文件（约 90MB）；frames_b / flow_b / features.jsonl 等
+# 几 GB 的训练中间产物不打（运行不需要）。
+tdir = ROOT / "training"
+if tdir.exists():
+    for _name in ("model_lgbm.txt", "model_b_simclr.pt", "model_flow_simclr.pt",
+                  "model_vm_lgbm.txt", "model_temporal_meta.json",
+                  "model_meta.json", "model_b_simclr_meta.json",
+                  "model_flow_simclr_meta.json"):
+        _f = tdir / _name
+        if _f.exists():
+            datas.append((str(_f), "training"))
+
 # ---- 隐式导入 ----
 hiddenimports = [
     "torchvision", "torchvision.ops", "torchvision.models",
