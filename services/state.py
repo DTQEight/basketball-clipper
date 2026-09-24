@@ -76,6 +76,10 @@ CHECKPOINT_DIR = os.path.join(CACHE_ROOT, "checkpoints")
 CLIP_CACHE_FILE = os.path.join(CACHE_ROOT, "clip_cache.json")
 # 全局人物名单（跨视频复用）：人物分类时曾使用过的名字，最近使用在前
 PERSONS_FILE = os.path.join(CACHE_ROOT, "persons.json")
+# 批量标定落盘缓存：{视频完整路径: {hoop, baseline_idx}}
+# 批量面板点「保存标定」原本只写内存，应用一关就丢；跑过检测的视频能从历史
+# 回填，没跑过的只能重新逐个框。落一份盘即可跨会话恢复标定。
+BATCH_CALIB_FILE = os.path.join(CACHE_ROOT, "batch_calibs.json")
 
 DEFAULT_VIDEO = ""
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v", ".ts"}
@@ -1212,3 +1216,60 @@ def init_clip_cache():
     """启动时调用，从磁盘恢复片段缓存到内存。"""
     clip_cache.clear()
     clip_cache.update(load_clip_cache())
+
+
+# ============ 批量标定缓存 ============
+def _norm_calib(hoop, baseline_idx):
+    """校验并规范一条标定数据；不合法返回 None。
+
+    视频被移动/改名、缓存文件被手改坏、hoop 不是 4 个数——都从这里返回 None，
+    由调用方**跳过**该条（批量列表显示 ○未标定），而不是抛错中断整轮回填。
+    """
+    try:
+        if not hoop or len(hoop) != 4:
+            return None
+        return {"hoop": tuple(int(v) for v in hoop),
+                "baseline_idx": int(baseline_idx or 0)}
+    except (TypeError, ValueError):
+        return None
+
+
+def load_batch_calibs() -> dict:
+    """从磁盘读取批量标定缓存 {视频路径: {hoop, baseline_idx}}，坏数据跳过。"""
+    out = {}
+    try:
+        if os.path.exists(BATCH_CALIB_FILE):
+            with open(BATCH_CALIB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for vp, c in (data or {}).items():
+                if not isinstance(c, dict):
+                    continue
+                cal = _norm_calib(c.get("hoop"), c.get("baseline_idx"))
+                if cal:
+                    out[vp] = cal
+    except json.JSONDecodeError as e:
+        logging.getLogger("state").warning(f"[WARN] 批量标定缓存解析失败，已忽略: {e}")
+    except OSError as e:
+        logging.getLogger("state").warning(f"[WARN] 批量标定缓存读取失败，已忽略: {e}")
+    return out
+
+
+def upsert_batch_calib(video_path: str, hoop, baseline_idx: int) -> bool:
+    """把单个视频的标定写进落盘缓存（读-改-写，保留其余视频的标定）。
+
+    返回是否写盘成功：失败时调用方提示"仅本次会话有效"，不影响内存标定可用。
+    """
+    try:
+        cal = _norm_calib(hoop, baseline_idx)
+        if cal is None:
+            return False
+        data = load_batch_calibs()
+        data[video_path] = cal
+        os.makedirs(os.path.dirname(BATCH_CALIB_FILE), exist_ok=True)
+        _atomic_write_json(BATCH_CALIB_FILE,
+                           {k: {"hoop": list(v["hoop"]), "baseline_idx": v["baseline_idx"]}
+                            for k, v in data.items()}, indent=2)
+        return True
+    except Exception as e:
+        logging.getLogger("state").warning(f"[WARN] 保存批量标定失败: {e}")
+        return False

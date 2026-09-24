@@ -720,14 +720,14 @@ def main_page():
             state.batch_calibs = {}
             state.batch_current_video = None
             state.batch_results.clear()  # 清掉上一轮快照，防止新文件夹同名视频显示旧结果
-            # 跨会话复用标定：该文件夹此前跑过批量识别的话，历史记录里存有
-            # 每个视频的篮筐标定，回填后列表直接显示 ✓、可直接批量识别
-            _n_cal = detection.backfill_batch_calibs_from_history()
+            # 跨会话复用标定：批量标定落盘缓存（cache/batch_calibs.json）+ 历史记录
+            # 两个来源回填，回填后列表直接显示 ✓、可直接批量识别
+            _n_cal = detection.backfill_batch_calibs()
             batch_panel.classes(remove='hidden')
             _refresh_batch_list()
             # 自动加载第一个视频（同时同步下拉框）
             await _on_batch_load_video(files[0])
-            _cal_hint = f'，已从历史恢复 {_n_cal} 个标定' if _n_cal else ''
+            _cal_hint = f'，已恢复 {_n_cal} 个标定' if _n_cal else ''
             _set_status(f'批量模式 | 扫描到 {len(files)} 个视频{_cal_hint}，逐个标定后批量识别', 'info')
             return
         # 单视频文件路径 → 原有流程（清空批量状态，避免写历史误带 batch_idx）

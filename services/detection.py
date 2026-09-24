@@ -2508,21 +2508,39 @@ def _on_batch_load_video_impl(selected, progress_callback):
     return preview, info_str, status
 
 
-def backfill_batch_calibs_from_history():
-    """从历史检测记录回填批量标定（跨会话复用篮筐标定）。
+def backfill_batch_calibs():
+    """回填批量标定（跨会话复用篮筐标定）。两个来源，优先级从高到低：
 
-    扫描文件夹时 batch_calibs 清空；若该文件夹此前跑过批量识别，历史记录里
-    已存每个视频的 hoop + baseline_idx，直接回填免去重新逐个标定。
-    本次会话已保存的标定优先（不被历史覆盖）；无记录/无 hoop 的视频跳过。
+    1. ``cache/batch_calibs.json`` —— 批量面板点过「保存标定」的视频，即使
+       从没跑过检测也在（on_batch_save_calib 落盘的缓存）；
+    2. 历史检测记录 —— 跑过检测的视频，记录里存有 hoop + baseline_idx。
+
+    扫描文件夹时 batch_calibs 清空；本次会话已保存的标定优先（不被回填覆盖）；
+    两个来源都没有的视频跳过（批量列表显示 ○未标定，由用户手动框）。
     返回回填的视频数量。
     """
     if not state.batch_files:
         return 0
+    n_cache = 0
+    try:
+        saved = state.load_batch_calibs()
+    except Exception as e:
+        log.warning(f"[CALIB] 批量标定缓存读取失败: {e}")
+        saved = {}
+    for vp in state.batch_files:
+        if vp in state.batch_calibs:
+            continue
+        c = saved.get(vp)
+        if c:
+            state.batch_calibs[vp] = c
+            n_cache += 1
+    if n_cache:
+        log.info(f"[CALIB] 从批量标定缓存回填 {n_cache}/{len(state.batch_files)} 个视频的篮筐标定")
     try:
         records = state.load_history()
     except Exception as e:
         log.warning(f"[CALIB] 历史标定回填失败: {e}")
-        return 0
+        return n_cache
     by_path = {}
     for r in records:
         v = r.get("video")
@@ -2545,14 +2563,16 @@ def backfill_batch_calibs_from_history():
         n += 1
     if n:
         log.info(f"[CALIB] 从历史记录回填 {n}/{len(state.batch_files)} 个视频的篮筐标定")
-    return n
+    return n_cache + n
 
 
 def on_batch_save_calib():
-    """保存当前标定到当前批量视频。
+    """保存当前标定到当前批量视频（内存 + 落盘）。
 
     只存 hoop + baseline_idx（不存整帧 BGR）：50 个视频的整帧常驻 ~300MB，
     而基准帧只在检测启动瞬间用到，检测/加载时按帧号现读。
+    同时落盘 cache/batch_calibs.json：不落盘的话关掉应用标定就丢，只有跑过
+    检测的视频能靠历史记录回填，没跑过的只能重新逐个框。
     """
     if state.batch_current_video is None:
         return "请先从列表选择视频"
@@ -2562,9 +2582,13 @@ def on_batch_save_calib():
         "hoop": state.calib["hoop"],
         "baseline_idx": state.calib["baseline_idx"],
     }
+    _persisted = state.upsert_batch_calib(state.batch_current_video,
+                                          state.calib["hoop"], state.calib["baseline_idx"])
     n_calib = len(state.batch_calibs)
     n_total = len(state.batch_files)
     status = f"已保存: {os.path.basename(state.batch_current_video)} | 已标定: {n_calib}/{n_total}"
+    if not _persisted:
+        status += "（写盘失败，仅本次会话有效）"
     if n_calib >= n_total:
         status += "，全部标定完成，可点击「批量识别」"
     return status

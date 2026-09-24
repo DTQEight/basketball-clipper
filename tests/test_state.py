@@ -850,7 +850,7 @@ class TestHistory:
         assert r["baseline_idx"] == 7
         assert state_mod.get_record("/nope.mp4") is None
 
-    def test_backfill_batch_calibs_from_history(self, state_mod, monkeypatch):
+    def test_backfill_batch_calibs(self, state_mod, monkeypatch):
         """跨会话复用标定：扫描后 batch_calibs 从历史回填，会话内标定优先。"""
         from services import detection
         monkeypatch.setattr(detection, "state", state_mod)
@@ -858,14 +858,14 @@ class TestHistory:
         state_mod.add_history("/b.mp4", (5, 6, 7, 8), [2.0], baseline_idx=9)
         state_mod.batch_files = ["/a.mp4", "/b.mp4", "/c.mp4"]  # /c 无历史记录
         state_mod.batch_calibs = {}
-        n = detection.backfill_batch_calibs_from_history()
+        n = detection.backfill_batch_calibs()
         assert n == 2
         assert state_mod.batch_calibs["/a.mp4"] == {"hoop": (1, 2, 3, 4), "baseline_idx": 7}
         assert state_mod.batch_calibs["/b.mp4"] == {"hoop": (5, 6, 7, 8), "baseline_idx": 9}
         assert "/c.mp4" not in state_mod.batch_calibs
         # 本次会话已保存的标定不被历史覆盖
         state_mod.batch_calibs["/a.mp4"] = {"hoop": (9, 9, 9, 9), "baseline_idx": 1}
-        assert detection.backfill_batch_calibs_from_history() == 0
+        assert detection.backfill_batch_calibs() == 0
         assert state_mod.batch_calibs["/a.mp4"]["hoop"] == (9, 9, 9, 9)
 
 
