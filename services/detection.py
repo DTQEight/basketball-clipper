@@ -688,6 +688,29 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     if state.video_state["path"] is None:
         _release_lock()
         return "❌ 请先加载视频", False
+    # 有断点、无标定 → 先用断点里的参数把标定补上（跨会话/跨中断恢复）。
+    # 断点 params 存着当初那次检测的 hoop + baseline_idx；不补的话只能拦用户重画，
+    # 而手画的框与断点指纹不一致 → 断点作废 → 整场重跑（数十分钟）。
+    _calib_from_cp = False
+    if state.calib["hoop"] is None:
+        _rec = recover_calib_from_checkpoint(state.video_state["path"])
+        if _rec:
+            state.calib["hoop"] = _rec["hoop"]
+            state.calib["baseline_idx"] = _rec["baseline_idx"]
+            try:
+                state.calib["baseline_frame"] = read_frame(
+                    state.video_state["path"], _rec["baseline_idx"],
+                    total=state.video_state.get("total"),
+                    fps=state.video_state.get("fps"))
+            except Exception as e:
+                log.warning(f"[CALIB] 断点基准帧读取失败: {e}")
+                state.calib["baseline_frame"] = None
+            _calib_from_cp = state.calib["baseline_frame"] is not None
+            if _calib_from_cp:
+                log.info(f"[CALIB] 已从断点恢复篮筐标定 hoop={_rec['hoop']} "
+                         f"baseline_idx={_rec['baseline_idx']}（无需重新画框）")
+            else:
+                log.warning(f"[CALIB] 断点有标定但基准帧读取失败，退回要求手动标定")
     if state.calib["hoop"] is None:
         _release_lock()
         return "❌ 请先点击画面框住篮筐+篮网（2 个点）", False
@@ -1382,6 +1405,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         status = (f"检测完成 | 处理 {processed} 帧 | 耗时 {_total_elapsed:.0f}s\n"
                   f"进球: {len(detector.goals)} 个 | "
                   f"YOLO确认: {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)")
+        if _calib_from_cp:
+            status += "\nℹ 篮筐标定取自未完成的断点（本次未重新画框）"
         if _missing_previews > 0:
             status += f"\n⚠ {_missing_previews} 个进球的预览片段生成失败（集锦将缺少这些球）"
         if _partial_decode:
@@ -2509,15 +2534,48 @@ def _on_batch_load_video_impl(selected, progress_callback):
     return preview, info_str, status
 
 
+def recover_calib_from_checkpoint(video_path=None):
+    """从断点文件回填篮筐标定（有断点、无标定时的兜底来源）。
+
+    断点（cache/checkpoints/<视频名>__<MD5>__<参数指纹>.json）里存着发起那次检测的
+    全部参数，含 hoop / baseline_idx。检测跑到一半被打断（服务被杀、关了控制台窗口、
+    断电），既没写成历史记录、也没在批量面板点过「保存标定」时，断点是唯一还留着
+    篮筐标定的地方。旧实现只拿断点做参数指纹比对，找不到标定就直接拦用户重画 ——
+    而手画的框哪怕差 1 像素也会让指纹对不上、断点作废、整场重跑（数十分钟）。
+
+    Returns:
+        {"hoop": (l, t, r, b), "baseline_idx": int}；无断点或参数不合法返回 None
+    """
+    vp = video_path or state.video_state.get("path")
+    if not vp:
+        return None
+    try:
+        cp = state.load_checkpoint(vp)  # params=None → 该视频最新的断点
+    except Exception as e:
+        log.warning(f"[CALIB] 断点标定回填失败: {e}")
+        return None
+    params = (cp or {}).get("params") or {}
+    hoop = params.get("hoop")
+    try:
+        if not hoop or len(hoop) != 4:
+            return None
+        return {"hoop": tuple(int(v) for v in hoop),
+                "baseline_idx": int(params.get("baseline_idx") or 0)}
+    except (TypeError, ValueError):
+        return None
+
+
 def backfill_batch_calibs():
-    """回填批量标定（跨会话复用篮筐标定）。两个来源，优先级从高到低：
+    """回填批量标定（跨会话复用篮筐标定）。三个来源，优先级从高到低：
 
     1. ``cache/batch_calibs.json`` —— 批量面板点过「保存标定」的视频，即使
        从没跑过检测也在（on_batch_save_calib 落盘的缓存）；
-    2. 历史检测记录 —— 跑过检测的视频，记录里存有 hoop + baseline_idx。
+    2. 历史检测记录 —— 跑过检测的视频，记录里存有 hoop + baseline_idx；
+    3. 断点文件 —— 检测被打断（没写历史、也没点过保存标定）的视频，
+       断点 params 里存着当时的 hoop + baseline_idx（recover_calib_from_checkpoint）。
 
     扫描文件夹时 batch_calibs 清空；本次会话已保存的标定优先（不被回填覆盖）；
-    两个来源都没有的视频跳过（批量列表显示 ○未标定，由用户手动框）。
+    三个来源都没有的视频跳过（批量列表显示 ○未标定，由用户手动框）。
     返回回填的视频数量。
     """
     if not state.batch_files:
@@ -2564,7 +2622,19 @@ def backfill_batch_calibs():
         n += 1
     if n:
         log.info(f"[CALIB] 从历史记录回填 {n}/{len(state.batch_files)} 个视频的篮筐标定")
-    return n_cache + n
+    # 第三来源：断点文件。检测被打断的视频既没写历史、也没点过「保存标定」，
+    # 断点 params 是它唯一的篮筐标定来源（旧实现会把这些视频判成"未标定"跳过）
+    n_cp = 0
+    for vp in state.batch_files:
+        if vp in state.batch_calibs:
+            continue
+        rec = recover_calib_from_checkpoint(vp)
+        if rec:
+            state.batch_calibs[vp] = rec
+            n_cp += 1
+    if n_cp:
+        log.info(f"[CALIB] 从断点回填 {n_cp}/{len(state.batch_files)} 个视频的篮筐标定")
+    return n_cache + n + n_cp
 
 
 def on_batch_save_calib():

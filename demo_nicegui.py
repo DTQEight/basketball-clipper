@@ -1508,8 +1508,15 @@ def main_page():
                               'border: 1px solid rgba(239, 68, 68, 0.5)')
             with result_container:
                 with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
-                    # 第一行：时间戳徽章（mono + tabular-nums）+ 右上角人物分类徽章（人物专属色）
+                    # 第一行：序号 + 时间戳徽章（mono + tabular-nums）+ 右上角人物分类徽章（人物专属色）
+                    # 序号用列表位置 i+1（不是"第几个可见卡片"）：与 √/×/预览/导出 传入的
+                    # idx 同源，且「只看待确认」过滤时序号保持稳定，便于对照"我点的是第几个"
                     with ui.row().classes('w-full items-center gap-2 mb-1'):
+                        ui.label(f'#{i + 1}').classes(
+                            'text-[10px] font-mono px-1.5 py-0.5 rounded'
+                        ).style('color: var(--text-secondary); '
+                                'border: 1px solid var(--border-subtle)').tooltip(
+                            f'第 {i + 1}/{len(clips)} 个候选')
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono').style('color: var(--accent)')
                         # AI 复核：分数始终显示，便于与人工标记对照。

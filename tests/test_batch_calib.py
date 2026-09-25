@@ -135,3 +135,70 @@ class TestBackfillPriority:
         state_mod.batch_files = ["/v/a.mp4"]
         state_mod.batch_calibs = {}
         assert det.backfill_batch_calibs() == 0
+
+
+class TestCalibFromCheckpoint:
+    """断点回填（第三来源）：检测被打断的视频 —— 没写历史、也没点过「保存标定」，
+    断点 params 里的 hoop/baseline_idx 是唯一还留着的标定。"""
+
+    def _save_cp(self, state_mod, vp, hoop, baseline_idx, cur=10):
+        assert state_mod.save_checkpoint(
+            vp, {"hoop": list(hoop), "baseline_idx": baseline_idx,
+                 "fps": 30.0, "start_frame": 0, "end_frame": 100,
+                 "ball_conf": 0.2, "min_gap_sec": 2.0},
+            cur, {}) is True
+
+    def test_recover_from_checkpoint(self, state_mod, det):
+        self._save_cp(state_mod, "/v/a.mp4", (11, 22, 33, 44), 55)
+        assert det.recover_calib_from_checkpoint("/v/a.mp4") == {
+            "hoop": (11, 22, 33, 44), "baseline_idx": 55}
+
+    def test_no_checkpoint_returns_none(self, state_mod, det):
+        assert det.recover_calib_from_checkpoint("/v/a.mp4") is None
+
+    def test_short_hoop_returns_none(self, state_mod, det):
+        self._save_cp(state_mod, "/v/a.mp4", (11, 22, 33), 55)  # 只有 3 个数
+        assert det.recover_calib_from_checkpoint("/v/a.mp4") is None
+
+    def test_non_numeric_hoop_returns_none(self, state_mod, det):
+        self._save_cp(state_mod, "/v/a.mp4", ("a", "b", "c", "d"), 55)
+        assert det.recover_calib_from_checkpoint("/v/a.mp4") is None
+
+    def test_backfill_uses_checkpoint(self, state_mod, det):
+        self._save_cp(state_mod, "/v/a.mp4", (1, 2, 3, 4), 7)
+        state_mod.batch_files = ["/v/a.mp4"]
+        state_mod.batch_calibs = {}
+        assert det.backfill_batch_calibs() == 1
+        assert state_mod.batch_calibs["/v/a.mp4"] == {"hoop": (1, 2, 3, 4), "baseline_idx": 7}
+
+    def test_history_wins_over_checkpoint(self, state_mod, det):
+        # 历史与断点都有：以历史为准（跑完过的记录比中断时的断点更权威）
+        self._save_cp(state_mod, "/v/a.mp4", (1, 2, 3, 4), 7)
+        state_mod.add_history("/v/a.mp4", (9, 8, 7, 6), [1.0], baseline_idx=111)
+        state_mod.batch_files = ["/v/a.mp4"]
+        state_mod.batch_calibs = {}
+        assert det.backfill_batch_calibs() == 1
+        assert state_mod.batch_calibs["/v/a.mp4"]["hoop"] == (9, 8, 7, 6)
+
+    def test_run_detect_fills_calib_from_checkpoint(self, state_mod, det, monkeypatch):
+        """run_detect 入口：有断点无标定 → 不再拦「请先点击画面框住篮筐」。"""
+        state_mod.video_state.update(path="/v/a.mp4", fps=30.0, total=1000)
+        state_mod.calib["hoop"] = None
+        state_mod.calib["baseline_frame"] = None
+        state_mod.calib["baseline_idx"] = 0
+        self._save_cp(state_mod, "/v/a.mp4", (11, 22, 33, 44), 55)
+        monkeypatch.setattr(det, "read_frame", lambda *a, **k: object())
+        monkeypatch.setattr(det, "get_device", lambda: "cpu")  # 在标定检查之后短路
+        text, ok = det.run_detect(0, 100, 0.2, 2.0)
+        assert ok is False
+        assert "请先点击画面" not in text
+        assert state_mod.calib["hoop"] == (11, 22, 33, 44)
+        assert state_mod.calib["baseline_idx"] == 55
+
+    def test_run_detect_still_requires_calib_without_checkpoint(self, state_mod, det):
+        state_mod.video_state.update(path="/v/a.mp4", fps=30.0, total=1000)
+        state_mod.calib["hoop"] = None
+        state_mod.calib["baseline_frame"] = None
+        text, ok = det.run_detect(0, 100, 0.2, 2.0)
+        assert ok is False
+        assert "请先点击画面" in text
