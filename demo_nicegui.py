@@ -1508,17 +1508,23 @@ def main_page():
                               'border: 1px solid rgba(239, 68, 68, 0.5)')
             with result_container:
                 with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
-                    # 第一行：序号 + 时间戳徽章（mono + tabular-nums）+ 右上角人物分类徽章（人物专属色）
+                    # 第一行：序号 + 时间戳 + AI 徽章 + 右侧人物分类，全部同一行
                     # 序号用列表位置 i+1（不是"第几个可见卡片"）：与 √/×/预览/导出 传入的
                     # idx 同源，且「只看待确认」过滤时序号保持稳定，便于对照"我点的是第几个"
-                    with ui.row().classes('w-full items-center gap-2 mb-1'):
+                    # flex-nowrap + 右侧按钮 min-w-0：q-btn 默认会因宽度不足被挤到第二行，
+                    # 加了序号后更容易触发；nowrap + 允许收缩才能保持单行
+                    with ui.row().classes('w-full items-center gap-1.5 mb-1 flex-nowrap'):
                         ui.label(f'#{i + 1}').classes(
-                            'text-[10px] font-mono px-1.5 py-0.5 rounded'
-                        ).style('color: var(--text-secondary); '
-                                'border: 1px solid var(--border-subtle)').tooltip(
+                            'text-[10px] font-mono font-bold shrink-0 rounded-full'
+                        ).style('color: var(--accent); '
+                                # 底色用主题的 --accent-muted；描边取同色 45%（无对应变量）
+                                'background: var(--accent-muted); '
+                                'border: 1px solid rgba(34, 211, 238, 0.45); '
+                                'min-width: 1.5rem; line-height: 1.05rem; '
+                                'padding: 0 0.3rem; text-align: center').tooltip(
                             f'第 {i + 1}/{len(clips)} 个候选')
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
-                            'text-sm font-bold font-mono').style('color: var(--accent)')
+                            'text-sm font-bold font-mono shrink-0').style('color: var(--accent)')
                         # AI 复核：分数始终显示，便于与人工标记对照。
                         # 不能再用「mark is None」做门——标完之后正好是最需要复核
                         # 对照的时候，一标就全没了（用户实测反馈）。
@@ -1553,17 +1559,17 @@ def main_page():
                                     f'四臂集成分 {clip.get("verify_score")} 落在 '
                                     f'{_thr_lo:.2f}–{_thr_hi:.2f} 之间 → 中间带，需人工确认')
                             ui.label(_badge).classes(
-                                'text-[10px] px-2 py-0.5 rounded-full font-bold'
+                                'text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0'
                             ).style(_bstyle).tooltip(_btip)
                         person = clip.get("person")
                         _pc = person_colors.get(person) if person else None
                         ui.button((f'👤 {person}' if _pc else '👤 分类'),
                                   on_click=lambda e, idx=i: _on_person_clip(idx)).classes(
-                            'ml-auto text-xs rounded-full px-3 py-0.5').props('ripple flat dense no-caps').style(
+                            'ml-auto text-xs rounded-full px-3 py-0.5 min-w-0').props('ripple flat dense no-caps').style(
                             f'color: {_pc[0] if _pc else "var(--text-secondary)"}; '
                             f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
                             f'background: {_pc[1] if _pc else "transparent"}; '
-                            'max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap')
+                            'max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap')
                     # 第二行：操作按钮（预览 / √ / × / 导出）
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
