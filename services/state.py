@@ -195,6 +195,9 @@ clip_cache = {}
 batch_files = []
 batch_calibs = {}
 batch_current_video = None
+# 单节勾选：本次「批量识别」要跑的视频路径集合（UI 复选框维护，加载文件夹时默认全选）。
+# 与 batch_files（扫描到的全部视频）分开存，是为了只跑部分节次时不丢列表/标定。
+batch_selected = set()
 
 # 批量结果快照：视频路径 -> {"goals": [...], "clips": [...], "kept": set(), "finished_at": str}
 # 检测线程只写入新 key；前台人工确认（删卡片/导出集锦）只读写快照。

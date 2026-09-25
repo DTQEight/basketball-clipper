@@ -355,6 +355,9 @@ def main_page():
                     batch_panel = ui.column().classes('w-full gap-1 hidden')
                     with batch_panel:
                         batch_select = ui.select(options={}, value=None).classes('w-full').props('outlined dense dark')
+                        # 单节勾选：批量识别只跑勾选的视频（加载文件夹时默认全选）
+                        batch_checks = ui.column().classes('w-full gap-0 max-h-[150px] overflow-y-auto')
+                        batch_check_hint = ui.label('').classes('text-gray-500 text-xs')
                         with ui.row().classes('w-full gap-2'):
                             ui.button('保存标定', on_click=lambda: _on_batch_save_calib()).classes('flex-1 text-xs').props('ripple').style('background: var(--bg-elevated); color: var(--text-secondary)')
                             batch_run_btn = ui.button('批量识别', on_click=lambda: _on_batch_run()).classes('flex-1 text-xs').props('ripple').style('background: var(--accent); color: var(--bg-canvas)')
@@ -720,6 +723,11 @@ def main_page():
             state.batch_calibs = {}
             state.batch_current_video = None
             state.batch_results.clear()  # 清掉上一轮快照，防止新文件夹同名视频显示旧结果
+            # 单节勾选：保留本会话里仍存在的勾选（重载同一目录不会被重置成全选）；
+            # 首次加载 / 换了目录（交集为空）→ 默认全选
+            state.batch_selected &= set(files)
+            if not state.batch_selected:
+                state.batch_selected = set(files)
             # 跨会话复用标定：批量标定落盘缓存（cache/batch_calibs.json）+ 历史记录
             # 两个来源回填，回填后列表直接显示 ✓、可直接批量识别
             _n_cal = detection.backfill_batch_calibs()
@@ -741,6 +749,7 @@ def main_page():
         state.batch_files = []
         state.batch_calibs = {}
         state.batch_current_video = None
+        state.batch_selected = set()
         state.batch_results.clear()
         _cards_video["path"] = None  # 离开快照查看模式
         # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
@@ -782,6 +791,18 @@ def main_page():
         else:
             resume_hint.visible = False
 
+    def _batch_check_hint_text():
+        return (f'已勾选 {len(state.batch_selected)}/{len(state.batch_files)}'
+                f'（批量识别只跑勾选的视频）')
+
+    def _on_batch_check(video_path, checked):
+        """单节勾选回调：只改 state.batch_selected，不动列表与标定。"""
+        if checked:
+            state.batch_selected.add(video_path)
+        else:
+            state.batch_selected.discard(video_path)
+        batch_check_hint.set_text(_batch_check_hint_text())
+
     def _refresh_batch_list():
         """刷新批量下拉框：三态标记（☑已完成n球 / ✓已标定 / ○未标定），保留当前选中。"""
         if not state.batch_files:
@@ -800,6 +821,15 @@ def main_page():
         # 若用 [(值,标签)] 列表，NiceGUI 会把整个元组当值，导致加载失败
         batch_select.set_options({f: _label(f) for f in state.batch_files},
                                  value=cur_val)
+        # 单节勾选：路径被移出目录后清掉残留，与 batch_files 保持一致
+        state.batch_selected &= set(state.batch_files)
+        batch_checks.clear()
+        with batch_checks:
+            for f in state.batch_files:
+                ui.checkbox(_label(f), value=f in state.batch_selected,
+                            on_change=lambda e, fp=f: _on_batch_check(fp, e.value)) \
+                    .classes('text-xs').props('dense')
+        batch_check_hint.set_text(_batch_check_hint_text())
 
     _batch_loading = False  # 防重入（set_value 可能触发 change 事件）
 
@@ -930,6 +960,11 @@ def main_page():
         if not state.batch_files:
             _set_status('请先加载文件夹', 'err')
             return
+        # 单节勾选：只跑勾选的视频（列表/标定保持完整）
+        _selected = [f for f in state.batch_files if f in state.batch_selected]
+        if not _selected:
+            _set_status('请至少勾选一个视频（批量识别只跑勾选的）', 'err')
+            return
         token = _try_acquire('batch')
         if not token:
             return
@@ -983,7 +1018,8 @@ def main_page():
                 yolo_step=3 if yolo_3frame_switch.value else 2,
                 skip_yolo_no_motion=skip_yolo_switch.value,
                 per_video_callback=_per_video_done,
-                task_token=token)
+                task_token=token,
+                video_paths=_selected)
         except Exception as _e:
             import traceback
             status = f"❌ 批量识别异常: {_e}\n{traceback.format_exc()}"

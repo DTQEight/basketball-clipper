@@ -2058,6 +2058,7 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
     state.batch_files = []
     state.batch_calibs = {}
     state.batch_current_video = None
+    state.batch_selected = set()
 
     _report(15, '读取视频信息...')
     try:
@@ -2598,7 +2599,7 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                      diff_threshold=15, min_circularity=0.35, min_in_hoop_frames=2,
                      min_blob_area=30, search_margin=80, progress_callback=None,
                      auto_threshold=True, yolo_step=2, skip_yolo_no_motion=False,
-                     per_video_callback=None, task_token=0):
+                     per_video_callback=None, task_token=0, video_paths=None):
     """批量识别：遍历文件夹内全部视频逐个检测，每个视频独立写入历史。
 
     返回 (状态文本, 是否成功)。状态文本逐条列出每个视频的结果，
@@ -2607,13 +2608,15 @@ def run_batch_detect(start_frame, end_frame, ball_conf, min_gap_sec,
     per_video_callback(video_path, goal_count): 每个视频检测成功后回调（UI 打完成标记）。
     结果同时存入 state.batch_results 快照，供流水线模式前台人工确认。
     task_token: 非零时锁由本函数持有并在 finally 释放（锁归任务本体）。
+    video_paths: 只跑这些视频（None = 跑 state.batch_files 全部）。UI 的「单节勾选」走它，
+                 只影响本轮跑哪些，不动 batch_files/batch_calibs（列表与标定保持完整）。
     """
     try:
         return _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
                                       diff_threshold, min_circularity, min_in_hoop_frames,
                                       min_blob_area, search_margin, progress_callback,
                                       auto_threshold, yolo_step, skip_yolo_no_motion,
-                                      per_video_callback)
+                                      per_video_callback, video_paths)
     finally:
         if task_token:
             state.release_task(task_token)
@@ -2623,15 +2626,16 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
                            diff_threshold, min_circularity, min_in_hoop_frames,
                            min_blob_area, search_margin, progress_callback,
                            auto_threshold, yolo_step, skip_yolo_no_motion,
-                           per_video_callback):
+                           per_video_callback, video_paths=None):
     """run_batch_detect 的实际实现（锁由外层 wrapper 管理）。"""
-    if not state.batch_files:
+    paths = list(video_paths) if video_paths is not None else list(state.batch_files)
+    if not paths:
         return "请先加载文件夹", False
     # 流水线快照：重跑批量时覆盖旧结果
     state.batch_results.clear()
     # 当前视频若已标定但未点「保存标定」，批量前自动保存，避免漏处理
     cur = state.batch_current_video
-    if (cur and cur in state.batch_files and cur not in state.batch_calibs
+    if (cur and cur in paths and cur not in state.batch_calibs
             and state.calib["hoop"] is not None and state.calib["baseline_frame"] is not None):
         state.batch_calibs[cur] = {
             "hoop": state.calib["hoop"],
@@ -2640,19 +2644,21 @@ def _run_batch_detect_impl(start_frame, end_frame, ball_conf, min_gap_sec,
     lines = []
     n_ok = 0
     total_goals = 0
-    n_total = len(state.batch_files)
+    n_total = len(paths)
     cancelled = False
     _batch_t0 = time.time()
     # ============ DEBUG: BATCH 开始 ============
     log.info("\n" + "#" * 68)
-    log.info(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos")
+    log.info(f"[BATCH START] {time.strftime('%H:%M:%S')}  |  {n_total} videos"
+             + (f"（勾选子集，目录共 {len(state.batch_files)} 个）"
+                if n_total != len(state.batch_files) else ""))
     log.info(f"  Auto-thresh : {bool(auto_threshold)}")
     log.info(f"  YOLO step   : every {yolo_step} frames")
     if skip_yolo_no_motion:
         log.info(f"  条件跳过    : ON (篮筐无运动时跳过 YOLO)")
     log.info(f"  ball_conf   : {ball_conf}  min_gap : {min_gap_sec}s")
     log.info("#" * 68)
-    for i, video_path in enumerate(state.batch_files):
+    for i, video_path in enumerate(paths):
         if state.cancel_event.is_set():
             cancelled = True
             break
