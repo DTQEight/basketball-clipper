@@ -1,38 +1,38 @@
 {
-  "calibrated_at": "2026-09-19 13:32:14",
-  "composition": "ab_f_vm",
+  "calibrated_at": "2026-09-25 18:37:16",
+  "composition": "mean4",
   "weights": {
-    "lgbm": 0.5,
-    "b": 0.5,
+    "lgbm": 1.0,
+    "b": 1.0,
     "flow": 1.0,
     "vm": 1.0
   },
-  "keep_thr": 0.834,
-  "reject_thr": 0.16,
-  "oof_auc": 0.9094,
-  "n_events": 831,
+  "keep_thr": 0.621,
+  "reject_thr": 0.21,
+  "oof_auc": 0.9578,
+  "n_events": 2247,
   "keep_wp": {
-    "threshold": 0.834,
-    "precision": 0.9559,
-    "recall": 0.1879
+    "threshold": 0.621,
+    "precision": 0.9502,
+    "recall": 0.5882
   },
   "arms_oof_auc": {
-    "A": 0.8034,
-    "B(mean pool+bigru)": 0.6305,
-    "Flow_T": 0.8593,
-    "VM": 0.8208,
-    "AB(mean)": 0.7767,
-    "mean4": 0.8975,
-    "ab_f_vm": 0.9094
+    "A": 0.8416,
+    "B(mean pool+bigru)": 0.8227,
+    "Flow_T": 0.9146,
+    "VM": 0.8705,
+    "AB(mean)": 0.8907,
+    "mean4": 0.9578,
+    "ab_f_vm": 0.9559
   },
   "fold_aucs_flow": [
-    0.9092,
-    0.8802,
-    0.9262,
-    0.8271,
-    0.8554
+    0.9177,
+    0.9345,
+    0.9553,
+    0.8213,
+    0.9229
   ],
   "flow_final_epochs": 10,
   "reject_kill_cap": 0.02,
-  "elapsed_sec": 110.0
+  "elapsed_sec": 378.4
 }
