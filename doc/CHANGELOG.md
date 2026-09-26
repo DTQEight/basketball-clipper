@@ -2,6 +2,24 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.26 修复：识别链路 6 项缺陷（预览异常连坐、断点早删、复核静默降级、越界 ROI 崩溃）
+
+一轮针对性代码审核（3 路并行审查 + 逐条核实代码）后修掉 6 项。**主检测/预热解码不开单线程**这条风险故意不动：结构上与已复现死锁的 A 臂不同（A 臂是同一 container 上数十次「seek + 提前弃流 + 夹 CUDA」，主循环是单次 seek、顺序读完、帧线程池只建一次），且关掉会让解码从约 285 f/s 掉到约 130 f/s。⑦ YOLO 失败不清 `_last_ball`、⑧ `detect_rate` 恒为 1.0（改口径需随重训）、⑨ YOLO 熔断用累计比例，本轮未纳入。
+
+**② 预览切片异常连坐整场检测（丢数据）** `services/detection.py`：`_generate_preview_clips()` 原先裸调用，一旦抛异常（ffmpeg 缺失 / 磁盘满 / 输出目录不可写 / 切片线程池异常）会走总 except → 清空 `last_goal_clips` / `kept_goal_indices` / `last_goals`；而断点保存条件 `_resume_frame < end` 此时不成立（主循环已跑到区间末尾）→ **不存断点**；后面的 `add_history` 也走不到 → 数十分钟检测成果全部丢弃，用户只看到「检测失败」。改为只降级：已切好的片段保留（`extend` 是增量消费生成器），缺口由既有的 `_missing_previews` 在状态文本里提示。
+
+**③ 断点删除早于历史落盘（丢数据）** `services/detection.py`：`delete_checkpoint()` 原在 `add_history()` 之前；`add_history` 返回 None（磁盘/权限/Windows 文件被占用）时历史没写、断点已删 → 整场只能从头重跑。改为**历史落盘成功之后**才删（`_saved_record is not None and not _partial_decode`，N1 的截断例外仍优先）。
+
+**④ 复核兜底未包 try（静默降级）** `services/goal_verifier.py`：B/Flow 臂的 ImageNet 兜底里 `_backbone()` 是裸调用（旁边 M1 注释自称「兜底也要包 try」，实际只包了 `_load_net`）。`_backbone()` 用 torchvision 的 ImageNet 权重，缓存缺失且离线时会抛 → 冒泡到外层 `except` → `_temporal = None` → **把完好的另一条臂一起禁用**。改为整体入 try，失败只禁本臂。
+
+**⑤ 复核待办判据只看 `score_b`（静默错 + 永久固化）** `services/goal_verifier.py`：`todo` 原为 `"score_b" not in c` —— 若某次运行里 B 成功而 Flow/VM 抛异常，该片段会带着 `score_b` 被**永久**排除出 todo，缺的臂再也补不回来（`combine` 按剩余权重重归一化 → 与四臂口径不可比，而分数已被缓存与历史固化成"全量口径"）。改为「三臂齐全」才算完成；臂加载后按**实际可用臂**再筛一次（避免某臂永久不可用时每次重跑全量重算）；三臂批推理中途异常时**回滚**本次写过的臂分，保证同一批候选口径一致。
+
+**⑥ `_tried` 闩锁永久禁臂（静默错）** `services/goal_verifier.py`：三个加载器的 `_tried = True` 都设在真正加载之前 → 瞬时失败（CUDA OOM / 文件正被训练脚本改写 / 瞬时 IO）等于该臂在本进程内永久禁用，而 `_available_arms` / `model_fingerprint` 只看文件是否存在、仍宣称该臂在场 → 降级后的重归一化分数被当全量口径长期固化、无法自愈。改为**只有产物缺失才闩锁**，文件在但加载抛异常时解除闩锁、下一场视频还有机会。
+
+**⑩ `_roi_gray` 空 ROI 崩溃（崩溃）** `tracker.py`：只 clamp 终点、不 clamp 起点，标定框整体落在画面之外（标定分辨率与实际帧不一致）时切出 `(0, 0, 3)` 空数组，`cv2.cvtColor` 抛 `cv2.error ... (-215:Assertion failed) !_src.empty()`，而 `feed()` 无保护 → 异常穿出 `run_detect` 主循环打崩整个检测任务。相邻的 `has_motion_near_hoop` / `_find_moving_blob` 都有 `size==0` 守卫，唯独它没有。改为起点一并 clamp 进画面，保证至少 1 像素（正常标定下取值不变）。已实测旧切片形状为 `(0,0,3)` 且 `cvtColor` 必抛。
+
+**测试**：新增 4 例（搜索框完全越界 / 起点越界终点在框内 / 正常标定形状不变 / 越界时 `feed` 全程不抛），全量 **277 passed**。
+
 ### 2026.09.26 修复：批量模式/进度面板跨刷新丢失；批量收尾异常保护
 
 **问题（实测踩到）**：批量识别跑到一半，界面出现三个症状 —— ① 批量文件夹面板消失；② 进度区只剩一句「检测中...」，详情行与进度条都不动；③ 复核还在打分，进球卡片已经全出来了。服务端日志同时留下 `RuntimeError: The client this element belongs to has been deleted.`（`_on_batch_run` 收尾的 `_refresh_result_cards()`）。

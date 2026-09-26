@@ -108,6 +108,12 @@ def _load_lgbm():
         except Exception as e:
             _log.warning("goal_verifier: A 臂加载失败（该臂禁用）: %s", e)
             _lgbm, _feat_names = None, []
+            # 只有"产物缺失"才闩锁。文件在、但加载抛异常（CUDA OOM / 文件正被训练
+            # 脚本改写 / 瞬时 IO）时解除闩锁，下一场视频还有机会加载回来。
+            # 闩锁的代价：本进程内永久禁臂，而降级后的重归一化分数在指纹上仍表现为
+            # "四臂全量口径"（_available_arms 只看文件是否存在）→ 错误无法自愈
+            if LGBM_MODEL.exists() and LGBM_META.exists():
+                _lgbm_tried = False
     return _lgbm
 
 
@@ -219,17 +225,18 @@ def _load_temporal():
                 _log.warning("goal_verifier: SimCLR B 臂加载失败，退回 ImageNet: %s", e)
                 b_resnet = b_nets = None
             if b_nets is None:
-                b_resnet = _backbone()
-                b_pre = "imagenet"
-                # M1：兜底也要包 try —— 否则这里任一异常会冒泡到外层 except，
-                # 把**完好的 Flow 臂一起禁用**（Flow 自己的兜底只禁本臂，两臂不对称）。
-                # B 臂不可用时只跳过它，其余臂照常打分。
+                # M1：兜底整体包 try（**必须含 `_backbone()`**）—— 否则这里任一异常
+                # 会冒泡到外层 except，把**完好的 Flow 臂一起禁用**（两臂不对称）。
+                # `_backbone()` 用 torchvision 的 ImageNet 权重，缓存缺失且离线时
+                # 会抛，正是高发点；旧补丁只包了 `_load_net`，漏了它。
                 try:
+                    b_resnet = _backbone()
+                    b_pre = "imagenet"
                     b_nets = [_load_net(p) for p in (TEMPORAL_BIGRU, TEMPORAL_POOL)]
                 except Exception as e:
                     _log.warning("goal_verifier: B 臂 ImageNet 兜底也失败"
                                  "（该臂禁用）: %s", e)
-                    b_nets = None
+                    b_resnet = b_nets = None
 
             # ---- Flow 臂：光流域 SimCLR 骨干优先，缺失退回 ImageNet ----
             _log.info("goal_verifier: [加载] B 臂就绪（骨干=%s），进入 Flow 臂…", b_pre)
@@ -253,13 +260,14 @@ def _load_temporal():
                              "退回 ImageNet: %s", e)
                 flow_resnet = flow_nets = None
             if flow_nets is None:
-                flow_resnet = _backbone()
-                flow_pre = "imagenet"
+                # 与 B 臂同理（M1）：`_backbone()` 也必须在 try 内
                 try:
+                    flow_resnet = _backbone()
+                    flow_pre = "imagenet"
                     flow_nets = [_load_net(FLOW_MODEL)]
                 except Exception as e:
                     _log.warning("goal_verifier: Flow 臂加载失败（该臂禁用）: %s", e)
-                    flow_nets = None
+                    flow_resnet = flow_nets = None
 
             mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
             std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
@@ -280,6 +288,11 @@ def _load_temporal():
         except Exception as e:
             _log.warning("goal_verifier: B/Flow 臂加载失败（两臂禁用）: %s", e)
             _temporal = None
+            # 同 _load_lgbm：产物在时解除闩锁，允许后续重试（torch/CUDA 的瞬时失败
+            # 不该让这两臂在本进程内永久失效）
+            if any(p.exists() for p in (B_SIMCLR_FILE, FLOW_SIMCLR_FILE,
+                                        TEMPORAL_BIGRU, TEMPORAL_POOL, FLOW_MODEL)):
+                _temporal_tried = False
     return _temporal
 
 
@@ -330,6 +343,9 @@ def _load_vm():
         except Exception as e:
             _log.info("goal_verifier: VM 臂不可用（该臂禁用）: %s", e)
             _vm = None
+            # 同 _load_lgbm：产物在时解除闩锁，允许后续重试
+            if VM_MODEL.exists():
+                _vm_tried = False
     return _vm
 
 
@@ -563,7 +579,12 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
     某臂缺模型或推理失败时静默跳过（集成端按剩余权重重归一化）。
     """
     tt = _load_temporal()
-    todo = [c for c in clips if "score_b" not in c]
+    # todo：只跳过"三臂分数齐全"的片段。旧判据只看 score_b —— 若上一次运行里 B
+    # 成功而 Flow/VM 抛异常，该片段会带着 score_b 被**永久**排除出 todo，缺的臂
+    # 再也补不回来（combine 按剩余权重重归一化 → 与四臂口径不可比，而分数已被
+    # 缓存与历史固化成"全量口径"）
+    _VIS_ARMS = ("score_b", "score_flow", "score_vm")
+    todo = [c for c in clips if not all(k in c for k in _VIS_ARMS)]
     if tt is None or not todo or not hoop:
         if on_progress:
             on_progress(1.0, '视觉三臂不可用')
@@ -583,6 +604,17 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
         on_progress(0.0, '视觉三臂：加载模型')
     vm = _load_vm()
     n_frames, min_valid = len(frame_offs), 8
+    # 再按"实际可用的臂"筛一次：某臂本进程不可用时它的键永远缺失，不筛的话每次
+    # 重跑都会把所有片段当成待办、把其余臂的分数白白重算一遍
+    _need = [k for k, _on in (("score_b", b_nets is not None),
+                              ("score_flow", flow_nets is not None),
+                              ("score_vm", vm is not None)) if _on]
+    if _need:
+        todo = [c for c in todo if not all(k in c for k in _need)]
+    if not todo:
+        if on_progress:
+            on_progress(1.0, '视觉三臂已完成')
+        return
     _log.info("goal_verifier: [B/Flow/VM] 开始打分 %d 个候选（B=%s Flow=%s VM=%s）",
               len(todo), bool(b_nets), bool(flow_nets), vm is not None)
 
@@ -707,6 +739,12 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                         c.pop("score_vm", None)
     except Exception as e:
         _log.warning("goal_verifier: 三臂推理失败 %s: %s", video_path, e)
+        # 逐批推进，异常可能出现在中途 → todo 里只有一部分片段拿到了臂分。
+        # 留着会让同一批候选混用两套重归一化口径（部分 3 臂 / 部分 1 臂，分数
+        # 不可比）；统一撤掉本次尝试过的视觉臂分，交给下次重算
+        for _c in todo:
+            for _k in _VIS_ARMS:
+                _c.pop(_k, None)
     else:
         _log.info("goal_verifier: [B/Flow/VM] GPU 推理完成（%d 批 / %d 片段）",
                   (len(blocks) + 3) // 4, len(blocks))

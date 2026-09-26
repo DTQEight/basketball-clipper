@@ -213,9 +213,16 @@ class GoalDetector:
         先裁 ROI 再做 cvtColor/GaussianBlur，避免整帧处理浪费 ~95% 计算量。
         （与基准帧 baseline_gray 的存储格式保持一致：ROI 灰度模糊图）
         """
-        sy2 = min(self.search_y2, frame.shape[0])
-        sx2 = min(self.search_x2, frame.shape[1])
-        roi = frame[self.search_y1:sy2, self.search_x1:sx2]
+        # 起点也要 clamp 进画面：search_x1 由 hoop_x1 - margin 得来（已 max(0)），
+        # 但标定框若超出实际帧尺寸（标定分辨率与帧不一致）会切出**空** ROI，
+        # cv2.cvtColor 对空数组直接抛错并穿出检测主循环（相邻的
+        # has_motion_near_hoop / _find_moving_blob 都有 size==0 守卫，唯独这里没有）。
+        # clamp 后至少保证 1 像素，形状始终可用；正常情形下取值不变。
+        sy1 = min(self.search_y1, max(0, frame.shape[0] - 1))
+        sx1 = min(self.search_x1, max(0, frame.shape[1] - 1))
+        sy2 = max(sy1 + 1, min(self.search_y2, frame.shape[0]))
+        sx2 = max(sx1 + 1, min(self.search_x2, frame.shape[1]))
+        roi = frame[sy1:sy2, sx1:sx2]
         if len(roi.shape) == 3:
             roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         return cv2.GaussianBlur(roi, (5, 5), 0)

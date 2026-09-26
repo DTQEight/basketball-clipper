@@ -828,3 +828,44 @@ class TestStaticBallEvidence:
         det._cur_frame_idx = n
         assert det._check_yolo_near_hoop() == (False, 'rejected')
         assert det.diag['probe_called'] == 1 and det.diag['probe_confirmed'] == 0
+
+
+class TestRoiGrayOutOfFrame:
+    """搜索框越出画面时 _roi_gray 不得抛异常（标定分辨率与实际帧不一致的场景）。
+
+    旧实现只 clamp 终点、不 clamp 起点：篮筐标定框整体落在画面之外时，
+    frame[y1:y2, x1:x2] 会切出**空**数组，cv2.cvtColor 对空数组直接抛 cv2.error，
+    而 feed() 没有保护 → 异常穿出 run_detect 主循环，整个检测任务崩掉。
+    （相邻的 has_motion_near_hoop / _find_moving_blob 都有 size==0 守卫，唯独这里没有）
+    """
+
+    @staticmethod
+    def _det_with_box(x1, y1, x2, y2):
+        det = _detector()
+        det.search_x1, det.search_y1 = x1, y1
+        det.search_x2, det.search_y2 = x2, y2
+        return det
+
+    def test_box_fully_beyond_frame(self):
+        det = self._det_with_box(4000, 3000, 4160, 3160)
+        assert det._roi_gray(_base_frame()).size > 0
+
+    def test_box_start_beyond_frame_end_inside(self):
+        det = self._det_with_box(500, 0, 600, 100)
+        assert det._roi_gray(_base_frame()).size > 0
+
+    def test_normal_box_shape_unchanged(self):
+        """正常标定下 clamp 不改变 ROI（回归：不引入行为变化）。
+
+        HOOP=(130,80,170,120) + margin 60 → 搜索区 [20:180, 70:230] = 160x160
+        """
+        det = _detector()
+        assert (det.search_x1, det.search_y1) == (70, 20)
+        assert det._roi_gray(_base_frame()).shape == (160, 160)
+
+    def test_feed_survives_out_of_frame_search_box(self):
+        """端到端：搜索框越界时 feed 全程不得抛异常。"""
+        det = self._det_with_box(4000, 3000, 4160, 3160)
+        det.baseline_gray = det._roi_gray(_base_frame())
+        for i in range(5):
+            det.feed(None, i, FPS, frame=_base_frame())

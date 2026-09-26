@@ -1246,14 +1246,23 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.kept_goal_indices.clear()
 
             _stamp = int(time.time())
-            state.last_goal_clips.extend(
-                # 片段边界用完整区间 _orig_start（而非恢复后的 start）：
-                # 恢复点之前检测到的进球若距恢复点超过 3 秒，片段会被
-                # _cut_one 的边界钳制直接丢弃（进球卡片无预览、集锦缺球）
-                _generate_preview_clips(video_path, goals, _orig_start, end,
-                                        fps, total, _stamp, progress_callback=_report,
-                                        cancel_check=state.cancel_event.is_set)
-            )
+            try:
+                state.last_goal_clips.extend(
+                    # 片段边界用完整区间 _orig_start（而非恢复后的 start）：
+                    # 恢复点之前检测到的进球若距恢复点超过 3 秒，片段会被
+                    # _cut_one 的边界钳制直接丢弃（进球卡片无预览、集锦缺球）
+                    _generate_preview_clips(video_path, goals, _orig_start, end,
+                                            fps, total, _stamp, progress_callback=_report,
+                                            cancel_check=state.cancel_event.is_set)
+                )
+            except Exception as e:
+                # 切片失败不能连坐整场检测：进球已检出、主循环已跑到区间末尾，异常
+                # 冒泡会走总 except → 清空结果 + 因 _resume_frame==end 不存断点 +
+                # 跳过后面的 add_history = 数十分钟检测成果全部丢弃。这里只降级：
+                # 已切好的片段保留（extend 增量消费生成器），缺口由下方
+                # _missing_previews 在状态文本里提示。
+                log.error(f"[PREVIEW FAIL] 预览片段生成异常"
+                          f"（保留已切片段，继续收尾）: {e}")
             _t_slice_done = time.time()
 
             # ===== AI 复核：四臂集成判分，高分候选自动标记「自动通过」=====
@@ -1347,8 +1356,8 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
         # 「继续识别」还能把后半段补齐；删了那部分就永久丢失
         if _partial_decode:
             log.warning("[DECODE PARTIAL] 保留断点不删除，可点「继续识别」补齐剩余帧")
-        else:
-            state.delete_checkpoint(video_path)
+        # 断点删除已延后到 add_history 成功之后（见下方）：先删再写历史时，一旦历史
+        # 落盘失败（磁盘/权限/Windows 文件被占用）断点已经没了 → 整场只能从头重跑
         state.kept_goal_indices = set(range(len(state.last_goal_clips)))
         state.last_goals.clear()
         state.last_goals.extend(detector.goals)
@@ -1511,6 +1520,10 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           # （点预览或 √/×），auto_* 就被搬进 kept/deleted，
                           # 模型当次判了什么就查不回来了（见 _build_verify_snapshot）
                           verify_snapshot=_build_verify_snapshot(state.last_goal_clips))
+        # 历史已落盘 → 现在才安全删断点（顺序反了会在 add_history 失败时丢掉唯一的
+        # 恢复手段；N1 的 _partial_decode 例外仍优先）
+        if _saved_record is not None and not _partial_decode:
+            state.delete_checkpoint(video_path)
         # ===== AI 自动 √ 落盘 =====
         # 必须放在 add_history 之后：add_history 只保留磁盘上已有人工标签、
         # 从不读 clips 上的 mark，先写会被随后的整条记录覆盖掉。
