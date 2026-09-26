@@ -238,7 +238,10 @@ def extract(model, ball_classes, device, events, log_every=20):
     for video_path, evs in by_video.items():
         evs.sort(key=lambda e: e["ts"])
         try:
-            reader = VideoReader(video_path)
+            # single_thread：本循环是「PyAV 解码 + YOLO CUDA 推理」交替，已复现
+            # avcodec 帧线程池死锁（服务端表现为复核永久假死、CPU 0%）。
+            # 解码不是瓶颈（逐帧 YOLO 才是），关掉帧线程无可见代价。
+            reader = VideoReader(video_path, single_thread=True)
         except Exception as e:
             for ev in evs:
                 errors.append((ev["event_id"], f"open fail: {e}"))

@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 _log = logging.getLogger("goal_verifier")
@@ -93,6 +94,7 @@ def _load_lgbm():
         if _lgbm_tried:
             return _lgbm
         _lgbm_tried = True
+        _log.info("goal_verifier: [加载] A 臂（LGBM %s）…", LGBM_MODEL.name)
         try:
             import lightgbm as lgb
             meta = json.loads(LGBM_META.read_text(encoding="utf-8"))
@@ -195,6 +197,9 @@ def _load_temporal():
                 return net.eval()
 
             # ---- B 臂：SimCLR 骨干优先，缺失退回 ImageNet ----
+            # 心跳：torch.load + 骨干 + TemporalNet 在慢盘/首次加载可能要几十秒。
+            # 日志停在这条之后 = 卡在 B/Flow 加载（不是复核推理）
+            _log.info("goal_verifier: [加载] 进入 B/Flow 臂（device=%s）…", device)
             b_resnet = b_nets = None
             b_pre = "rgb255"
             try:
@@ -227,6 +232,7 @@ def _load_temporal():
                     b_nets = None
 
             # ---- Flow 臂：光流域 SimCLR 骨干优先，缺失退回 ImageNet ----
+            _log.info("goal_verifier: [加载] B 臂就绪（骨干=%s），进入 Flow 臂…", b_pre)
             flow_resnet = flow_nets = None
             flow_pre = "rgb255"
             try:
@@ -304,6 +310,7 @@ def _load_vm():
         if _vm_tried:
             return _vm
         _vm_tried = True
+        _log.info("goal_verifier: [加载] VM 臂（VideoMAE，离线缓存）…")
         try:
             os.environ.setdefault("HF_HOME", str(Path(CACHE_ROOT) / "hf"))
             os.environ["HF_HUB_OFFLINE"] = "1"
@@ -576,11 +583,16 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
         on_progress(0.0, '视觉三臂：加载模型')
     vm = _load_vm()
     n_frames, min_valid = len(frame_offs), 8
+    _log.info("goal_verifier: [B/Flow/VM] 开始打分 %d 个候选（B=%s Flow=%s VM=%s）",
+              len(todo), bool(b_nets), bool(flow_nets), vm is not None)
 
     blocks = []  # [(clip, (16,224,224,3) uint8 BGR)]
     reader = None
     try:
-        reader = VideoReader(video_path)
+        _log.info("goal_verifier: [B/Flow/VM] 抽帧开始（单 reader 顺序解码）")
+        # single_thread：A 臂刚跑完 YOLO CUDA，再走 PyAV 帧线程池解码会偶发
+        # 永久卡死（与 read_frame 同一规避，见 video_io.VideoReader 注释）
+        reader = VideoReader(video_path, single_thread=True)
         fps, total = reader.fps, reader.total
         for k, c in enumerate(todo):
             ts = float(c["ts"])
@@ -604,6 +616,8 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                 # 抽帧（解码）占视觉阶段前半：让进度在长时间解码里也能动
                 on_progress(0.5 * (k + 1) / len(todo),
                             f'三臂抽帧 {k + 1}/{len(todo)}')
+                _log.info("goal_verifier: [B/Flow/VM] 抽帧 %d/%d（已有 %d 个有效块）",
+                          k + 1, len(todo), len(blocks))
     except Exception as e:
         _log.warning("goal_verifier: 筐心块抽帧失败 %s: %s", video_path, e)
         return
@@ -615,11 +629,15 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                 pass
     if on_progress:
         on_progress(0.5, f'三臂抽帧 {len(blocks)}/{len(todo)}')
+    _log.info("goal_verifier: [B/Flow/VM] 抽帧完成 %d/%d，进入 GPU 推理",
+              len(blocks), len(todo))
 
     # 批量 GPU 推理（4 片段 = 64 帧/批，同训练特征提取的显存预算）
     try:
+        n_chunks = (len(blocks) + 3) // 4
         for i in range(0, len(blocks), 4):
             chunk = blocks[i:i + 4]
+            bn = i // 4 + 1
             if on_progress:
                 on_progress(0.5 + 0.5 * i / max(len(blocks), 1),
                             f'三臂推理 {i}/{len(blocks)}')
@@ -628,6 +646,7 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
             # 退回 ImageNet 时才是 mean/std
             # 与 Flow 臂对称：本臂不可用（None）或推理失败时只跳过它，不连累其它臂
             if b_nets:
+                _log.info("goal_verifier: [B/Flow/VM] 批 %d/%d：B 臂推理…", bn, n_chunks)
                 try:
                     arr = np.concatenate([b[1] for b in chunk]).astype(np.float32) / 255.0
                     arr = arr[..., ::-1]  # BGR→RGB
@@ -649,6 +668,7 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
             # 与 B 臂同理按骨干口径分流：光流 SimCLR 用裸 /255，退回
             # ImageNet 时才是 mean/std（两套口径不能混）
             if flow_nets:
+                _log.info("goal_verifier: [B/Flow/VM] 批 %d/%d：Flow 臂推理…", bn, n_chunks)
                 try:
                     fmap_blocks = [_flow_maps(b[1]) for b in chunk]
                     farr = np.concatenate(fmap_blocks).astype(np.float32) / 255.0
@@ -670,6 +690,7 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                         c.pop("score_flow", None)
             # ---- VM 臂：VideoMAE 768 维 → LGBM Booster ----
             if vm is not None:
+                _log.info("goal_verifier: [B/Flow/VM] 批 %d/%d：VM 臂推理…", bn, n_chunks)
                 try:
                     with torch.no_grad():
                         t_in = torch.cat(
@@ -686,6 +707,9 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                         c.pop("score_vm", None)
     except Exception as e:
         _log.warning("goal_verifier: 三臂推理失败 %s: %s", video_path, e)
+    else:
+        _log.info("goal_verifier: [B/Flow/VM] GPU 推理完成（%d 批 / %d 片段）",
+                  (len(blocks) + 3) // 4, len(blocks))
 
 
 def _score_lgbm(video_path, clips, hoop, on_progress=None):
@@ -718,8 +742,13 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None):
         return
 
     n_done, n_err = 0, 0
+    nb = (len(todo) + A_BATCH - 1) // A_BATCH
+    tb = time.time()
+    _log.info("goal_verifier: [A 臂] 开始提特征：%d 个候选 / %d 批", len(todo), nb)
     for s in range(0, len(todo), A_BATCH):
         chunk = todo[s:s + A_BATCH]
+        _log.info("goal_verifier: [A 臂] 批 %d/%d（%d 个候选）YOLO 逐帧提特征…",
+                  s // A_BATCH + 1, nb, len(chunk))
         events, clip_by_eid = [], {}
         for c in chunk:
             ts = round(float(c["ts"]), 3)
@@ -758,6 +787,8 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None):
                         f'A臂特征 {min(n_done, len(todo))}/{len(todo)}')
     if n_err:
         _log.info("goal_verifier: A 臂有 %d 个候选提特征失败（保留人工判断）", n_err)
+    _log.info("goal_verifier: [A 臂] 提特征完成：%d 个候选（失败 %d，耗时 %.1fs）",
+              n_done, n_err, time.time() - tb)
 
 
 def combine(clip) -> float | None:
@@ -789,8 +820,15 @@ def score_clips(video_path, clips, hoop, progress=None):
         if progress:
             progress(0.70 + 0.30 * frac, stage)
 
+    # 心跳：日志停在哪一条，就说明卡在哪一臂（服务卡死时唯一现场）
+    _log.info("goal_verifier: [复核开始] %s —— %d 个候选", video_path, len(clips))
+    t0 = time.time()
     _score_lgbm(video_path, clips, hoop, on_progress=_p_a)
+    _log.info("goal_verifier: [复核] A 臂结束（%.1fs），进入视觉三臂",
+              time.time() - t0)
     _score_visual(video_path, clips, hoop, on_progress=_p_v)
+    _log.info("goal_verifier: [复核] 视觉三臂结束（%.1fs），开始融合",
+              time.time() - t0)
     # 打分完成后才取指纹：ENS_WEIGHTS 是 _load_temporal 里读进来的
     fp = model_fingerprint()
     n = 0
@@ -801,6 +839,8 @@ def score_clips(video_path, clips, hoop, progress=None):
         c["score"] = round(s, 3)
         c["verify_ver"] = fp
         n += 1
+    _log.info("goal_verifier: [复核完成] %d/%d 个候选有集成分（耗时 %.1fs，指纹 %s）",
+              n, len(clips), time.time() - t0, fp)
     return n
 
 

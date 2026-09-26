@@ -2,6 +2,34 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.26 修复：复核阶段 PyAV 帧线程池死锁（服务假死）；加分臂心跳日志
+
+**问题**：批量识别跑到复核阶段服务假死 —— 7871 端口可连但 HTTP 不响应、**CPU 0%**（不是慢，是永久阻塞），日志停在 `goal_verifier: A 臂 LGBM 已加载（35 特征）`。强杀重启后换个视频又卡，第二次停在 `[WARMUP ABORT]` 之后。
+
+**定位**：先加分臂心跳日志，一轮命中 —— 日志停在 `[A 臂] 批 3/11（8 个候选）YOLO 逐帧提特征…`（批 1、2 已过）。`py-spy dump --native` 抓到原生栈：
+
+```
+ZwWaitForAlertByThreadId → RtlSleepConditionVariableSRW → SleepConditionVariableSRW
+avcodec_free_context → av\codec\context.pyd / av\stream.pyd
+_score_lgbm (services/goal_verifier.py:761)  →  extract()  （extract_features.py）
+```
+
+与 `read_frame` 里 2026.09.22 记录的必现死锁**同源**：avcodec 帧级多线程解码（`thread_type=FRAME`）的线程池条件变量。当时 `thread_count = 1` 的规避只加在 `read_frame`，注释判断「批量解码走 VideoReader（检测主路径）不受影响」—— 被证伪：A 臂 `extract()` 是「PyAV 解码 + YOLO CUDA 推理」交替，一样中招。
+
+**为什么以前没撞上**（不是新 bug，是概率攒够了）：
+- A 臂复核路径 09-19 才随四臂集成上线，规避 09-22 才进仓库且**没覆盖它** —— 两者从没合上过。
+- 访问模式根本不同：检测主循环是**一个 reader 顺序读完 8.7 万帧、一次 seek 之后再不回头**（帧线程池建一次平稳跑 48 分钟）；A 臂是同一 container 上**每个候选一次「seek → 读约 90 帧 → 命中 `fidx >= end` 提前弃流」**，83 个候选 = 83 次，且每次之间都夹着 YOLO CUDA 推理 → 帧线程池被反复挂起/唤醒，这才是死锁窗口。
+- 素材在 `Y:`（`\\Mcdull-nas\hdd1`，网络盘）：帧级多线程每线程缓冲一帧（1080p 约 3.1MB），NAS 的 IO 抖动放大生产/消费节奏错位。09-22 那次复现是本地 `E:\ball\*.mov`，这次是 NAS 上的 `.mp4`。
+- 属概率性 race，非必现：同一次 83 个候选里批 1、2 平稳过了批 3 才卡。
+
+**实现**：
+- `VideoReader(path, single_thread=False)` 新增参数：True 时在 **seek/decode 之前**设 `codec_context.thread_count = 1`（线程池建好后再改无效），与 `read_frame` 同一规避。
+- A 臂 [extract_features.extract()](training/extract_features.py) 与 [goal_verifier._score_visual](services/goal_verifier.py) 的抽帧改走 `single_thread=True`。**检测主路径不动**：那里没复现过，且要靠帧线程吃 285 帧/秒；解码也不是复核瓶颈（逐帧 YOLO 才是）。
+- **分臂心跳日志**（本轮定位的关键）：加载路径各臂各一条；复核 `[复核开始] N 个候选` → `[A 臂] 开始提特征 N 个 / M 批` + 每批 → `[A 臂] 提特征完成（耗时）` → `[B/Flow/VM] 开始打分（各臂可用性）/ 抽帧 i/N / 抽帧完成 / 批 i/M 逐臂推理 / GPU 推理完成` → `[复核完成] n/N（耗时，指纹）`。
+- 补检测阶段日志盲区：`[WARMUP ABORT]` 到 `[DETECT START]` 之间原先**零落盘日志**（`_report()` 只推 UI 不写文件），新增 `[DETECT] 预热结束，开始加载 YOLO 模型…` 与 `[DETECT] YOLO 就绪（N 个球类别），进入检测循环`，可区分「卡在 YOLO 加载」还是「卡在检测循环」。
+
+**测试**：全量 273 passed。
+
 ### 2026.09.25 结果卡片序号；08.25 跨机位场次留出；keep_thr 扫描（本次不改）
 
 **卡片序号**：结果卡片第一行左侧加 `#N`（青蓝 pill，与时间戳同色：`var(--accent)` + `--accent-muted` 底 + 同色 45% 描边，等宽加粗居中，`min-width` 对齐两位数）。N 是**列表位置**（1-based），与 √/×/预览/导出 传入的 `idx` 同源 —— 「只看待确认」过滤时会跳号，这是故意的（保证与后台顺序一致）。同时整行加 `flex-nowrap`、序号/时间戳/徽章加 `shrink-0`、分类按钮加 `min-w-0`：NiceGUI 的 `ui.row()` 默认 `flex-wrap: wrap`，加了序号后总宽一超，右侧「人物分类」就被挤到第二行。

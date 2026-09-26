@@ -221,10 +221,21 @@ class VideoReader:
         reader.close()
     """
 
-    def __init__(self, path):
+    def __init__(self, path, single_thread=False):
+        """single_thread=True 关闭帧级多线程解码（thread_count=1）。
+
+        与 read_frame 同一规避：进程内跑过 torch/CUDA 推理后再解码，avcodec 帧
+        线程池会偶发永久卡在条件变量上（原生栈 SleepConditionVariableSRW，
+        表现为 CPU 0% 假死）。检测主路径（解码与 YOLO 交替但码率/节奏稳定）
+        实测未复现，保持多线程以吃到 285 帧/秒；**复核路径**已复现
+        （goal_verifier A 臂 extract()：批 3/11 卡死），故按调用方显式开启。
+        """
         self.container = av_open(path)
         try:
             self.stream = self.container.streams.video[0]
+            if single_thread:
+                # 必须在 seek/decode 之前设置，线程池建好后再改无效
+                self.stream.codec_context.thread_count = 1
             # 直接复用已打开的容器读取信息，避免再 open 一次（get_video_info 会重开）
             s = self.stream
             self.total = int(s.frames or 0) or 0

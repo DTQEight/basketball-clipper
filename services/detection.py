@@ -946,6 +946,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             state.last_goals.clear()
             return "已取消（预热阶段）", False
         _report(10, '加载 YOLO 模型...')
+        # 心跳：预热结束到 DETECT START 之间原本零日志（_report 只推 UI 不落盘），
+        # 服务卡死时无法区分「卡在 YOLO 加载」还是「卡在检测循环」
+        log.info("[DETECT] 预热结束，开始加载 YOLO 模型…")
         model, _weights_path = get_ball_model()
         # 按 model.names 反查球类别索引：classes=[0] 只对自定义单类权重成立，
         # 回退 COCO 权重（yolov8n.pt）时类 0 是 person，硬编码会误把球员当球确认
@@ -992,6 +995,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             detector.yolo_probe = _probe_ball
             detector._probe_gated_ref = _probe_gated
 
+        log.info("[DETECT] YOLO 就绪（%d 个球类别），进入检测循环", len(_ball_classes))
         t0 = time.time()
         t0_str = time.strftime('%H:%M:%S', time.localtime(t0))
         # 统计口径：n_frames 为本次运行待处理帧数（ETA/瞬时速率）；
