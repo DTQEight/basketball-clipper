@@ -2,6 +2,23 @@
 
 > 本文档收集 README 的历次版本对比 / 审查修复 / 实测报告等历史条目，从 README.md 迁移而来。
 
+### 2026.09.26 修复：批量模式/进度面板跨刷新丢失；批量收尾异常保护
+
+**问题（实测踩到）**：批量识别跑到一半，界面出现三个症状 —— ① 批量文件夹面板消失；② 进度区只剩一句「检测中...」，详情行与进度条都不动；③ 复核还在打分，进球卡片已经全出来了。服务端日志同时留下 `RuntimeError: The client this element belongs to has been deleted.`（`_on_batch_run` 收尾的 `_refresh_result_cards()`）。
+
+**根因（同一个）**：批量途中**刷新了页面** → NiceGUI 销毁旧 client、重建整页 UI。三个症状都是"每页 UI 回到建页初始态、而进程级 state 还在跑"的连锁反应：
+
+- `batch_panel` 全项目只有 `_on_load()` 一处会 `remove='hidden'`，建页时是 `hidden`，**刷新后没有任何恢复逻辑**；更糟的是任务运行中 `_on_load` 被 `_refuse_if_busy()` 拦住，用户连"重新加载文件夹"都点不了，只能干等本批跑完。
+- `_sync_live_ui` 里 `detect` / `hl` 两个分支都会把主进度面板写回来，唯独 `batch` **只写了左侧迷你条** → 主面板停在控件默认值，而 `progress_text` 的初始文案恰好就是「检测中...」（详情行为空、进度条为 0），看着像卡死。
+- 建页时会 `_refresh_result_cards()` 按 `state.last_goal_clips` 渲染卡片，而这份数据在"生成预览片段"（进度 80%）阶段就填好了，**早于 AI 复核（85~99%）** → 卡片先出、分数徽章后到。
+
+**实现**：
+- 建页时若 `state.batch_files` 非空 → 直接显示 `batch_panel` + `_refresh_batch_list()`，恢复面板/下拉/单节勾选/标定标记（`state.batch_files` 是进程级状态，同进程内跨刷新有效；进程重启后自然为空，需重新扫描目录）。
+- `_sync_live_ui` 的 `batch` 分支补上 `progress_bar` / `progress_text` / `progress_detail` 恢复，口径与 `detect` / `hl` 一致。
+- `_on_batch_run` 收尾的两次列表重建包 `try/except RuntimeError`：原注释里"元素操作退化为静默 no-op"只对 `set_text` / `classes` 成立，`clear()` / `remove_elements()` 在 client 已销毁时会抛。状态清理（`_CANCEL_REQ` / `state.clear_live` / `_cards_video`）留在 `try` 之外，保证任何情况下都执行。
+
+**测试**：全量 273 passed。
+
 ### 2026.09.26 修复：复核阶段 PyAV 帧线程池死锁（服务假死）；加分臂心跳日志
 
 **问题**：批量识别跑到复核阶段服务假死 —— 7871 端口可连但 HTTP 不响应、**CPU 0%**（不是慢，是永久阻塞），日志停在 `goal_verifier: A 臂 LGBM 已加载（35 特征）`。强杀重启后换个视频又卡，第二次停在 `[WARMUP ABORT]` 之后。

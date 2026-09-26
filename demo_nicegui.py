@@ -1027,7 +1027,13 @@ def main_page():
             state.release_task(token)  # io_bound 未启动/启动即异常时后台 finally 不会执行
         # 注意：正常路径锁由 run_batch_detect 内部 finally 释放（锁归任务本体；
         # 刷新页面只会让新页面不再自动刷这一份 UI，收尾逻辑照常执行——NiceGUI 把
-        # 事件协程调度为全局任务，client 删除不会取消它，元素操作退化为静默 no-op）
+        # 事件协程调度为全局任务，client 删除不会取消它）
+        # 但"元素操作退化为静默 no-op"只对 set_text / classes 成立：整列表重建走的
+        # clear() / remove_elements() 在 client 已销毁时会抛 RuntimeError —— 实测
+        # 批量跑完前刷新页面，收尾的 _refresh_result_cards() 抛
+        # "The client this element belongs to has been deleted."。故两次列表重建
+        # 自带保护；状态清理(_CANCEL_REQ / state.clear_live / _cards_video)全在
+        # try 之外，任何情况下都会执行。
         _CANCEL_REQ["batch"] = False  # 任务真正结束：取消标记随之失效
         batch_run_btn.set_text('批量识别')
         batch_run_btn.enable()
@@ -1038,8 +1044,13 @@ def main_page():
         # 批量结束后：用户查看中的快照保留显示；否则回全局模式显示最后一个视频的结果
         if _cards_video["path"] not in state.batch_results:
             _cards_video["path"] = None
-        _refresh_result_cards()
-        _refresh_batch_list()
+        try:
+            _refresh_result_cards()
+            _refresh_batch_list()
+        except RuntimeError:
+            # 页面已被刷新/关闭 → 没有页面需要刷新。结果早已写入历史记录，
+            # 这里只是收尾 UI；吞掉异常避免日志里留下误导性的假堆栈
+            pass
 
     async def _on_image_click(e):
         """点击预览图标定篮筐。
@@ -2036,6 +2047,14 @@ def main_page():
                 batch_progress_strip.classes(remove='hidden')
                 batch_mini_bar.set_value(b["pct"] / 100)
                 batch_mini_text.set_text(f"{b['pct']:.0f}%")
+                # 主进度面板也要恢复：批量的进度回调写的是**刷新前**那批元素
+                # （已不在页面里，赋值静默失效），此处不补的话刷新后面板停在控件
+                # 默认态——恰好是「检测中...」+ 空详情 + 进度条 0，看着像卡死。
+                # 与 detect/hl 两个分支保持同样口径（右侧面板被预览顶掉时用户可点
+                # 左侧迷你条切回进度视图，那里必须是活的）
+                progress_bar.set_value(b["pct"] / 100)
+                progress_text.set_text(b["msg"])
+                progress_detail.set_text(b["msg"])
             else:
                 _CANCEL_REQ["batch"] = False
                 if batch_run_btn.text != '批量识别':
@@ -2075,6 +2094,14 @@ def main_page():
 
     # 页面初始化：不自动加载历史列表（空白初始状态），点「刷新」才加载
     _refresh_result_cards()
+    # 跨刷新恢复「批量文件夹模式」：batch_panel 是每页新建的 UI（建页时是 hidden），
+    # 而 state.batch_files 是进程级状态、刷新后依然在 → 旧实现只靠 _on_load 显示
+    # 面板，刷新一次面板就没了；更糟的是任务运行中 _on_load 被 _refuse_if_busy
+    # 拦住，用户连"重新加载文件夹"都点不了，只能干等本批跑完。故建页时按 state
+    # 直接恢复面板与列表（与 _sync_live_ui「运行中任务 UI 恢复」同一意图）。
+    if state.batch_files:
+        batch_panel.classes(remove='hidden')
+        _refresh_batch_list()
 
 
 # ============ 启动 ============
