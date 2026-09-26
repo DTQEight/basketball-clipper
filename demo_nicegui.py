@@ -984,7 +984,13 @@ def main_page():
         progress_detail.set_text('')
 
         def _progress_callback(pct, msg):
+            # set_live 必须排在元素写入之前：本闭包捕获的是**启动批量那一页**的元素，
+            # 中途刷新页面后这些元素所属 client 已销毁、任何写入都抛异常，而
+            # except 会把它吞掉 —— 若 set_live 写在后面将永远执行不到，进程级进度
+            # 槽冻结在刷新前那一刻，于是 0.4s 的 _sync_live_ui 只能反复把旧值写回
+            # 新页面（表现为进度条与文字长期不动，且刷新救不回来）。
             try:
+                state.set_live('batch', pct, msg)
                 progress_bar.set_value(pct / 100)
                 # 主行直接显示完整消息（含当前视频进度 + 整批 ETA），
                 # 右侧面板被预览顶掉时迷你条仍有百分比兜底
@@ -993,7 +999,6 @@ def main_page():
                 # 迷你进度条同步（右侧面板被预览顶掉时，用户仍能看到后台进度）
                 batch_mini_bar.set_value(pct / 100)
                 batch_mini_text.set_text(f'{pct:.0f}%')
-                state.set_live('batch', pct, msg)
             except Exception:
                 pass
 
@@ -1228,11 +1233,11 @@ def main_page():
         # 进度回调函数（修复 Bug#3：更新 progress_detail，让用户看到当前处理的帧/阶段）
         def _progress_callback(pct, msg):
             try:
+                state.set_live('detect', pct, msg)  # 先写槽，页面销毁时元素写入会抛异常
                 progress_bar.set_value(pct / 100)
                 # 主行短状态 + 详情行完整消息（含帧数/ETA），避免两行重复显示同一内容
                 progress_text.set_text('检测中...' if pct < 80 else '生成预览片段...')
                 progress_detail.set_text(msg)
-                state.set_live('detect', pct, msg)
             except Exception:
                 pass
 
@@ -1696,9 +1701,9 @@ def main_page():
 
             def _hl_progress(pct, msg):
                 try:
+                    state.set_live('hl', pct, msg, mini=True)  # 先写槽
                     hl_mini_bar.set_value(pct / 100)
                     hl_mini_text.set_text(f'集锦 {pct:.0f}%')
-                    state.set_live('hl', pct, msg, mini=True)
                 except Exception:
                     pass
 
@@ -1740,11 +1745,11 @@ def main_page():
 
         def _progress_callback(pct, msg):
             try:
+                state.set_live('hl', pct, msg)  # 先写槽
                 progress_bar.set_value(pct / 100)
                 # 主行短状态 + 详情行完整消息，避免两行重复
                 progress_text.set_text('正在生成集锦...')
                 progress_detail.set_text(msg)
-                state.set_live('hl', pct, msg)
             except Exception:
                 pass
 
@@ -1793,9 +1798,9 @@ def main_page():
 
             def _hl_progress(pct, msg):
                 try:
+                    state.set_live('hl', pct, msg, mini=True)  # 先写槽
                     hl_mini_bar.set_value(pct / 100)
                     hl_mini_text.set_text(f'整场集锦 {pct:.0f}%')
-                    state.set_live('hl', pct, msg, mini=True)
                 except Exception:
                     pass
 
@@ -1831,10 +1836,10 @@ def main_page():
 
         def _progress_callback(pct, msg):
             try:
+                state.set_live('hl', pct, msg)  # 先写槽
                 progress_bar.set_value(pct / 100)
                 progress_text.set_text('正在生成整场集锦...')
                 progress_detail.set_text(msg)
-                state.set_live('hl', pct, msg)
             except Exception:
                 pass
 
