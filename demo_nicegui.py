@@ -408,10 +408,11 @@ def main_page():
                                     start_frame = ui.number(label='起始帧', value=0, format='%d').classes('flex-1')
                                     end_frame = ui.number(label='结束帧(0=末尾)', value=0, format='%d').classes('flex-1')
                                 with ui.row().classes('gap-2 w-full'):
-                                    # 默认 0.15（原 0.2）：实测有真实进球因 YOLO
-                                    # 置信度略低于 0.2 而完全漏检。配合 imgsz=1280
-                                    # 使用；若误报明显增多可单独调回 0.2 对比。
-                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.15, step=0.05).classes('flex-1')
+                                    # 默认 0.2（2026.09.27 由 0.15 调回）：0.15 确实能
+                                    # 救回「置信度略低于 0.2」的漏球，但候选数明显增多、
+                                    # YOLO 确认率下降（"过滤漏斗"通过率减半）。0.2 在
+                                    # 检出率与候选量之间更均衡。配合 imgsz=1280 使用。
+                                    ball_conf = ui.slider(min=0.1, max=0.9, value=0.2, step=0.05).classes('flex-1')
                                     ui.label().bind_text_from(ball_conf, 'value', lambda v: f'置信度: {v:.2f}').classes('text-gray-400 text-xs')
                                 with ui.row().classes('gap-2 w-full'):
                                     min_gap = ui.slider(min=1.0, max=10.0, value=2.0, step=0.5).classes('flex-1')
@@ -1395,6 +1396,131 @@ def main_page():
         """
         ui.timer(0, _refresh_result_cards, once=True)
 
+    # ============ 卡片局部更新（方案 A）与乐观更新（方案 B）的支持设施 ============
+    # 背景：√/× 原先每点一次都走 _refresh_result_cards 整列表重建。88 张卡片 =
+    # 上千个元素，重建耗时数百毫秒；期间被点击的按钮已被移出 DOM、新按钮刚建出来，
+    # 浏览器只在 mousedown/mouseup 落在同一元素上才触发 click —— 这几百毫秒里的
+    # 点击会真丢。改为：标记只更新那一张卡片的 3 个元素 + 顶部统计行（约 6 个元素）。
+    _card_widgets = {}          # idx -> {'card': ui.card, 'keep': btn, 'rej': btn}
+    _stats_row_holder = {'row': None}
+
+    def _cards_clips():
+        """当前卡片列表的数据源（与 _refresh_result_cards 同一规则：快照优先）。"""
+        vp = _cards_video["path"]
+        if vp is not None:
+            snap = state.batch_results.get(vp)
+            return snap["clips"] if snap else []
+        return state.last_goal_clips
+
+    def _eff_mark(c):
+        """屏幕上呈现的标记：AI 识别关闭时，模型的 auto 标记一律按「未判定」显示。"""
+        if not goal_verifier.is_enabled() and c.get("mark_source") == "auto":
+            return None
+        return c.get("mark")
+
+    def _mark_btn_style(on, kind):
+        """√/× 按钮的两种外观（on=已标记）。与建卡时写死的样式同一份口径。"""
+        if kind == 'keep':
+            _fg, _bd, _bg = '#22c55e', 'rgba(34, 197, 94, 0.7)', 'rgba(34, 197, 94, 0.12)'
+        else:
+            _fg, _bd, _bg = 'var(--err)', 'rgba(239, 68, 68, 0.7)', 'rgba(239, 68, 68, 0.12)'
+        return (f'color: {_fg if on else "var(--text-secondary)"}; '
+                f'border: 1px solid {_bd if on else "var(--border-subtle)"}; '
+                f'background: {_bg if on else "transparent"}')
+
+    def _card_style(mark):
+        """卡片外框：√ 绿 / × 红 + 半透明 / 未标记 中性。
+
+        三种状态都必须显式写 opacity：element.style() 是**合并**语义（本次没提到的
+        属性不会被清除）。局部更新是往同一个元素反复写样式，若只在 × 分支写
+        opacity: 0.55，先点 × 再点 √ 就会残留半透明 —— 边框变绿了但整张卡还是灰的，
+        表现为"卡片不高亮"。建卡时每张卡只写一次样式，所以整列表重建的老实现看不到。
+        """
+        _base = 'margin: 0; background: var(--bg-surface); '
+        if mark == 'keep':
+            return _base + 'opacity: 1; border: 1px solid rgba(34, 197, 94, 0.6)'
+        if mark == 'reject':
+            return _base + 'opacity: 0.55; border: 1px solid rgba(239, 68, 68, 0.5)'
+        return _base + 'opacity: 1; border: 1px solid var(--border-subtle)'
+
+    def _stats_payload():
+        """统计行 / 人物下拉 / 导出提示共用的一份计数（口径单一来源，避免两处漂移）。"""
+        _clips = _cards_clips()
+        _ai_on = goal_verifier.is_enabled()
+        n_keep = sum(1 for c in _clips if _eff_mark(c) == "keep")
+        n_reject = sum(1 for c in _clips if _eff_mark(c) == "reject")
+        person_counts = {}
+        for c in _clips:
+            p = c.get("person")
+            if p:
+                person_counts[p] = person_counts.get(p, 0) + 1
+        n_person = sum(person_counts.values())
+        n_pending = len(_clips) - n_keep - n_reject
+        if n_keep:
+            _hint = f'导出集锦：{n_keep} 个 √ 片段'
+        elif n_reject:
+            _hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
+        else:
+            _hint = f'导出集锦：全部 {len(_clips)} 个（标记 √ 后只导 √）'
+        return {
+            'n_keep': n_keep, 'n_reject': n_reject, 'n_pending': n_pending,
+            # 三段分诊：自动 √（高带）/ 自动 ×（低带）分别计数，人工只需看中间带
+            'n_auto_keep': sum(1 for c in _clips if _ai_on and c.get("mark") == "keep"
+                               and c.get("mark_source") == "auto"),
+            'n_auto_rej': sum(1 for c in _clips if _ai_on and c.get("mark") == "reject"
+                              and c.get("mark_source") == "auto"),
+            'person_counts': person_counts, 'n_person': n_person,
+            'person_colors': _person_color_map(_clips), 'export_hint': _hint,
+            'n_total': len(_clips),
+        }
+
+    def _fill_stat_row(st=None):
+        """重填顶部统计行（约 6~12 个元素，重建代价可忽略）。
+
+        标记后只重填这一行、不重建整张卡片列表 —— 就是这个函数让方案 A 成立。
+        行元素本身固定（_stats_row_holder），clear 后重填不会打乱它与卡片列表的顺序。
+        """
+        row = _stats_row_holder['row']
+        if row is None:
+            return
+        if st is None:
+            st = _stats_payload()
+        p_only = _cards_video["pending_only"]
+        row.clear()
+        with row:
+            ui.label(f'√ {st["n_keep"]}' + (f'（AI {st["n_auto_keep"]}）' if st["n_auto_keep"] else '')
+                     ).classes('text-xs font-bold').style('color: #22c55e')
+            ui.label(f'× {st["n_reject"]}' + (f'（AI {st["n_auto_rej"]}）' if st["n_auto_rej"] else '')
+                     ).classes('text-xs font-bold').style('color: var(--err)')
+            ui.label(f'待确认 {st["n_pending"]}' if st["n_pending"] else '全部已判定').classes(
+                'text-xs font-bold' if st["n_pending"] else 'text-xs').style(
+                'color: #f59e0b' if st["n_pending"] else 'color: var(--text-secondary)')
+            ui.button('显示全部' if p_only else '只看待确认',
+                      on_click=_toggle_pending_only).props(
+                'ripple flat dense no-caps').classes(
+                'text-[10px] rounded-full px-2 py-0').style(
+                f'color: {"#f59e0b" if p_only else "var(--text-secondary)"}; '
+                f'border: 1px solid {"rgba(245, 158, 11, 0.6)" if p_only else "var(--border-subtle)"}; '
+                f'background: {"rgba(245, 158, 11, 0.12)" if p_only else "transparent"}')
+            for p, n in sorted(st['person_counts'].items()):
+                _c = st['person_colors'].get(p, _PERSON_PALETTE[0])
+                ui.label(f'👤 {p}×{n}').classes(
+                    'text-xs font-bold rounded-full px-2 py-0.5').style(
+                    f'color: {_c[0]}; background: {_c[1]}; border: 1px solid {_c[0]}')
+            ui.label(st['export_hint']).classes('text-xs ml-auto').style('color: var(--text-secondary)')
+
+    def _apply_mark_local(i, mark):
+        """方案 A/B：只把第 i 张卡片切到 mark 外观 + 重填统计行，不碰其它卡片。"""
+        w = _card_widgets.get(i)
+        if w is not None:
+            try:
+                w['card'].style(_card_style(mark))
+                w['keep'].style(_mark_btn_style(mark == 'keep', 'keep'))
+                w['rej'].style(_mark_btn_style(mark == 'reject', 'reject'))
+            except Exception:
+                pass  # 页面已销毁等：样式更新失败不影响落盘，下次重建会纠正
+        _fill_stat_row()
+
     def _refresh_result_cards():
         """刷新结果卡片列表。
 
@@ -1402,12 +1528,12 @@ def main_page():
                 否则 → 全局 last_goal_clips（单视频/批量最后结果）。
         """
         result_container.clear()
+        _card_widgets.clear()  # 方案A：局部更新注册表随整列表一起重建
+        # 统计行槽位需同步失效：result_container.clear() 已把它删掉，留着旧引用会
+        # 让后续 _fill_stat_row() 往已销毁的元素上写（无结果提前 return 的路径会踩到）
+        _stats_row_holder['row'] = None
         vp = _cards_video["path"]
-        if vp is not None:
-            snap = state.batch_results.get(vp)
-            clips = snap["clips"] if snap else []
-        else:
-            clips = state.last_goal_clips
+        clips = _cards_clips()
         if not clips:
             with result_container:
                 if vp is not None:
@@ -1426,43 +1552,16 @@ def main_page():
         # AI 识别关闭时，模型自己打的分诊标记（mark_source == "auto"）一律按
         # 「未判定」呈现：只改显示，不动缓存分数与历史标签，重开即时恢复。
         _ai_on = goal_verifier.is_enabled()
-
-        def _eff_mark(c):
-            m = c.get("mark")
-            if not _ai_on and c.get("mark_source") == "auto":
-                return None
-            return m
-
-        n_keep = sum(1 for c in clips if _eff_mark(c) == "keep")
-        n_reject = sum(1 for c in clips if _eff_mark(c) == "reject")
-        n_pending = len(clips) - n_keep - n_reject
-        # 三段分诊：自动 √（高带）/ 自动 ×（低带）分别计数，人工只需看中间带
-        n_auto_keep = sum(1 for c in clips if _ai_on and c.get("mark") == "keep"
-                          and c.get("mark_source") == "auto")
-        n_auto_rej = sum(1 for c in clips if _ai_on and c.get("mark") == "reject"
-                         and c.get("mark_source") == "auto")
-        person_counts = {}
-        for c in clips:
-            p = c.get("person")
-            if p:
-                person_counts[p] = person_counts.get(p, 0) + 1
-        n_person = sum(person_counts.values())
-        # 人物配色映射（徽章 / 统计行 / 对话框同源，同屏不撞色）
-        person_colors = _person_color_map(clips)
-        if n_keep:
-            export_hint = f'导出集锦：{n_keep} 个 √ 片段'
-        elif n_reject:
-            export_hint = f'导出集锦：{n_pending} 个未标片段（× 已排除）'
-        else:
-            export_hint = f'导出集锦：全部 {len(clips)} 个（标记 √ 后只导 √）'
+        # 统计行 / 人物下拉 / 导出提示共用同一份计数（口径单一来源，见 _stats_payload）
+        st = _stats_payload()
         # 人物筛选下拉选项：'' = 全部 / 仅已分类（存在未分类片段时才有意义）/
         # 各人物（带计数）/ 全局名单其他场次人物（无计数，供整场合并导出选择——
         # 单视频模式下同场其他节的人物也来自这里）
         try:
             _opts = {'': '全部人物'}
-            if person_counts and n_person < len(clips):
-                _opts[detection.PERSON_FILTER_CLASSIFIED] = f'仅已分类（{n_person}）'
-            _opts.update({p: f'{p}（{n}）' for p, n in sorted(person_counts.items())})
+            if st['person_counts'] and st['n_person'] < len(clips):
+                _opts[detection.PERSON_FILTER_CLASSIFIED] = f'仅已分类（{st["n_person"]}）'
+            _opts.update({p: f'{p}（{n}）' for p, n in sorted(st['person_counts'].items())})
             for p in state.load_persons():
                 if p and p not in _opts:
                     _opts[p] = p
@@ -1476,29 +1575,11 @@ def main_page():
             if vp is not None:
                 ui.label(f'当前查看: {os.path.basename(vp)}').classes(
                     'text-xs font-bold w-full pb-1').style('color: var(--accent)')
-            with ui.row().classes('w-full items-center gap-2 px-1 pb-2 flex-wrap'):
-                ui.label(f'√ {n_keep}' + (f'（AI {n_auto_keep}）' if n_auto_keep else '')
-                         ).classes('text-xs font-bold').style('color: #22c55e')
-                ui.label(f'× {n_reject}' + (f'（AI {n_auto_rej}）' if n_auto_rej else '')
-                         ).classes('text-xs font-bold').style('color: var(--err)')
-                ui.label(f'待确认 {n_pending}' if n_pending else '全部已判定').classes(
-                    'text-xs font-bold' if n_pending else 'text-xs').style(
-                    'color: #f59e0b' if n_pending else 'color: var(--text-secondary)')
-                _ponly = _cards_video["pending_only"]
-                ui.button('显示全部' if _ponly else '只看待确认',
-                          on_click=_toggle_pending_only).props(
-                    'ripple flat dense no-caps').classes(
-                    'text-[10px] rounded-full px-2 py-0').style(
-                    f'color: {"#f59e0b" if _ponly else "var(--text-secondary)"}; '
-                    f'border: 1px solid {"rgba(245, 158, 11, 0.6)" if _ponly else "var(--border-subtle)"}; '
-                    f'background: {"rgba(245, 158, 11, 0.12)" if _ponly else "transparent"}')
-                if person_counts:
-                    for p, n in sorted(person_counts.items()):
-                        _c = person_colors.get(p, _PERSON_PALETTE[0])
-                        ui.label(f'👤 {p}×{n}').classes(
-                            'text-xs font-bold rounded-full px-2 py-0.5').style(
-                            f'color: {_c[0]}; background: {_c[1]}; border: 1px solid {_c[0]}')
-                ui.label(export_hint).classes('text-xs ml-auto').style('color: var(--text-secondary)')
+            # 统计行由固定槽位承载：标记后只 clear + 重填这一行（约 6 个元素），
+            # 不重建下面的卡片列表 —— 见 _fill_stat_row / _apply_mark_local
+            _stats_row_holder['row'] = ui.row().classes(
+                'w-full items-center gap-2 px-1 pb-2 flex-wrap')
+        _fill_stat_row(st)
         n_hidden = 0
         for i, clip in enumerate(clips):
             # 三段分诊：只看待确认时隐藏已判定（人工或模型）的片段
@@ -1515,15 +1596,11 @@ def main_page():
             end_min, end_sec = int(end_ts // 60), end_ts % 60
             mark = _eff_mark(clip)
             # 卡片视觉状态：√ 绿框 / × 红框半透明
-            card_style = 'margin: 0; background: var(--bg-surface); border: 1px solid var(--border-subtle)'
-            if mark == 'keep':
-                card_style = ('margin: 0; background: var(--bg-surface); '
-                              'border: 1px solid rgba(34, 197, 94, 0.6)')
-            elif mark == 'reject':
-                card_style = ('margin: 0; background: var(--bg-surface); opacity: 0.55; '
-                              'border: 1px solid rgba(239, 68, 68, 0.5)')
+            # 与 _apply_mark_local 共用同一个 _card_style，避免两处样式漂移
             with result_container:
-                with ui.card().props('flat').classes('result-card w-full rounded-lg px-3 py-2').style(card_style):
+                _card = ui.card().props('flat').classes(
+                    'result-card w-full rounded-lg px-3 py-2').style(_card_style(mark))
+                with _card:
                     # 第一行：序号 + 时间戳 + AI 徽章 + 右侧人物分类，全部同一行
                     # 序号用列表位置 i+1（不是"第几个可见卡片"）：与 √/×/预览/导出 传入的
                     # idx 同源，且「只看待确认」过滤时序号保持稳定，便于对照"我点的是第几个"
@@ -1578,7 +1655,7 @@ def main_page():
                                 'text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0'
                             ).style(_bstyle).tooltip(_btip)
                         person = clip.get("person")
-                        _pc = person_colors.get(person) if person else None
+                        _pc = st['person_colors'].get(person) if person else None
                         ui.button((f'👤 {person}' if _pc else '👤 分类'),
                                   on_click=lambda e, idx=i: _on_person_clip(idx)).classes(
                             'ml-auto text-xs rounded-full px-3 py-0.5 min-w-0').props('ripple flat dense no-caps').style(
@@ -1590,20 +1667,16 @@ def main_page():
                     with ui.row().classes('w-full gap-1'):
                         ui.button('预览', on_click=lambda e, idx=i: _on_preview_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
-                        _keep_on = mark == 'keep'
-                        ui.button('√ 确认', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')).classes(
+                        _keep_btn = ui.button('√ 确认', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')).classes(
                             'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
-                            f'color: {"#22c55e" if _keep_on else "var(--text-secondary)"}; '
-                            f'border: 1px solid {"rgba(34, 197, 94, 0.7)" if _keep_on else "var(--border-subtle)"}; '
-                            f'background: {"rgba(34, 197, 94, 0.12)" if _keep_on else "transparent"}')
-                        _rej_on = mark == 'reject'
-                        ui.button('× 误报', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')).classes(
+                            _mark_btn_style(mark == 'keep', 'keep'))
+                        _rej_btn = ui.button('× 误报', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')).classes(
                             'flex-1 text-xs rounded-lg py-1 font-bold').props('ripple flat').style(
-                            f'color: {"var(--err)" if _rej_on else "var(--text-secondary)"}; '
-                            f'border: 1px solid {"rgba(239, 68, 68, 0.7)" if _rej_on else "var(--border-subtle)"}; '
-                            f'background: {"rgba(239, 68, 68, 0.12)" if _rej_on else "transparent"}')
+                            _mark_btn_style(mark == 'reject', 'reject'))
                         ui.button('导出', on_click=lambda e, idx=i: _on_export_clip(idx)).classes(
                             'flex-1 text-xs rounded-lg py-1').props('ripple flat').style('color: var(--text-secondary); border: 1px solid var(--border-subtle)')
+                # 方案A：登记本卡片可被局部更新的 3 个元素（未登记则退回整列表重建）
+                _card_widgets[i] = {'card': _card, 'keep': _keep_btn, 'rej': _rej_btn}
 
     async def _on_preview_clip(idx):
         # 全局模式下有任务运行时拒绝：检测线程可能正在 clear/extend clips，
@@ -1673,11 +1746,32 @@ def main_page():
         if _cards_video["path"] is None and _refuse_if_busy():
             return
         vp = _cards_video["path"]  # 取值在 await 之前：本次操作对象不该被后续状态变化改掉
+        _clips = _cards_clips()
+        if not (0 <= idx < len(_clips)):
+            return
+        _target = 'keep' if action == 'mark_keep' else 'reject'
+        # 方案B：乐观更新 —— 点击瞬间先本地切样式，不等落盘（落盘要重写整份历史，数百 ms）。
+        # toggle 语义与 detection.clip_action 对齐：基准是**屏幕上显示的**标记（_eff_mark），
+        # 而不是 clip["mark"] 原值 —— 否则 AI 关闭时第一次点击只会把那个看不见的 auto
+        # 标记取消掉，屏幕上毫无变化，用户以为没点上（实测：某场 88 个片段里 49 个
+        # 带 auto 的 ×，即 56% 的卡片要连点两下才有反应）。
+        _apply_mark_local(idx, None if _eff_mark(_clips[idx]) == _target else _target)
         from nicegui import run
         # M12：√/× 除了改标记，还要把整份历史标签写回磁盘（全量读改写；
         # 多标签间还被 _history_io_lock 串行化）——留在事件循环里会让所有页面卡顿
         _, status = await run.io_bound(detection.clip_action, action, idx, video_path=vp)
-        _refresh_result_cards_soon()  # 整列表重建推到下一帧，先让状态栏反馈上屏
+        # 落盘返回后按真实值对齐（越界/异常/被拒时把乐观样式改回来）
+        _mark_now = _eff_mark(_clips[idx])
+        _apply_mark_local(idx, _mark_now)
+        # 方案A：正常路径不再整列表重建。只有「只看待确认」下这张卡片必须消失时，
+        # 才单独删掉它（不重建 → 其它卡片的元素不被销毁 → 后续点击不会丢）
+        if _cards_video["pending_only"] and _mark_now:
+            _w = _card_widgets.pop(idx, None)
+            if _w is not None:
+                try:
+                    _w['card'].delete()
+                except Exception:
+                    _refresh_result_cards_soon()
         _set_status(status, 'info')
 
     async def _on_highlights():

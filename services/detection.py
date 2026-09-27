@@ -1637,8 +1637,15 @@ def clip_action(action, idx, video_path=None, person=None):
         # √/× 仅做标记，不删除片段（列表保持完整，导出集锦只取 √）
         target = "keep" if action == "mark_keep" else "reject"
         clip = clips[idx]
-        # toggle：再次点击同标记 = 取消
-        clip["mark"] = None if clip.get("mark") == target else target
+        # toggle：再次点击同标记 = 取消。基准必须是**用户屏幕上看到的**标记，不能直接用
+        # clip["mark"] 原值：AI 识别关闭时 auto 标记不参与呈现（按钮是灰的 = 看起来没标），
+        # 照原值 toggle 会把那个看不见的 auto 标记取消掉 → 屏幕毫无变化，用户以为没点上，
+        # 要连点两下才有反应（实测某场 88 个片段里 49 个带 auto 的 ×，即 56% 的卡片中招）。
+        # 口径与 demo_nicegui._eff_mark 一致：AI 关闭时 auto 标记视为"未判定"。
+        _cur = clip.get("mark")
+        if not goal_verifier.is_enabled() and clip.get("mark_source") == "auto":
+            _cur = None
+        clip["mark"] = None if _cur == target else target
         clip["mark_source"] = "manual" if clip["mark"] else None
         ts = clip["ts"]
         # kept 集合 = √ 标记的索引（导出集锦/历史标签都以 mark 为准）

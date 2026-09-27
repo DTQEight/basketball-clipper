@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""真实录像体检：当前生产模型 vs 旧模型（缓存分） vs 人工标签。
+"""真实录像体检：当前生产模型 vs 旧分 vs 人工标签。
 
 用法：
     env\\python.exe training\\spot_check.py                  # 随机 3 场
@@ -9,17 +9,23 @@
     env\\python.exe training\\spot_check.py 悍高 07.29       # 只测文件名含关键词的场次
     env\\python.exe training\\spot_check.py --list           # 只列可选场次
     env\\python.exe training\\spot_check.py --n 10 --out r.json
+    env\\python.exe training\\spot_check.py --old cache      # 旧分改从 clip_cache 取
 
-做什么：把 cache/clip_cache.json 里缓存的旧分数留一份，**清掉各臂分**后用当前生产模型
+做什么：把该场的**旧分**留一份，**清掉各臂分**后用当前生产模型
 （services.goal_verifier.score_clips）重新打分，再与人工标签三方对比：
-自动 √ 的精确率/召回、中间带大小、翻带明细、各臂 AUC（旧 vs 新）。
+集成 AUC 旧→新、自动 √ 的精确率/召回、中间带大小、高带变动明细、各臂 AUC。
+
+旧分来源（--old，默认 history）：
+- `history`：历史记录的 `verify_snapshot.scores`（**持久化**，覆盖所有做过 AI 复核的场次；
+  受"复核时用的口径"限制，只有集成分、没有逐臂分）
+- `cache`：`cache/clip_cache.json` 里缓存的旧分（有逐臂分，但 clip_cache 是小容量 LRU，
+  加载新场次会逐出旧场次 → 通常只剩最近 1~2 场可用）
 
 口径与副作用：
 - **只改内存，不写 cache/clip_cache.json**；界面上仍显示旧分，重开记录时才重算
 - ⚠ 必须清掉各臂分再打分：`_score_lgbm`/`_score_visual` 对已有分数的片段会直接跳过
   （`todo = [c for c in clips if "score_lgbm" not in c]`），不清就变成「旧分批 + 新口径融合」
 - 人工标签取 cache/history，严格口径（只用 kept/deleted；未标注的候选不进精确率/召回）
-- 旧分取缓存里的 score / score_lgbm / score_b / score_flow / score_vm（当时的生产口径）
 """
 from __future__ import annotations
 
@@ -72,6 +78,64 @@ def tally(rows, keep, rej):
             "rec": rec, "n_pos": real_kept, "n_scored": len(scored)}
 
 
+def _round3(t) -> float:
+    return round(float(t), 3)
+
+
+def build_pool(source: str, keywords):
+    """返回 [{'name','video','hoop','clips','old_scores','old_arms','kept','deleted'}]。"""
+    hist = state.load_history()
+    pool = []
+    if source == "history":
+        for r in hist:
+            vp = r.get("video") or ""
+            b = os.path.basename(vp)
+            snap = ((r.get("verify_snapshot") or {}).get("scores")) or {}
+            labels = r.get("labels") or {}
+            kept = {_round3(t) for t in (labels.get("kept") or [])}
+            deleted = {_round3(t) for t in (labels.get("deleted") or [])}
+            goals = [float(t) for t in (r.get("goals") or [])]
+            if not b or not r.get("hoop") or not snap or not goals:
+                continue
+            if not (kept or deleted):
+                continue                       # 没人标签，无法对照
+            if not os.path.exists(vp):
+                continue                       # 视频不在（换盘/改名/已删）
+            if keywords and not any(k in b for k in keywords):
+                continue
+            pool.append({
+                "name": b, "video": vp, "hoop": [int(x) for x in r["hoop"]],
+                "clips": [{"ts": t} for t in goals],
+                "old_scores": {_round3(k): float(v) for k, v in snap.items()},
+                "old_arms": None, "kept": kept, "deleted": deleted,
+            })
+    else:
+        cache = json.loads(CLIP_CACHE.read_text(encoding="utf-8"))
+        recs = {os.path.basename(r["video"]): r for r in hist}
+        for e in cache:
+            b = os.path.basename(e["video"])
+            r = recs.get(b)
+            if not r or not r.get("hoop") or not (e.get("clips") or []):
+                continue
+            if not any(c.get("score") is not None for c in e["clips"]):
+                continue                       # 没有旧分可对比
+            if keywords and not any(k in b for k in keywords):
+                continue
+            labels = r.get("labels") or {}
+            clips = copy.deepcopy(e["clips"])
+            pool.append({
+                "name": b, "video": r["video"], "hoop": [int(x) for x in r["hoop"]],
+                "clips": clips,
+                "old_scores": {_round3(c["ts"]): c.get("score") for c in clips},
+                "old_arms": {_round3(c["ts"]): {k: c.get(k) for k in ARM_KEYS.values()}
+                             for c in clips},
+                "kept": {_round3(t) for t in (labels.get("kept") or [])},
+                "deleted": {_round3(t) for t in (labels.get("deleted") or [])},
+            })
+    pool.sort(key=lambda x: x["name"])
+    return pool
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -83,29 +147,19 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--list", action="store_true", help="只列出可选场次")
     ap.add_argument("--out", type=str, default=None, help="另存 JSON 报告")
+    ap.add_argument("--old", choices=("history", "cache"), default="history",
+                    help="旧分来源：history=历史记录 verify_snapshot（默认，持久化）；"
+                         "cache=clip_cache（有逐臂旧分，但 LRU 通常只剩 1~2 场）")
     args = ap.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
 
-    cache = json.loads(CLIP_CACHE.read_text(encoding="utf-8"))
-    recs = {os.path.basename(r["video"]): r for r in state.load_history()}
-    pool = []
-    for e in cache:
-        b = os.path.basename(e["video"])
-        r = recs.get(b)
-        if not r or not r.get("hoop") or not (e.get("clips") or []):
-            continue
-        if not any(c.get("score") is not None for c in e["clips"]):
-            continue                       # 没有旧分可对比
-        if args.keywords and not any(k in b for k in args.keywords):
-            continue
-        pool.append((b, e, r))
-    pool.sort(key=lambda x: x[0])
-    print(f"可选场次 {len(pool)}（有旧分数缓存 + 有人工标签）")
+    pool = build_pool(args.old, args.keywords)
+    print(f"可选场次 {len(pool)}（旧分来源={args.old} + 有人工标签）")
     if args.list:
-        for b, e, r in pool:
-            print(f"  {b:<32} 候选 {len(e['clips']):>3}")
+        for it in pool:
+            print(f"  {it['name']:<32} 候选 {len(it['clips']):>3}")
         return
 
     picks = pool if args.n == 0 else random.sample(pool, min(args.n, len(pool)))
@@ -114,14 +168,12 @@ def main():
           f"| 权重={gv.ENS_WEIGHTS}\n")
 
     report, summary = [], []
-    for name, entry, rec in picks:
-        video = rec["video"]
-        hoop = [int(x) for x in rec["hoop"]]
-        labels = state.get_labels(video)
-        kept = {round(float(t), 3) for t in (labels.get("kept") or [])}
-        deleted = {round(float(t), 3) for t in (labels.get("deleted") or [])}
-        old_clips = copy.deepcopy(entry["clips"])
-        new_clips = copy.deepcopy(entry["clips"])
+    ens_old_all, ens_new_all = [], []          # 汇总用的池化样本（跨场不能加总 AUC）
+    for it in picks:
+        name, video, hoop = it["name"], it["video"], it["hoop"]
+        kept, deleted = it["kept"], it["deleted"]
+        old_clips = it["clips"]
+        new_clips = copy.deepcopy(old_clips)
         for c in new_clips:
             for k in STRIP:                # 关键：清掉各臂分，否则会被 todo 跳过
                 c.pop(k, None)
@@ -133,9 +185,9 @@ def main():
 
         rows_old, rows_new = [], []
         for c_o, c_n in zip(old_clips, new_clips):
-            ts = round(float(c_o["ts"]), 3)
+            ts = _round3(c_o["ts"])
             truth = "√" if ts in kept else ("×" if ts in deleted else "?")
-            rows_old.append((ts, c_o.get("score"), truth))
+            rows_old.append((ts, it["old_scores"].get(ts), truth))
             rows_new.append((ts, c_n.get("score"), truth))
         o = tally(rows_old, keep_thr, rej_thr)
         n = tally(rows_new, keep_thr, rej_thr)
@@ -143,6 +195,19 @@ def main():
         for tag, r in (("旧模型", o), ("新模型", n)):
             print(f"  {tag:<8}{r['auto_k']:>7}{r['fp']:>6}{r['prec']:>8.3f}{r['rec']:>8.3f}"
                   f"{r['mid']:>8}{r['auto_r']:>7}")
+
+        # 集成 AUC 旧→新（严格人工口径：只用 kept/deleted 的候选）
+        eo = [(s, 1 if tr == "√" else 0) for _, s, tr in rows_old
+              if s is not None and tr in ("√", "×")]
+        en = [(s, 1 if tr == "√" else 0) for _, s, tr in rows_new
+              if s is not None and tr in ("√", "×")]
+        ens_old_all += eo
+        ens_new_all += en
+        auc_o = auc(eo) if eo else float("nan")
+        auc_n = auc(en) if en else float("nan")
+        delta = f"{auc_n - auc_o:+.4f}" if eo and en else "n/a"
+        print(f"  集成 AUC（严格人工口径，{len(eo)} 个）: "
+              f"{auc_o:.4f} → {auc_n:.4f}  ({delta})")
 
         flips = [(t1, s1, s2, tr, "新进高带" if a2 else "退出高带")
                  for (t1, s1, tr), (t2, s2, tr2) in zip(rows_old, rows_new)
@@ -155,18 +220,27 @@ def main():
 
         arms = {}
         for arm, key in ARM_KEYS.items():
-            a_old = [(float(c[key]), 1 if round(float(c["ts"]), 3) in kept else 0)
-                     for c in old_clips if c.get(key) is not None
-                     and round(float(c["ts"]), 3) in (kept | deleted)]
-            a_new = [(float(c[key]), 1 if round(float(c["ts"]), 3) in kept else 0)
+            if it["old_arms"] is not None:
+                a_old = [(float(it["old_arms"][_round3(c["ts"])][key]),
+                          1 if _round3(c["ts"]) in kept else 0)
+                         for c in old_clips
+                         if _round3(c["ts"]) in (kept | deleted)
+                         and it["old_arms"].get(_round3(c["ts"]), {}).get(key) is not None]
+            else:
+                a_old = []
+            a_new = [(float(c[key]), 1 if _round3(c["ts"]) in kept else 0)
                      for c in new_clips if c.get(key) is not None
-                     and round(float(c["ts"]), 3) in (kept | deleted)]
-            arms[arm] = [round(auc(a_old), 4), round(auc(a_new), 4)]
+                     and _round3(c["ts"]) in (kept | deleted)]
+            arms[arm] = [round(auc(a_old), 4) if a_old else None,
+                         round(auc(a_new), 4) if a_new else None]
         print(f"  各臂 AUC（严格人工口径，{len(kept) + len(deleted)} 个已标注候选）: "
-              + "  ".join(f"{k} {v[0]}→{v[1]}" for k, v in arms.items()))
+              + "  ".join(f"{k} {v[0]}→{v[1]}" for k, v in arms.items())
+              + ("　（旧分来源无逐臂分，仅新值）" if it["old_arms"] is None else ""))
         summary.append((name, o, n))
         report.append({"video": name, "candidates": len(old_clips),
                        "kept": len(kept), "deleted": len(deleted),
+                       "ens_auc_old": None if auc_o != auc_o else round(auc_o, 4),
+                       "ens_auc_new": None if auc_n != auc_n else round(auc_n, 4),
                        "old": o, "new": n, "arms_auc": arms})
 
     print(f"\n{'=' * 76}\n汇总（{len(summary)} 场）")
@@ -183,6 +257,10 @@ def main():
     print(f"        新 自动√{sn['auto_k']}（对 {sn['tp']} / 误报 {sn['fp']}），"
           f"精确 {sn['tp'] / max(sn['auto_k'], 1):.3f}  召回 {sn['tp'] / max(sn['n_pos'], 1):.3f}"
           f"  中间带 {sn['mid']}")
+    if ens_old_all and ens_new_all:
+        pa, pn = auc(ens_old_all), auc(ens_new_all)
+        print(f"  池化集成 AUC（{len(ens_old_all)} 个已标注候选）: "
+              f"{pa:.4f} → {pn:.4f}  ({pn - pa:+.4f})")
     print(f"  人工复核量（中间带）: {so['mid']} → {sn['mid']} "
           f"({(sn['mid'] - so['mid']) / max(so['mid'], 1) * 100:+.1f}%)")
 

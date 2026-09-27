@@ -641,6 +641,42 @@ class TestHistory:
         assert labels["auto_rejected"] == [2.0]
         assert "√ 2 · × 1" in msg                # 提示里的计数仍含模型判定
 
+    def test_mark_toggle_baseline_is_displayed_mark(self, state_mod, monkeypatch, tmp_path):
+        """回归：toggle 的基准必须是**屏幕上显示的**标记，不是 clip["mark"] 原值。
+
+        AI 识别关闭时 auto 标记不参与呈现（卡片上按钮是灰的 = 看起来没标）。旧实现照
+        原值 toggle：第一次点 × 只会把那个看不见的 auto 标记取消掉，屏幕毫无变化 ——
+        用户以为没点上、要连点两下（实测某场 88 个片段里 49 个带 auto 的 ×，56% 中招）。
+        """
+        from services import detection, goal_verifier
+        monkeypatch.setattr(detection, "state", state_mod)
+        vp = str(tmp_path / "1st.mp4")
+        state_mod.add_history(vp, (1, 2, 3, 4), [1.0])
+        state_mod.update_history_labels(vp, kept_ts_list=None, deleted_ts_list=None,
+                                        auto_rejected_ts_list=[1.0])
+        state_mod.video_state["path"] = vp
+        state_mod.kept_goal_indices = set()
+        clip = {"ts": 1.0, "path": "p", "idx": 0, "mark": "reject",
+                "mark_source": "auto", "auto_reject": True}
+        state_mod.last_goal_clips = [clip]
+        prev = goal_verifier.is_enabled()
+        try:
+            # AI 关闭 → 那个 auto × 在屏幕上不存在：第一次点击就要真的标上
+            goal_verifier.set_enabled(False)
+            detection.clip_action("mark_reject", 0)
+            assert clip["mark"] == "reject"
+            assert clip["mark_source"] == "manual"
+            # 此时屏幕上确实显示着 × → 再点一次才是取消
+            detection.clip_action("mark_reject", 0)
+            assert clip["mark"] is None
+            # AI 开启 → auto 标记可见：首次点击仍按旧语义取消它
+            clip["mark"], clip["mark_source"] = "reject", "auto"
+            goal_verifier.set_enabled(True)
+            detection.clip_action("mark_reject", 0)
+            assert clip["mark"] is None
+        finally:
+            goal_verifier.set_enabled(prev)
+
     def test_preview_marks_auto_marks_as_reviewed(self, state_mod, monkeypatch,
                                                   tmp_path):
         """用户口径：点「预览」就是人工复核。看过后没改 → 记为人工来源；
