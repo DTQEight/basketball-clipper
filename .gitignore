@@ -35,6 +35,11 @@ training/feat_c_glob/
 training/feat_flow/
 training/feat_traj/
 training/features.jsonl
+# 特征文件的重提副本 / 留底（2026.09.28 加 ③④ 时的产物；库里有 features.jsonl 即可）
+training/features_v2.jsonl
+training/features_v1_35dim.jsonl.keep
+# Flow SimCLR 预训练的 crops mmap（11.2 GB，可由 simclr_pretrain 重建）
+training/flow_crops_all.npy
 
 # 视频文件（太大）
 *.mp4

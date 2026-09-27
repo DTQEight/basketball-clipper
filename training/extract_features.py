@@ -2,11 +2,19 @@
 """L4 阶段 A 特征提取：对 dataset_v1.json 每个事件做 ±1.5s 密集 YOLO 复检，
 计算轨迹/几何/网区能量特征，输出 training/features.jsonl（每行一个事件）。
 
+特征 = **35 维原有特征**（_compute_features，几何/网区能量）
+     + **21 维 ③④ 特征**（training/feat_traj_net.py，轨迹外推 + 网区/筐框光流）= 56 维。
+③④ 只用事件窗口内已有的逐帧数据（detections / 缩小灰度），不额外解码；
+实测被逐帧 YOLO 掩盖，几乎零额外耗时。落地依据见 feat_traj_net.py 的 docstring。
+
 用法（项目根执行）：
   env\\python.exe training\\extract_features.py --limit 5     # 小样测试
   env\\python.exe training\\extract_features.py               # 全量（支持断点续跑）
 
-特征明细见 _compute_features() docstring。GPU 必须（项目硬性要求），CPU 直接拒绝。
+GPU 必须（项目硬性要求），CPU 直接拒绝。
+
+⚠ 断点续跑按 event_id 跳过已提事件：新增特征列后必须**换新 --out 文件重提**，
+   否则旧行缺列（LightGBM 会按 meta.features 取 0，静默劣化）。
 """
 from __future__ import annotations
 
@@ -16,13 +24,17 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # 同目录的 feat_traj_net
 
 from app import get_ball_model, get_ball_class_ids, get_device  # noqa: E402
 from video_io import VideoReader  # noqa: E402
+from feat_traj_net import (farneback_mag, net_feats,  # noqa: E402
+                           roi_diff, roi_rects, traj_feats)
 
 TRAINING_DIR = PROJECT_ROOT / "training"
 DATASET_FILE = TRAINING_DIR / "dataset_v1.json"
@@ -33,6 +45,11 @@ BALL_CONF = 0.3
 IMGSZ = 960
 WIN_PRE = 1.5   # 事件前窗口（秒）
 WIN_POST = 1.5  # 事件后窗口（秒）
+
+# ③④ 用的缩小倍数。注意与 A 臂网区能量的 scale=4 **不同**：
+# 那是 frame[::4].mean(axis=2)，这是 cv2 灰度 scale=2，两者各自独立、都不要改，
+# 改了会让已有特征的数值漂移（③④ 的口径在 cache/ 的实验里验证过）。
+SCALE_TN = 2
 
 
 def _resolve_video(path_str: str) -> str | None:
@@ -221,8 +238,13 @@ def _compute_features(detections, net_pre, net_post, hoop, video_w, video_h, fps
     return f
 
 
-def extract(model, ball_classes, device, events, log_every=20):
-    """events: dataset 记录列表。返回 (features_list, errors)。"""
+def extract(model, ball_classes, device, events, log_every=20, on_row=None):
+    """events: dataset 记录列表。返回 (features_list, errors)。
+
+    on_row(feats): 可选回调，每个事件产出后**立即**调用一次。全量跑要 5~6 小时，
+      没有它就只能等整个列表跑完才落盘（main 末尾统一写），中途中断全丢。
+      main 传它来做增量落盘 + 断点续跑。
+    """
     # 按视频分组 + 时间戳排序（减少 seek）
     by_video = {}
     for ev in events:
@@ -262,6 +284,8 @@ def extract(model, ball_classes, device, events, log_every=20):
                     continue
                 detections = []
                 grays = []  # 缩小灰度帧（网区能量用）
+                net_s, rim_s = [], []   # ③④：逐帧 网区/筐框 的帧差 + Farneback 光流
+                prev_g2, rects = None, None
                 scale = 4
                 for fidx, frame in reader.iter_frames(start=f0, end=f1):
                     # YOLO 逐帧（特征提取不复用/不跳帧，要最准序列）
@@ -284,6 +308,26 @@ def extract(model, ball_classes, device, events, log_every=20):
                     small = frame[::scale, ::scale]
                     g = small.mean(axis=2)
                     grays.append(g)
+
+                    # ③④：scale-2 灰度上取 网区/筐框 两个 ROI 的逐帧信号。
+                    # 与 A 臂网区能量（scale-4 mean(axis=2)）是两套独立口径，别合并。
+                    g2 = cv2.cvtColor(frame[::SCALE_TN, ::SCALE_TN], cv2.COLOR_BGR2GRAY)
+                    if rects is None:      # 帧尺寸固定，首帧算一次
+                        rects = roi_rects(hoop, g2.shape[1] * SCALE_TN,
+                                          g2.shape[0] * SCALE_TN, SCALE_TN)
+                    (nx1, ny1, nx2, ny2), (rx1, ry1, rx2, ry2) = rects
+                    if prev_g2 is None or nx2 <= nx1 or ny2 <= ny1:
+                        net_s.append([0.0, 0.0])
+                        rim_s.append([0.0, 0.0])
+                    else:
+                        cn, pn = g2[ny1:ny2, nx1:nx2], prev_g2[ny1:ny2, nx1:nx2]
+                        net_s.append([roi_diff(pn, cn), farneback_mag(pn, cn)])
+                        if rx2 > rx1 and ry2 > ry1:
+                            cr, pr = g2[ry1:ry2, rx1:rx2], prev_g2[ry1:ry2, rx1:rx2]
+                            rim_s.append([roi_diff(pr, cr), farneback_mag(pr, cr)])
+                        else:
+                            rim_s.append([0.0, 0.0])
+                    prev_g2 = g2
                 # 解码产出 0 帧的守卫（N14）：video_io.iter_frames 遇到容器层
                 # demux 失败是**静默 return**，此时 grays 为空，下面的 grays[0]
                 # 会 IndexError 打崩整个特征提取主流程（其余事件一起丢）
@@ -311,12 +355,17 @@ def extract(model, ball_classes, device, events, log_every=20):
                 feats = _compute_features(detections, net_pre, net_post, hoop,
                                           ev.get("video_width") or 0,
                                           ev.get("video_height") or 0, fps)
+                # ③④：轨迹外推 + 网区/筐框光流（键与上面 35 维不冲突）
+                feats.update(traj_feats(detections, hoop, n))
+                feats.update(net_feats(net_s, rim_s, fps, pre_end, post_start))
                 feats["event_id"] = ev["event_id"]
                 feats["label"] = ev["label"]
                 feats["video"] = ev["video"]
                 feats["ts"] = ev["ts"]
                 out.append(feats)
                 done += 1
+                if on_row is not None:
+                    on_row(feats)
                 if done % log_every == 0:
                     dt = time.time() - t0
                     print(f"  [{done}/{len(events)}] {dt:.0f}s "
@@ -384,6 +433,13 @@ def main():
     out_path = Path(args.out)
     done_map = {}                       # event_id -> features.jsonl 里已写的 label
     if out_path.exists():
+        # 增量落盘下被强杀可能留下半行 JSON：先按最后一个换行截断，否则它会永久
+        # 卡在文件中间（下面的 json.loads 静默跳过它，但后续行会接在残行后面）
+        _raw = out_path.read_bytes()
+        if _raw and not _raw.endswith(b"\n"):
+            _cut = _raw.rfind(b"\n")
+            out_path.write_bytes(_raw[:_cut + 1] if _cut >= 0 else b"")
+            print("断点续跑：截断末尾未写完的半行")
         for line in out_path.read_text(encoding="utf-8").splitlines():
             try:
                 rec = json.loads(line)
@@ -406,12 +462,18 @@ def main():
     ball_classes = get_ball_class_ids(model, weights)
     print(f"weights: {weights}, ball classes: {ball_classes}, events: {len(events)}")
 
-    feats, errors = extract(model, ball_classes, device, events)
-    # 追加写
+    # 增量落盘：每个事件产出即写盘并 flush。旧实现是 extract() 返回整个列表后
+    # 才统一追加——5~6 小时的全量跑中途任何中断（强杀/断电/用户停）全部白跑。
+    written = 0
     with open(args.out, "a", encoding="utf-8") as fo:
-        for r in feats:
-            fo.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"完成：新提取 {len(feats)}，累计 {len(done_map) + len(feats)}")
+        def _on_row(row):
+            nonlocal written
+            fo.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fo.flush()
+            written += 1
+
+        feats, errors = extract(model, ball_classes, device, events, on_row=_on_row)
+    print(f"完成：新提取 {written}，累计 {len(done_map) + written}")
     if errors:
         print(f"错误 {len(errors)} 个（前 10）：")
         for eid, msg in errors[:10]:
