@@ -1,38 +1,38 @@
 {
-  "trained_at": "2026-09-25 18:30:53",
-  "backbone": "光流域 SimCLR 自监督 resnet18（831 events x 15 crops (unlabeled)，无标签）",
-  "n_events": 2247,
-  "n_pos": 811,
+  "trained_at": "2026-09-27 12:21:59",
+  "backbone": "光流域 SimCLR 自监督 resnet18（5336 events x 15 crops (unlabeled)，无标签）",
+  "n_events": 4131,
+  "n_pos": 1409,
   "arch": "bigru",
   "fold_aucs": [
-    0.9465,
-    0.9596,
-    0.9773,
-    0.9189,
-    0.955
+    0.9473,
+    0.9523,
+    0.9543,
+    0.9526,
+    0.956
   ],
-  "final_epochs": 6,
+  "final_epochs": 5,
   "baseline_flow_imagenet_oof": 0.8593,
-  "oof_auc": 0.9413,
+  "oof_auc": 0.9331,
   "working_points": {
     "0.9": {
-      "threshold": 0.9477,
-      "precision": 0.9004,
-      "recall": 0.6128
+      "threshold": 0.9869,
+      "precision": 0.9003,
+      "recall": 0.4358
     },
     "0.95": {
       "threshold": 1.0,
-      "precision": 0.9522,
-      "recall": 0.27
+      "precision": 0.9519,
+      "recall": 0.1405
     },
     "0.98": {
       "threshold": 1.0,
-      "precision": 0.9821,
-      "recall": 0.1356
+      "precision": 0.9818,
+      "recall": 0.0383
     }
   },
   "fixed_050": {
-    "precision": 0.8459,
-    "recall": 0.8459
+    "precision": 0.8334,
+    "recall": 0.8595
   }
 }

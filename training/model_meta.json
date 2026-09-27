@@ -1,9 +1,9 @@
 {
-  "trained_at": "2026-09-25 18:25:46",
-  "n_events": 2247,
-  "n_pos": 811,
-  "n_neg": 1436,
-  "n_videos": 50,
+  "trained_at": "2026-09-27 02:43:01",
+  "n_events": 4131,
+  "n_pos": 1409,
+  "n_neg": 2722,
+  "n_videos": 83,
   "features": [
     "above_then_below",
     "ball_h_cv",
@@ -41,14 +41,14 @@
     "x_final_in",
     "x_off_final"
   ],
-  "oof_auc": 0.8546,
+  "oof_auc": 0.8696,
   "fold_aucs": [
-    0.8441,
-    0.8795,
-    0.8533,
-    0.87,
-    0.8286
+    0.874,
+    0.8848,
+    0.8415,
+    0.835,
+    0.9083
   ],
-  "recommended_threshold": 0.985,
+  "recommended_threshold": 0.966,
   "model_file": "model_lgbm.txt"
 }
