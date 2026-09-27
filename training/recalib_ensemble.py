@@ -42,7 +42,9 @@ A_W = (0.0, 0.25, 0.5, 1.0)
 B_W = (0.5, 1.0, 1.5, 2.0)
 F_W = (0.5, 1.0, 1.5, 2.0)
 V_W = (0.5, 1.0, 1.5, 2.0)
-INCUMBENT = {"a": 0.5, "b": 2.0, "flow": 1.0, "vm": 1.0}
+# 「现役」基准配比：必须与 model_temporal_meta.json 的 ensemble.weights 一致，
+# 否则网格的 Top-1 是相对一个并未部署的基准比出来的，结论会误读。
+INCUMBENT = {"a": 1.0, "b": 2.0, "flow": 1.5, "vm": 0.5}
 
 
 def read_jsonl(p):

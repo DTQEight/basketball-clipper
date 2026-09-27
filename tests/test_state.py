@@ -579,6 +579,86 @@ class TestHistory:
         assert snap["weights"] == {"lgbm": 0.5, "b": 1.0}
         assert snap["fingerprint"] == "fp1"
 
+    # ===== 逐场分数校准（2026.09.28）：单场保序平移 =====
+
+    @staticmethod
+    def _calib(monkeypatch, **kw):
+        """把阈值/校准口径固定成可断言的常量。"""
+        from services import goal_verifier
+        monkeypatch.setattr(goal_verifier, "auto_threshold", lambda: 0.68)
+        monkeypatch.setattr(goal_verifier, "reject_threshold", lambda: 0.20)
+        monkeypatch.setattr(goal_verifier, "CALIB_P", kw.get("p", 0.95))
+        monkeypatch.setattr(goal_verifier, "CALIB_REF_Q", kw.get("ref_q", 0.9087))
+        monkeypatch.setattr(goal_verifier, "CALIB_MIN_CLIPS", kw.get("min_clips", 20))
+        return goal_verifier
+
+    def test_quantile_is_linear_interpolation(self, monkeypatch):
+        gv = self._calib(monkeypatch)
+        # k = 3*0.95 = 2.85 → 0.2 + (0.3-0.2)*0.85
+        assert gv._quantile([0.0, 0.1, 0.2, 0.3], 0.95) == pytest.approx(0.285)
+
+    def test_no_shift_when_too_few_clips(self, monkeypatch):
+        """候选数不足时 Q0.95 不稳 → 回退为不平移，行为与改动前完全一致。"""
+        gv = self._calib(monkeypatch, min_clips=20)
+        clips = [{"ts": float(i), "score": 0.01 * i} for i in range(19)]
+        assert gv.calibration_shift(clips) == 0.0
+        gv.refresh_auto(clips)
+        assert all(c["calib_shift"] == 0.0 for c in clips)
+        assert all(c["verify_score"] == pytest.approx(c["score"], abs=1e-6)
+                   for c in clips)
+        assert not any(c.get("auto") for c in clips)
+
+    def test_shift_rescues_compressed_game(self, monkeypatch):
+        """刻度被压扁的场次：全场最高分都够不着 keep_thr，校准后能自动√。
+
+        这就是 2026.07.15 4th 的病理（集成分 AUC 1.0000、最高分 0.522、召回 0）。
+        """
+        gv = self._calib(monkeypatch, min_clips=4)
+        scores = [0.10, 0.20, 0.30, 0.40, 0.50]
+        clips = [{"ts": float(i), "score": s} for i, s in enumerate(scores)]
+        assert not any(s >= 0.68 for s in scores)      # 旧口径：一个都进不了高带
+        gv.refresh_auto(clips)
+        assert [c["score"] for c in clips] == pytest.approx(scores), "原始分被改写"
+        shift = clips[0]["calib_shift"]
+        assert shift > 0
+        assert all(abs(c["calib_shift"] - shift) < 5e-4 for c in clips)
+        assert all(c["verify_score"] == pytest.approx(c["score"] + shift, abs=5e-4)
+                   for c in clips)
+        assert sum(1 for c in clips if c["auto"]) > 0
+
+    def test_shift_is_order_preserving(self, monkeypatch):
+        """保序：平移只挪刻度，绝不能改变场内排序。"""
+        gv = self._calib(monkeypatch, min_clips=4)
+        scores = [0.02, 0.30, 0.11, 0.45, 0.08, 0.50]
+        clips = [{"ts": float(i), "score": s} for i, s in enumerate(scores)]
+        gv.refresh_auto(clips)
+        order_before = sorted(range(len(scores)), key=lambda i: scores[i])
+        order_after = sorted(range(len(clips)), key=lambda i: clips[i]["verify_score"])
+        assert order_before == order_after, "校准改变了场内排序"
+
+    def test_shift_never_overwrites_manual(self, monkeypatch):
+        """人工标记永远优先：校准让分数进高带也不能翻掉用户判的 ×。"""
+        gv = self._calib(monkeypatch, min_clips=4)
+        clips = [{"ts": float(i), "score": 0.1 * (i + 1)} for i in range(5)]
+        clips[4]["mark"], clips[4]["mark_source"] = "reject", "manual"
+        gv.refresh_auto(clips)
+        assert clips[4]["mark"] == "reject"
+        assert clips[4]["mark_source"] == "manual"
+
+    def test_snapshot_stores_raw_score_and_shift(self, monkeypatch):
+        """留档必须存**原始**分 + 平移量：存 verify_score 会在回读时二次平移。"""
+        from services import detection, goal_verifier
+        monkeypatch.setattr(goal_verifier, "auto_threshold", lambda: 0.68)
+        monkeypatch.setattr(goal_verifier, "reject_threshold", lambda: 0.20)
+        monkeypatch.setattr(goal_verifier, "ENS_WEIGHTS", {"lgbm": 1.0})
+        monkeypatch.setattr(goal_verifier, "model_fingerprint", lambda: "fp1")
+        clips = [{"ts": 1.0, "score": 0.40, "verify_score": 0.83,
+                  "calib_shift": 0.43, "mark": "keep", "mark_source": "auto"}]
+        snap = detection._build_verify_snapshot(clips)
+        assert snap["scores"] == {"1.0": 0.40}, "存了 verify_score 会二次平移"
+        assert snap["calib"]["shift"] == 0.43
+        assert "ref_q" in snap["calib"] and "p" in snap["calib"]
+
     def test_build_verify_snapshot_none_when_ai_off(self):
         """AI 复核没跑（没有 score）→ 返回 None，add_history 跳过该字段。"""
         from services import detection

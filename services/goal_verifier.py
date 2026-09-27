@@ -64,14 +64,35 @@ ENSEMBLE_META = TRAINING_DIR / "model_temporal_meta.json"
 # 换权重会改变 A 臂输入分布 → 必须计入口径指纹（见 model_fingerprint）
 BALL_WEIGHTS_DIR = _ROOT / "weights"
 
-# 兜底阈值/权重（仅在 ENSEMBLE_META 缺 ensemble 段时生效）
-AUTO_THR = 0.70
+# 兜底阈值/权重（仅在 ENSEMBLE_META 缺 ensemble 段或读取失败时生效）。
+# ⚠ 这三个值必须与 training/model_temporal_meta.json 的 ensemble 段保持一致：
+#   它们不一致时不会报错，服务会**静默**换用另一套配比继续跑，比直接失败更难发现。
+#   改动顺序：先改 model_temporal_meta.json 的 ensemble（线上真源），再同步这里。
+AUTO_THR = 0.68
 # 自动 ×（低带）阈值：低于它模型判为误报，人工可直接跳过。
 # 三带分诊：≥AUTO_THR 自动 √ / <REJECT_THR 自动 × / 中间带人工只看这一带。
-# 9 场 419 片段实测：0.15 时低带 160 个含 0 个真球（最低真球分 0.152），
-# 高带 131 个含 1 个误报，中间带 128 个（占 30%）。
-REJECT_THR = 0.15
-ENS_WEIGHTS = {"lgbm": 0.5, "b": 0.5, "flow": 1.0, "vm": 1.0}
+# 现役值 0.68 / 0.20 的标定依据见 model_temporal_meta.json 的
+# keep_thr_source / reject_thr_source；低带 0.20 的实测：低带到 0.25 均 0 真球，
+# 0.20 之上成对多漏真球（0.225→5 个、0.25→6 个），故宁可留在中间带人工看。
+REJECT_THR = 0.20
+ENS_WEIGHTS = {"lgbm": 1.0, "b": 2.0, "flow": 1.5, "vm": 0.5}
+
+# ===== 逐场分数校准（保序平移）=====
+# 问题：四臂合成分的**刻度**在不同场次之间会整体漂移（曝光/压缩/机位差异），而排序
+# 常常是完好的。典型例子 2026.07.15 4th：集成分 AUC 1.0000、最高分只有 0.522，
+# 全局阈值 0.68 永远够不着 → 召回 0.000；而同一场的 A 臂单独能把 23 个真球全部
+# 自动√。这不是排序问题，是刻度问题。
+# 做法：把**本场的高分端**对齐到全局参考刻度——s' = s + (CALIB_REF_Q − Q_p(本场))。
+#   · 单场内**保序**（线性平移）→ 不改场内排序、不改场内 AUC、不新增模型推理；
+#   · 只允许用「本场自身分数分布」，不用标签 → 推理时可用，无泄漏；
+#   · 离线留一验证（33 场 / 1893 候选 / 614 真球）：召回@0.68 0.6678 → 0.7997
+#     （+13.2pp），精度 0.9809 → 0.9781（−0.28pp），集成 AUC 0.9852 → 0.9869。
+# ⚠ 已知取舍：它优化的是 keep_thr 这个工作点。若目标改成"精度 ≥98%/99%"的极高端，
+#   校准会**有害**（召回@P98 0.5933→0.5444、@P99 0.3875→0.2874）。
+# 取值来源与验证过程见 doc/CHANGELOG.md（2026.09.28 分数校准）。
+CALIB_P = 0.95          # 锚点分位（Q0.95）；0.85~1.00 是一段平稳高原，0.80 及以下会伤 AUC
+CALIB_REF_Q = 0.9087    # 全局参考刻度 = 33 场 1893 个真实候选池化集成分的 Q0.95
+CALIB_MIN_CLIPS = 20    # 本场候选数少于它时 Q0.95 不稳，回退为不平移
 
 # A 臂单批候选数：A 臂逐帧 YOLO 很慢（约 6.5s/候选），分批只为刷 UI 进度
 A_BATCH = 8
@@ -361,6 +382,7 @@ def _read_ensemble():
     ResNet18/VideoMAE 的加载代价。
     """
     global AUTO_THR, REJECT_THR, ENS_WEIGHTS, _ens_mtime
+    global CALIB_P, CALIB_REF_Q, CALIB_MIN_CLIPS
     try:
         mtime = ENSEMBLE_META.stat().st_mtime
         if _ens_mtime != mtime:
@@ -372,9 +394,15 @@ def _read_ensemble():
             w = ens.get("weights")
             if isinstance(w, dict) and w:
                 ENS_WEIGHTS = {k: float(v) for k, v in w.items()}
+            cal = ens.get("calib")
+            if isinstance(cal, dict) and cal:
+                CALIB_P = float(cal.get("p", CALIB_P))
+                CALIB_REF_Q = float(cal.get("ref_q", CALIB_REF_Q))
+                CALIB_MIN_CLIPS = int(cal.get("min_clips", CALIB_MIN_CLIPS))
             _log.info("goal_verifier: 集成标定 keep_thr=%s reject_thr=%s 权重=%s"
-                      "（组合 %s）",
-                      AUTO_THR, REJECT_THR, ENS_WEIGHTS, ens.get("composition"))
+                      " 校准(p=%s ref_q=%s min=%s)（组合 %s）",
+                      AUTO_THR, REJECT_THR, ENS_WEIGHTS,
+                      CALIB_P, CALIB_REF_Q, CALIB_MIN_CLIPS, ens.get("composition"))
         return AUTO_THR
     except Exception as e:
         _log.warning("goal_verifier: ensemble 段读取失败，用代码默认 "
@@ -489,7 +517,7 @@ def invalidate_stale(clips) -> int:
         if "score" not in c and c.get("mark_source") != "auto":
             continue                    # 既无分数也无模型标记 → 无事可做
         for k in ("score", "verify_ver", "auto", "auto_reject", "verify_score",
-                  "score_lgbm", "score_b", "score_flow", "score_vm"):
+                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm"):
             c.pop(k, None)
         if c.get("mark_source") == "auto":
             c.pop("mark", None)
@@ -498,21 +526,62 @@ def invalidate_stale(clips) -> int:
     return n
 
 
+def _quantile(vals, p: float) -> float:
+    """线性插值分位数（与 numpy.percentile 同口径，但不引入额外依赖）。"""
+    w = sorted(float(v) for v in vals)
+    if not w:
+        return float("nan")
+    k = (len(w) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(w) - 1)
+    return w[lo] + (w[hi] - w[lo]) * (k - lo)
+
+
+def calibration_shift(clips) -> float:
+    """本场的校准平移量（单场内保序，不改排序）。见文件头 CALIB_* 常量说明。
+
+    只依赖**本场自身的分数分布**（不用标签、不用其他场次）→ 推理时可用、无泄漏。
+    候选数 < CALIB_MIN_CLIPS 时返回 0：小样本的 Q0.95 不稳，宁可不校准。
+    """
+    ss = [float(c["score"]) for c in clips if c.get("score") is not None]
+    if len(ss) < CALIB_MIN_CLIPS:
+        return 0.0
+    return CALIB_REF_Q - _quantile(ss, CALIB_P)
+
+
+def calibration_info() -> dict:
+    """当前校准口径（供 verify_snapshot 留档 / 排查用）。"""
+    return {"p": CALIB_P, "ref_q": CALIB_REF_Q,
+            "min_clips": CALIB_MIN_CLIPS}
+
+
 def refresh_auto(clips) -> int:
     """按当前阈值从已有 score 重推三带判定，并对高/低带自动打标（不重跑模型）。
 
     三带：
-      高带 score >= keep_thr   → mark=keep,  mark_source=auto（可直接跳过人工）
-      中间带 keep>s>=reject    → 清掉模型标记，**留给人工**（这是唯一要看的带）
-      低带 score <  reject_thr → mark=reject, mark_source=auto（模型判为误报）
+      高带 score' >= keep_thr   → mark=keep,  mark_source=auto（可直接跳过人工）
+      中间带 keep>s'>=reject    → 清掉模型标记，**留给人工**（这是唯一要看的带）
+      低带 score' <  reject_thr → mark=reject, mark_source=auto（模型判为误报）
     自动标记只写 mark_source != 'manual' 的片段：**人工标记永远优先，绝不覆盖**
     （用户已判 × 的球不能因为模型给高分就被翻成 √）。阈值可被手改
     （model_temporal_meta.json），片段缓存里的标记是旧阈值的产物——历史回读不
     重推就会一直显示过时的徽标；阈值调高后原本 auto 的片段会落回中间带，
     此时必须把模型标记清掉，否则会出现"没人看却已被判定"的片段。
+
+    2026.09.28 起，分带用**校准后**的分数 score' = score + 本场平移量：
+      · c["score"]        保持**原始**合成分不变（缓存 / 历史 / 口径指纹都以它为准，
+                          重推分带永远从原始分出发，不会二次平移）；
+      · c["verify_score"]  写校准后的值（界面显示的数就是与阈值比较的那个数）；
+      · c["calib_shift"]   记录本次平移量，便于排查与留档。
+    校准是单场保序平移 → 不改变场内排序，也不改变任何模型分数。
     """
     keep_thr = auto_threshold()
     rej_thr = reject_threshold()
+    try:
+        shift = calibration_shift(clips)
+    except Exception as e:                       # 校准失败绝不能连累分带
+        _log.warning("goal_verifier: 分数校准失败，本次不平移: %s", e)
+        shift = 0.0
     n = 0
     for c in clips:
         if "score" not in c:
@@ -525,9 +594,11 @@ def refresh_auto(clips) -> int:
                 n += 1
             continue
         s = float(c["score"])
-        c["verify_score"] = round(s, 3)
-        c["auto"] = bool(s >= keep_thr)
-        c["auto_reject"] = bool(s < rej_thr)
+        s_eff = s + shift
+        c["verify_score"] = round(s_eff, 3)
+        c["calib_shift"] = round(shift, 4)
+        c["auto"] = bool(s_eff >= keep_thr)
+        c["auto_reject"] = bool(s_eff < rej_thr)
         if c.get("mark_source") == "manual":
             continue
         if c["auto"]:

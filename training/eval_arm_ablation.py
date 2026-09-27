@@ -23,8 +23,9 @@ from services import state  # noqa: E402
 CACHE = json.loads((ROOT / "cache" / "clip_cache.json").read_text(encoding="utf-8"))
 
 # 组合定义：(名称, 权重) —— 权重为 0 的臂不参与，缺臂按剩余权重重归一化（同 combine）
+# 「现役」两字必须与 model_temporal_meta.json 的 ensemble.weights 对齐
 VARIANTS = [
-    ("现役 a_b2_f_vm   (A .5 B 2 F 1 V 1)", {"lgbm": .5, "b": 2, "flow": 1, "vm": 1}),
+    ("现役 a1_b2_f1.5_v.5 (A 1 B 2 F 1.5 V .5)", {"lgbm": 1, "b": 2, "flow": 1.5, "vm": .5}),
     ("去A · 等权3臂     (B 1 F 1 V 1)     ", {"b": 1, "flow": 1, "vm": 1}),
     ("去A · 同比例      (B .5 F 1 V 1)    ", {"b": .5, "flow": 1, "vm": 1}),
     ("去B · 等权3臂     (A 1 F 1 V 1)     ", {"lgbm": 1, "flow": 1, "vm": 1}),

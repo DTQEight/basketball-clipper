@@ -450,9 +450,11 @@ def _build_verify_snapshot(clips):
             return None
         scores = {}
         for c in scored:
-            v = c.get("verify_score")
-            scores[str(round(float(c["ts"]), 3))] = float(
-                c["score"] if v is None else v)
+            # 存**原始**合成分，而不是 verify_score：留档的意义是「任何时候都能按
+            # 任意阈值/任意校准离线重推分带」。verify_score 是「原始分 + 当次校准
+            # 平移」的显示值，存它会导致回读时再叠一次平移。2026.09.28 引入逐场
+            # 校准前两者相等，历史数据无需迁移。
+            scores[str(round(float(c["ts"]), 3))] = float(c["score"])
 
         def _band(mark):
             # 只认 mark_source == "auto"：人工 √/× 优先，不混进模型的成绩单
@@ -460,10 +462,18 @@ def _build_verify_snapshot(clips):
                           if c.get("mark") == mark
                           and c.get("mark_source") == "auto")
 
+        # 本场校准平移量（整场同一个值；异常时记 None，便于发现口径不一致）
+        shifts = {c["calib_shift"] for c in scored
+                  if c.get("calib_shift") is not None}
+        calib = dict(goal_verifier.calibration_info())
+        calib["shift"] = (round(float(next(iter(shifts))), 4)
+                          if len(shifts) == 1 else None)
+
         return {
             "keep_thr": round(float(goal_verifier.auto_threshold()), 4),
             "reject_thr": round(float(goal_verifier.reject_threshold()), 4),
             "weights": {k: float(v) for k, v in goal_verifier.ENS_WEIGHTS.items()},
+            "calib": calib,
             "fingerprint": goal_verifier.model_fingerprint(),
             "auto_kept": _band("keep"),
             "auto_rejected": _band("reject"),

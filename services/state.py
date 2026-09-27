@@ -1151,7 +1151,7 @@ def clip_cache_key(video_path: str, goals) -> tuple:
 # AI 复核分数随片段缓存一起落盘：否则服务重启后历史回读只剩 ts/path/idx，
 # 卡片上的「AI 自动通过」徽标整批消失（分数要重跑几分钟复核才有）
 _AI_CACHE_KEYS = ("score", "auto", "auto_reject", "verify_score", "verify_ver",
-                  "score_lgbm", "score_b", "score_flow", "score_vm")
+                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm")
 
 
 def put_clip_cache(key, clips):

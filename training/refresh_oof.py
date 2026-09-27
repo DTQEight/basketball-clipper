@@ -45,8 +45,10 @@ REPORT = TR / "refresh_report.json"
 LGBM_KW = dict(n_estimators=400, learning_rate=0.05, num_leaves=15,
                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                reg_lambda=1.0, random_state=42, verbose=-1)
-# 线上现役集成权重
-W = {"a": 0.5, "b": 2.0, "flow": 1.0, "vm": 1.0}
+# 线上现役集成权重。**必须与 services/goal_verifier.py 的 ENS_WEIGHTS 兜底值、
+# 以及 model_temporal_meta.json 的 ensemble.weights 三者一致**——本脚本产出的
+# OOF 报告是用来对线上做判断的，口径不一致会让报告描述一个并未部署的配置。
+W = {"a": 1.0, "b": 2.0, "flow": 1.5, "vm": 0.5}
 
 
 def load_seq(root, events, variant="orig"):
