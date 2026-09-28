@@ -1,6 +1,13 @@
 # basketball-clipper
 
+<img src="assets/logo/logo_512.png" width="76" alt="Logo">
+
 篮球录像进球检测与自动剪辑工具。专为**固定机位**比赛录像设计，手动框住篮筐+篮网（标定）后自动检测进球时刻并 GPU 加速剪辑集锦。
+
+> **Logo 释义**：四角括号 = 目标检测的 bounding box（AI 锁定目标的原生视觉语言），
+> 中间橙球 = 被锁定的那一次进球 —— 一眼读出「AI 锁定每一个进球」。
+> 品牌色：墨 `#14171C` / 球橙 `#FF6B2C` / 冷青 `#27D2BF`。
+> 资产见 [assets/logo/](assets/logo/)，改动后跑 `python tools/generate_logo_assets.py` 重新生成。
 
 ## 核心特性
 
@@ -74,6 +81,7 @@ basketball-clipper/
 │   └── video_utils.py      # 视频元信息 / 帧转码
 ├── training/               # 离线训练流水线：四臂特征抽取 / 训练 / 集成搜索与阈值标定
 ├── cutter/ffmpeg_cutter.py # ffmpeg 剪辑（NVENC 探测 / 流拷贝拼接）
+├── assets/logo/            # 品牌 Logo：SVG 源文件 / 多尺寸 PNG / favicon.ico / installer.ico
 ├── start.bat / start.sh    # Windows / Linux 一键启动
 └── doc/                    # 文档（算法 / 性能 / FAQ / 训练 / 输出 / 更新日志）
 ```

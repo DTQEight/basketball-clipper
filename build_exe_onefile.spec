@@ -23,6 +23,12 @@ collect_all_packages = [
 
 # ---- 额外数据文件 ----
 datas = []
+# Logo 品牌资产（界面顶栏图标 + 浏览器 favicon）
+adir = ROOT / "assets" / "logo"
+if adir.exists():
+    for _f in adir.iterdir():
+        if _f.is_file():
+            datas.append((str(_f), "assets/logo"))
 wdir = ROOT / "weights"
 # 只打运行时真正加载的球检测权重。temporal_ft.pt / temporal_simclr.pt 是旧一代
 # 时序模型的留档，生产代码里没有任何引用（只有 training/ 脚本引用同名的
@@ -195,4 +201,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ROOT / "assets" / "logo" / "installer.ico"),
 )

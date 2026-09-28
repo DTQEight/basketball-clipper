@@ -30,6 +30,12 @@ collect_all_packages = [
 
 # ---- 额外数据文件 ----
 datas = []
+# Logo 品牌资产（界面顶栏图标 + 浏览器 favicon）
+adir = ROOT / "assets" / "logo"
+if adir.exists():
+    for _f in adir.iterdir():
+        if _f.is_file():
+            datas.append((str(_f), "assets/logo"))
 # YOLO 球检测权重（打包 weights 目录下所有 .pt）
 wdir = ROOT / "weights"
 if wdir.exists():
@@ -199,6 +205,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ROOT / "assets" / "logo" / "installer.ico"),
 )
 
 coll = COLLECT(

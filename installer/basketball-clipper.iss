@@ -58,6 +58,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=..\dist\installer
 OutputBaseFilename=BasketballClipper-Setup-{#MyAppVersion}
 WizardStyle=modern
+
+; 图标（安装程序自身 + 安装向导左上角）
+SetupIconFile=..\assets\logo\installer.ico
+WizardSmallImageFile=..\assets\logo\icon_64.png
 SetupLogging=yes
 CloseApplications=yes
 RestartApplications=no

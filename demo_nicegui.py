@@ -36,7 +36,7 @@ ROOT = _get_bundle_root()
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
-from nicegui import ui
+from nicegui import ui, app
 
 from services import state, detection, video_utils, goal_verifier
 
@@ -137,6 +137,9 @@ _yolo_selfcheck()
 
 
 # ============ NiceGUI 界面 ============
+
+# 品牌资产静态目录（顶栏图标 / favicon）
+app.add_static_files('/assets', str(ROOT / 'assets'))
 
 @ui.page('/')
 def main_page():
@@ -328,7 +331,9 @@ def main_page():
 
                 # 标题行 + 折叠功能区按钮（始终可见）
                 with ui.row().classes('w-full items-center justify-between px-3 py-2 border-b').style('flex-shrink: 0; border-color: var(--border-subtle)'):
-                    ui.label('🏀 进球集锦助手').classes('text-sm font-bold').style('color: var(--text-primary)')
+                    with ui.row().classes('items-center gap-2'):
+                        ui.image('/assets/logo/icon_32.png').classes('w-5 h-5 rounded')
+                        ui.label('进球集锦助手').classes('text-sm font-bold').style('color: var(--text-primary)')
                     collapse_btn = ui.button('▲ 收起功能区', on_click=lambda: _toggle_func_collapse()).classes(
                         'text-xs').style('background: var(--bg-elevated); color: var(--text-secondary)')
 
@@ -2230,4 +2235,5 @@ if __name__ == "__main__":
 
     # 端口可用 BBALL_PORT 环境变量覆盖（start.sh / start.bat 同源读取）
     ui.run(host="127.0.0.1", port=int(os.environ.get("BBALL_PORT", "7871")),
+           favicon=str(ROOT / 'assets' / 'logo' / 'favicon.ico'),
            title="进球集锦助手", dark=True, reload=False)
