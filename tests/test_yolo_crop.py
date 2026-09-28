@@ -212,11 +212,14 @@ class TestProbeConfFilter:
             '门槛必须高于默认 ball_conf（0.2），否则等于不过滤'
 
     def test_keeps_high_conf_only(self):
-        kept = detection._filter_probe_balls(self.BALLS)
+        # 显式传门槛：本用例验的是「过滤器只留 ≥ 门槛的证据」这一语义，
+        # 不该随 YOLO_PROBE_CONF 的取值（0.5 → 0.35 已调过一次）而失效。
+        # 常量本身的有效性由 test_gate_is_meaningful 守着。
+        kept = detection._filter_probe_balls(self.BALLS, 0.5)
         assert [round(b[6], 2) for b in kept] == [0.9, 0.62]
 
     def test_all_below_returns_empty(self):
-        assert detection._filter_probe_balls(self.BALLS[2:]) == []
+        assert detection._filter_probe_balls(self.BALLS[2:], 0.5) == []
 
     def test_empty_and_none(self):
         assert detection._filter_probe_balls([]) == []

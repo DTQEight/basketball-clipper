@@ -159,6 +159,33 @@ class TestNetEchoSuppression:
         assert det.diag["reject_echo"] >= 1
         assert det.diag["reject_cooldown"] == 0        # 不是冷却拦下的，是回声判据
 
+    def test_weak_registration_does_not_arm_echo_window(self):
+        """弱注册的进球不武装回声窗口：紧随其后的同型触发应照常注册。
+
+        回归场景（20251007 勒流 11 号篮球公园 1st，388.8s 实测）：386.25s 的打铁
+        靠 1.5s 超时窗 + 兜底档 probe 证据被**弱注册**，它开的 5 秒窗口把 2.4 秒后
+        真正的补篮当成余摆吞掉（该场 reject_echo=8）。弱注册不武装后应恢复注册。
+        """
+        det = _detector(min_gap_sec=2.0)
+        # 首球显式弱注册（模拟「超时窗匹配 / 仅兜底档证据」）
+        assert det._register_goal(0.1, 3, FPS, "side", strong=False) is True
+        # 冷却已过（gap≈2.3s > 2.0），又一枚筐内斑块触发
+        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is True
+        assert det.diag["reject_echo"] == 0
+        assert det.diag["echo_disarmed_weak"] >= 1
+
+    def test_strong_registration_still_arms_echo_window(self):
+        """强注册照旧武装窗口 —— 本修复不得把网兜回声保护一起撤销。
+
+        这是防止「为救补篮而放纵余摆」的护栏：同样相隔 2.3s 的第二次触发，
+        上一次是强注册时必须仍被判为余摆。
+        """
+        det = _detector(min_gap_sec=2.0)
+        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
+        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is False
+        assert det.diag["reject_echo"] == 1
+        assert det.diag["echo_disarmed_weak"] == 0
+
     def test_real_second_goal_within_window_is_kept(self):
         """窗口内的**真球**（先到筐上方再进框）必须照常注册，不能被误杀。"""
         det = _detector(min_gap_sec=2.0)

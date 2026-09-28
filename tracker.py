@@ -180,6 +180,10 @@ class GoalDetector:
 
         self.goals = []                # 进球时间戳
         self.last_goal_frame = -1
+        # 回声窗口是否已武装：只有**强确认**的进球才武装（见 _register_goal / _is_net_echo）。
+        # 弱注册（走 1.5s 超时窗匹配、或仅兜底档 probe 证据）往往是误报，不该获得
+        # 5 秒「余摆保护期」——那会把紧随其后的真补篮一起吞掉。
+        self._echo_armed = True
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
 
         # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
@@ -202,6 +206,7 @@ class GoalDetector:
             "in_hoop": 0,          # 斑块在篮筐框内次数
             "reject_cooldown": 0,  # 冷却期跳过
             "reject_echo": 0,      # 网兜余摆回声被抑制（进球后窗口内没有「新球从上方来」）
+            "echo_disarmed_weak": 0,  # 回声窗口未武装（上一个进球是弱注册，见 _register_goal）
             "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
             "reject_in_x": 0,      # x 不在篮筐范围
             "reject_size": 0,      # 斑块太宽
@@ -584,7 +589,8 @@ class GoalDetector:
                         if yolo_status == "confirmed":
                             self.diag["yolo_confirmed"] += 1
                         ts = frame_idx / fps
-                        if self._register_goal(ts, frame_idx, fps, "loose"):
+                        if self._register_goal(ts, frame_idx, fps, "loose",
+                                               strong=(yolo_status == "confirmed")):
                             self.blob_in_hoop_frames = 0
                             # loose 进球后复位"曾在上方"标记：否则本次下穿轨迹结束后，
                             # flag 无限期残留，几秒后任意无关"下方下移"斑块会走路径1
@@ -623,13 +629,20 @@ class GoalDetector:
                         else:
                             if yolo_status == "confirmed":
                                 self.diag["yolo_confirmed"] += 1
-                            if above_in_time and not self.blob_above_hoop:
+                            # 弱注册判据要先算：下面会复位 blob_above_hoop，
+                            # 复位后再读它会误判（靠 1.5s 超时窗匹配到轨迹 = 弱）
+                            _timeout = above_in_time and not self.blob_above_hoop
+                            if _timeout:
                                 self.diag["timeout_goal"] += 1
                             ts = frame_idx / fps
                             self.blob_above_hoop = False
                             self.last_above_frame = -999
                             self.blob_in_hoop_frames = 0
-                            if self._register_goal(ts, frame_idx, fps, "visual"):
+                            # 弱注册判据：靠 1.5s 超时窗匹配到轨迹（不是新鲜的下穿），
+                            # 或球证据只来自兜底档 probe（主档没看见球）
+                            if self._register_goal(
+                                    ts, frame_idx, fps, "visual",
+                                    strong=(not _timeout) and yolo_status == "confirmed"):
                                 return ts
                 self.blob_above_hoop = False
 
@@ -647,14 +660,19 @@ class GoalDetector:
                     else:
                         if yolo_status == "confirmed":
                             self.diag["yolo_confirmed"] += 1
-                        if hoop_in_time and self.blob_in_hoop_frames < 1:
+                        # 弱注册判据要先算：下面会复位 blob_in_hoop_frames，
+                        # 复位后再读它会误判（靠 1.5s 超时窗匹配到轨迹 = 弱）
+                        _timeout = hoop_in_time and self.blob_in_hoop_frames < 1
+                        if _timeout:
                             self.diag["timeout_goal"] += 1
                         else:
                             self.diag["side_goal"] += 1
                         ts = frame_idx / fps
                         self.blob_in_hoop_frames = 0
                         self.last_in_hoop_frame = -999
-                        if self._register_goal(ts, frame_idx, fps, "side"):
+                        if self._register_goal(
+                                ts, frame_idx, fps, "side",
+                                strong=(not _timeout) and yolo_status == "confirmed"):
                             return ts
             else:
                 self.diag["reject_no_above"] += 1
@@ -681,10 +699,22 @@ class GoalDetector:
         gap_sec = (frame_idx - self.last_goal_frame) / fps
         if gap_sec >= ECHO_WINDOW_SEC:
             return False
+        if not self._echo_armed:
+            # 上一个进球是弱注册（超时匹配 / 仅兜底档证据）→ 不设余摆保护期。
+            # 依据（20251007 勒流 1st）：386.25s 的打铁被弱注册成进球，它开的
+            # 5 秒窗口把 388.8s 的真补篮当成余摆吞了（该场 reject_echo=8、真球漏检）。
+            self.diag["echo_disarmed_weak"] += 1
+            return False
         return self.last_above_frame <= self.last_goal_frame
 
-    def _register_goal(self, ts, frame_idx, fps, source=""):
+    def _register_goal(self, ts, frame_idx, fps, source="", strong=True):
         """注册一个进球时间戳（受冷却期 + 网兜回声抑制控制）。
+
+        strong: 本次注册是否为**强确认** —— 新鲜的「上穿→下穿」轨迹 + 主档 YOLO
+            直接确认。弱注册（只有兜底档 probe 证据，或靠 1.5s 超时窗匹配到轨迹）
+            往往是误报（实测 20251007 勒流 1st 386.25s 打铁被误注册），故不武装
+            回声窗口：让紧随其后的真补篮有机会注册，代价是这一类进球后余摆不受
+            保护。强注册照旧武装，余摆保护行为不变。
 
         返回: True 表示已注册，False 表示被拒（冷却期 / 网兜余摆）
         """
@@ -699,6 +729,7 @@ class GoalDetector:
 
         self.goals.append(ts)
         self.last_goal_frame = frame_idx
+        self._echo_armed = bool(strong)
         self.blob_history.clear()
         if source == "loose":
             self.diag["loose_goal"] += 1  # 独立计数器（旧实现复用 side_goal，两条路径混在一起无法排查）
@@ -838,6 +869,9 @@ class GoalDetector:
             # ---- 进球状态机 ----
             "goals": list(self.goals),
             "last_goal_frame": self.last_goal_frame,
+            # 回声窗口是否武装：断点存于窗口内（≤5s）时必须一起恢复，
+            # 否则弱注册进球在恢复点之后会被错误地重新武装
+            "_echo_armed": self._echo_armed,
             "blob_above_hoop": self.blob_above_hoop,
             "blob_in_hoop": self.blob_in_hoop,
             "blob_in_hoop_frames": self.blob_in_hoop_frames,
@@ -891,6 +925,7 @@ class GoalDetector:
         # ---- 进球状态机 ----
         self.goals = list(state.get("goals", []))
         self.last_goal_frame = int(state.get("last_goal_frame", -1))
+        self._echo_armed = bool(state.get("_echo_armed", True))
         self.blob_above_hoop = bool(state.get("blob_above_hoop", False))
         self.blob_in_hoop = bool(state.get("blob_in_hoop", False))
         self.blob_in_hoop_frames = int(state.get("blob_in_hoop_frames", 0))
