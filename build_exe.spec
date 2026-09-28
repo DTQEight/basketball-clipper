@@ -172,6 +172,7 @@ a.binaries = _normalize_toc(list(a.binaries))
 # 路径下成立——那时 exe 里根本没有四臂。
 _EXCLUDE_DLLS = {
     "cusolverMg64_11.dll",                # 145MB 多 GPU 求解器
+    "curand64_10.dll",                    # 68.6MB 无人导入（torch 的 CUDA RNG 自带 Philox）
 }
 _before = len(a.binaries)
 a.binaries = [

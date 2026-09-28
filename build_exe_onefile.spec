@@ -139,14 +139,20 @@ a.binaries = _normalize_toc(list(a.binaries))
 #   路径下成立——那时 exe 里根本没有四臂。
 _EXCLUDE_DLLS = {
     "cusolverMg64_11.dll",                # 145MB 多 GPU 求解器
+    "curand64_10.dll",                    # 68.6MB 无人导入（torch 的 CUDA RNG 自带 Philox）
 }
 # 注：其余 CUDA 库经本轮实测**都不可删**（torch 的加载链相互依赖，缺一即
 # WinError 126 或 CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED）：
 #   cublas64_12    ← 依赖 cublasLt64_12
-#   cusolver64_11  ← 依赖 cusparse64_12
+#   cusolver64_11  ← 依赖 cusparse64_12，且依赖 nvrtc64_120_0（JIT 消元）
 #   caffe2_nvrtc   ← 依赖 nvrtc64_120_0
 #   cudnn 的卷积路径 ← 依赖 cudnn_engines_precompiled64_9（504MB）
-# 逐个改名实测均失败，故保持原样（详见上轮打包记录）。
+# 逐个改名实测均失败，故保持原样。
+# curand64_10 例外：PE 导入表扫描显示 torch/lib 内无人导入，且 2026-09-28 的
+# 冒烟（CUDA 卷积/GRU/matmul/设备随机数 + YOLO + 剪辑 + 四臂真实候选打分）
+# 隐藏后四臂全在线、分数逐位相同，故可剔。sklearn/scipy（82MB）也试过隐藏——
+# 能跑，但 A 臂与 VM 臂（都走 lightgbm→sklearn）会**静默禁用**，分数口径改变，
+# 故不可剔。
 _before = len(a.binaries)
 a.binaries = [
     b for b in a.binaries
