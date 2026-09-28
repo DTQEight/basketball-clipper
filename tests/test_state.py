@@ -626,6 +626,43 @@ class TestHistory:
                    for c in clips)
         assert sum(1 for c in clips if c["auto"]) > 0
 
+    def test_shift_never_negative(self, monkeypatch):
+        """只抬不降：分数偏高的场次不平移，绝不往下压。
+
+        下压会误伤真球 —— 实测 2026.09.26-1st-partone 被下压 0.046 后，两个原本
+        能自动√的真球（原始分 0.700 / 0.707）掉回中间带。
+        """
+        gv = self._calib(monkeypatch, min_clips=4, ref_q=0.30)
+        # 本场 Q0.95≈0.48 远高于 ref_q=0.30 → 旧行为会下压约 0.18，现在必须是 0
+        scores = [0.10, 0.20, 0.30, 0.40, 0.50]
+        clips = [{"ts": float(i), "score": s} for i, s in enumerate(scores)]
+        assert gv.calibration_shift(clips) == 0.0
+        gv.refresh_auto(clips)
+        assert all(c["calib_shift"] == 0.0 for c in clips)
+        assert all(c["verify_score"] == pytest.approx(c["score"], abs=1e-6)
+                   for c in clips)
+        # 没有候选够高带；低带照常（0.10 < reject_thr 0.20）—— 重点是没有被下压
+        assert not any(c.get("auto") for c in clips)
+
+    def test_shift_cannot_remove_auto(self, monkeypatch):
+        """性质：只抬不降 ⇒ 原本够 keep_thr 的候选不可能被校准移出高带。
+
+        这是「只抬不降」相对「双向平移」最可解释的地方，也是用户能直接感知的
+        —— 不会再出现「卡片明明 ≥0.68 却没自动√」。
+        """
+        gv = self._calib(monkeypatch, min_clips=4, ref_q=0.20)
+        scores = [0.10, 0.30, 0.55, 0.68, 0.90]
+        clips = [{"ts": float(i), "score": s} for i, s in enumerate(scores)]
+        gv.refresh_auto(clips)
+        shift = clips[0]["calib_shift"]
+        assert shift >= 0
+        for c in clips:
+            if c["score"] >= 0.68:
+                assert c["auto"], "够线的候选被校准压出了高带"
+        # 且平移量一致、原始分未被改写
+        assert [c["score"] for c in clips] == pytest.approx(scores)
+        assert all(abs(c["calib_shift"] - shift) < 5e-4 for c in clips)
+
     def test_shift_is_order_preserving(self, monkeypatch):
         """保序：平移只挪刻度，绝不能改变场内排序。"""
         gv = self._calib(monkeypatch, min_clips=4)

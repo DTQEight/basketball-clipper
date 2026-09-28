@@ -1621,7 +1621,20 @@ def main_page():
                         # AI 复核：分数始终显示，便于与人工标记对照。
                         # 不能再用「mark is None」做门——标完之后正好是最需要复核
                         # 对照的时候，一标就全没了（用户实测反馈）。
-                        _ai_score = clip.get("score")
+                        # 显示的分**必须是阈值实际比较的那个数**：分带走的是 verify_score
+                        # （= 原始合成分 + 逐场校准平移），徽标若显示原始分，就会与判带自相矛盾
+                        # ——实测反馈「卡片写 AI ? 0.70 而阈值是 0.68」，根因是该场平移 −0.046，
+                        # 校准后只有 0.654。verify_score 缺失时（AI 没跑过/旧缓存）退回原始分。
+                        _ai_score = clip.get("verify_score")
+                        if _ai_score is None:
+                            _ai_score = clip.get("score")
+                        _ai_raw = clip.get("score")
+                        _ai_shift = clip.get("calib_shift")
+                        _cal_note = ""
+                        if (isinstance(_ai_shift, (int, float)) and abs(_ai_shift) > 1e-9
+                                and isinstance(_ai_raw, (int, float))):
+                            _cal_note = (f'（原始分 {_ai_raw:.3f}，本场校准平移 '
+                                         f'{_ai_shift:+.3f}）')
                         # AI 识别关闭时不显示徽标（分数仍在 clip 里，只是不参与呈现）
                         if _ai_on and _ai_score is not None:
                             _ai_auto = bool(clip.get("auto"))
@@ -1633,24 +1646,25 @@ def main_page():
                                     f'AI ✓ {_ai_score:.2f}',
                                     'color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.5); '
                                     'background: rgba(34, 197, 94, 0.12)',
-                                    f'四臂集成分 {clip.get("verify_score")} ≥ {_thr_hi:.2f}'
-                                    f' → 自动确认，人工可直接跳过')
+                                    f'四臂集成分 {_ai_score:.3f} ≥ {_thr_hi:.2f}'
+                                    f' → 自动确认，人工可直接跳过{_cal_note}')
                             elif _ai_rej:
                                 _badge, _bstyle, _btip = (
                                     f'AI × {_ai_score:.2f}',
                                     'color: var(--err); '
                                     'border: 1px solid rgba(239, 68, 68, 0.45); '
                                     'background: rgba(239, 68, 68, 0.10)',
-                                    f'四臂集成分 {clip.get("verify_score")} < {_thr_lo:.2f}'
-                                    f' → 模型判为误报，人工可直接跳过')
+                                    f'四臂集成分 {_ai_score:.3f} < {_thr_lo:.2f}'
+                                    f' → 模型判为误报，人工可直接跳过{_cal_note}')
                             else:
                                 _badge, _bstyle, _btip = (
                                     f'AI ? {_ai_score:.2f}',
                                     'color: #f59e0b; '
                                     'border: 1px solid rgba(245, 158, 11, 0.55); '
                                     'background: rgba(245, 158, 11, 0.12)',
-                                    f'四臂集成分 {clip.get("verify_score")} 落在 '
-                                    f'{_thr_lo:.2f}–{_thr_hi:.2f} 之间 → 中间带，需人工确认')
+                                    f'四臂集成分 {_ai_score:.3f} 落在 '
+                                    f'{_thr_lo:.2f}–{_thr_hi:.2f} 之间 → 中间带，需人工确认'
+                                    f'{_cal_note}')
                             ui.label(_badge).classes(
                                 'text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0'
                             ).style(_bstyle).tooltip(_btip)
