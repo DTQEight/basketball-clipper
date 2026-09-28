@@ -13,7 +13,7 @@
 ; ============================================================
 
 #define MyAppName        "篮球进球集锦助手"
-#define MyAppVersion     "1.3.0"
+#define MyAppVersion     "1.3.1"
 #define MyAppPublisher   "DTQEight"
 #define MyAppURL         "https://github.com/DTQEight/basketball-clipper"
 #define MyAppExeName     "basketball-clipper.exe"
