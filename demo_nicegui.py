@@ -405,8 +405,6 @@ def main_page():
                                 ui.label('关闭后不跑四臂打分，检测更快；'
                                          '已有分数与历史标签保留，重开即时恢复').classes(
                                     'text-gray-500 text-[10px] -mt-1 mb-1')
-                                yolo_3frame_switch = ui.switch('提速模式 (YOLO每3帧推理一次, 可能略漏检)', value=True).classes('w-full')
-                                ui.label('默认每3帧（推荐, 提速）').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 skip_yolo_switch = ui.switch('条件跳过 (篮筐无运动时跳过YOLO, 大幅提速)', value=True).classes('w-full')
                                 ui.label('篮筐区域无运动像素时跳过 YOLO 推理').classes('text-gray-500 text-[10px] -mt-1 mb-1')
                                 with ui.row().classes('gap-2 w-full'):
@@ -1026,7 +1024,12 @@ def main_page():
                 min_blob_area.value, search_margin.value,
                 progress_callback=_progress_callback,
                 auto_threshold=auto_threshold_switch.value,
-                yolo_step=3 if yolo_3frame_switch.value else 2,
+                # 固定每 2 帧推理一次（原「提速模式」开关已移除）：step=3 叠加大幅
+                # 条件跳过会让球穿过篮筐的几帧整段采不到 —— 20251007 勒流 1st 的
+                # 2分32秒 就是这样漏的（该窗口逐帧扫描「筐上方」检出 0 个）。
+                # 代价实测约 +12 s/场（裁剪@640 单次推理 18.1 ms × 多出的 662 次），
+                # 占该场 detect 288 s 的 +4.2%。改小到 1 无收益（候选集与 2 完全相同）。
+                yolo_step=2,
                 skip_yolo_no_motion=skip_yolo_switch.value,
                 per_video_callback=_per_video_done,
                 task_token=token,
@@ -1258,7 +1261,7 @@ def main_page():
                 min_blob_area.value, search_margin.value,
                 progress_callback=_progress_callback,
                 auto_threshold=auto_threshold_switch.value,
-                yolo_step=3 if yolo_3frame_switch.value else 2,
+                yolo_step=2,
                 skip_yolo_no_motion=skip_yolo_switch.value,
                 task_token=token)
         except Exception as _e:
