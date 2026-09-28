@@ -35,6 +35,18 @@ STATIC_BALL_TOL_PX = 12      # 球心位移 ≤ 该值视为「同一位置」�
 STATIC_BALL_SEC = 1.0        # 同一位置持续存在 ≥ 该秒数 → 判为静止物
 STATIC_BALL_GAP_SEC = 2.0    # 超过该秒数没再出现 → 该位置记录作废、重新计时
 
+# ===== 网兜余摆回声抑制 =====
+# 问题：球入筐后网兜会继续摆动 2~4 秒，而网兜自身的运动斑块就落在筐内，满足
+#   loose 路径的「in_x + 连续 min_in_hoop_frames 帧」，冷却期（min_gap_sec，
+#   界面「进球间隔」默认 2.0s）一过期就会被**再注册一次**，同一个进球变成两个候选。
+# 实测（2026.09.21-2nd）：43 个候选里 13 对的间隔正好是 2.07~2.96s，紧贴冷却边界。
+# 判别依据（物理）：网兜不会「从筐上方下来」。所以进球后的这段窗口内，要求
+#   先重新观察到「斑块在筐上方」（即一条新的下穿轨迹）才允许再次注册；
+#   超出窗口则行为与旧版完全一致。
+# 为什么要窗口而不是全局要求：loose 路径是刻意宽松的（配合 YOLO 兜底），
+#   全局加「必须来自上方」会误伤横向/补篮类进筐；只在回声窗口内收紧最安全。
+ECHO_WINDOW_SEC = 5.0        # 进球后多久内要求「新球从上方来」的证据（网兜摆动 ≤4s）
+
 
 class GoalDetector:
     """进球检测器：基准帧差法 + 连通域 + 篮筐穿越检测。"""
@@ -189,6 +201,7 @@ class GoalDetector:
             "cross_below": 0,      # 斑块到达篮筐下方次数
             "in_hoop": 0,          # 斑块在篮筐框内次数
             "reject_cooldown": 0,  # 冷却期跳过
+            "reject_echo": 0,      # 网兜余摆回声被抑制（进球后窗口内没有「新球从上方来」）
             "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
             "reject_in_x": 0,      # x 不在篮筐范围
             "reject_size": 0,      # 斑块太宽
@@ -650,15 +663,38 @@ class GoalDetector:
 
         return None
 
-    def _register_goal(self, ts, frame_idx, fps, source=""):
-        """注册一个进球时间戳（受冷却期控制）。
+    def _is_net_echo(self, frame_idx, fps) -> bool:
+        """本次触发是否为「网兜余摆回声」：冷却已过，但仍在回声窗口内，
+        且这期间**没有任何**「斑块在筐上方」的新观测（=没有新球从上面下来）。
 
-        返回: True 表示已注册，False 表示被冷却期拒绝
+        背景见文件头 ECHO_WINDOW_SEC 的注释。判据 last_above_frame 的生命周期：
+
+          · 每次注册进球都会把它复位成 -999（见 loose / visual 路径），所以刚进完
+            球这个条件必然成立；而网兜的斑块只会出现在筐内，不会产生新的「在筐
+            上方」观测 → 余摆必然被判为回声；
+          · 真球（投篮或补篮）总有一段球在筐上方的轨迹，会重新置位该值 → 不受影响。
+
+        只在本函数被调用的时机（冷却已过）才有意义；从未进球 → 恒 False。
+        """
+        if self.last_goal_frame < 0:
+            return False
+        gap_sec = (frame_idx - self.last_goal_frame) / fps
+        if gap_sec >= ECHO_WINDOW_SEC:
+            return False
+        return self.last_above_frame <= self.last_goal_frame
+
+    def _register_goal(self, ts, frame_idx, fps, source=""):
+        """注册一个进球时间戳（受冷却期 + 网兜回声抑制控制）。
+
+        返回: True 表示已注册，False 表示被拒（冷却期 / 网兜余摆）
         """
         if self.last_goal_frame >= 0:
             gap_sec = (frame_idx - self.last_goal_frame) / fps
             if gap_sec < self.min_gap_sec:
                 self.diag["reject_cooldown"] += 1
+                return False
+            if self._is_net_echo(frame_idx, fps):
+                self.diag["reject_echo"] += 1
                 return False
 
         self.goals.append(ts)

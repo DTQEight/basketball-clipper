@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytest
 
-from tracker import GoalDetector, WARMUP_TARGET_SEC
+from tracker import ECHO_WINDOW_SEC, GoalDetector, WARMUP_TARGET_SEC
 
 FPS = 30
 HOOP = (130, 80, 170, 120)   # x1, y1, x2, y2（40x40 篮筐）
@@ -132,10 +132,72 @@ class TestGoalPaths:
         _feed_seq(det, [100, 100, 100], start_idx=5)
         assert len(det.goals) == 1
         assert det.diag["reject_cooldown"] >= 1
-        # 3 秒后（帧号跳到 100）→ 第二个进球
-        _feed_seq(det, [100, 100, 100], start_idx=100)
+        # 3 秒后（帧号跳到 100）→ 第二个进球。
+        # 注意必须给「先到筐上方」的两帧：真球总有一段球在筐上方的轨迹，而只喂
+        # 筐内斑块正是网兜余摆的形状，会被回声抑制拦下（见 TestNetEchoSuppression）。
+        _feed_seq(det, [40, 40, 100, 100, 100], start_idx=100)
         assert len(det.goals) == 2
-        assert det.goals[1] == pytest.approx(101 / FPS)  # idx=101 第2个筐内帧
+        assert det.goals[1] == pytest.approx(103 / FPS)  # idx=100/101 上方，102/103 筐内第2帧
+
+
+class TestNetEchoSuppression:
+    """网兜余摆回声抑制：进球后网兜仍会摆动 2~4 秒，其斑块落在筐内、满足 loose
+    路径的进框条件，冷却期一过就会被再注册一次，同一个进球变成两个候选。
+
+    实测（2026.09.21-2nd.mp4，43 候选）：13 对的间隔正好是 2.07~2.96s，紧贴
+    min_gap_sec=2.0 的边界；抽帧确认第二次触发时球已落下、只有网兜在晃。
+    """
+
+    def test_net_swing_after_goal_is_suppressed(self):
+        """进球后只喂「筐内斑块」（=网兜余摆）→ 不再注册第二个进球。"""
+        det = _detector(min_gap_sec=2.0)
+        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
+        assert len(det.goals) == 1
+        # 冷却已过（idx 从 70 起，gap≈2.2s > 2.0），但仍是纯筐内斑块
+        _feed_seq(det, [100, 100, 100, 100], start_idx=70)
+        assert len(det.goals) == 1, "网兜余摆被注册成了第二个进球"
+        assert det.diag["reject_echo"] >= 1
+        assert det.diag["reject_cooldown"] == 0        # 不是冷却拦下的，是回声判据
+
+    def test_real_second_goal_within_window_is_kept(self):
+        """窗口内的**真球**（先到筐上方再进框）必须照常注册，不能被误杀。"""
+        det = _detector(min_gap_sec=2.0)
+        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
+        assert len(det.goals) == 1
+        _feed_seq(det, [40, 40, 100, 100], start_idx=70)  # 又有新球从上方下来
+        assert len(det.goals) == 2
+        assert det.diag["reject_echo"] == 0
+
+    def test_beyond_window_behaves_like_old(self):
+        """超出回声窗口（net 摆动早已停止）→ 行为与旧版一致，不设额外限制。
+
+        这条是向后兼容的护栏：窗口外只喂筐内斑块也应该能注册，避免把
+        「窗口」变成对整场生效的新门槛。
+        """
+        det = _detector(min_gap_sec=2.0)
+        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
+        assert len(det.goals) == 1
+        far = 3 + 30 * (ECHO_WINDOW_SEC + 1.0)          # 窗口外
+        _feed_seq(det, [100, 100, 100], start_idx=far)
+        assert len(det.goals) == 2
+        assert det.diag["reject_echo"] == 0
+
+    def test_first_goal_unaffected(self):
+        """本场第一个进球不受影响（此前没有任何进球）。"""
+        det = _detector(min_gap_sec=2.0)
+        _feed_seq(det, [100, 100, 100])                 # 直接筐内 3 帧
+        assert len(det.goals) == 1
+        assert det.diag["reject_echo"] == 0
+
+    def test_echo_flag_never_fires_before_window_expiry_semantics(self):
+        """窗口内若中途出现过「斑块在筐上方」，回声判据即失效（说明来了新球）。"""
+        det = _detector(min_gap_sec=2.0)
+        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
+        assert det.last_above_frame <= det.last_goal_frame
+        # 进球后先出现一帧筐上方（新球轨迹起点）→ 判据失效
+        _feed_seq(det, [40], start_idx=70)
+        assert det.last_above_frame > det.last_goal_frame
+        assert det._is_net_echo(71, FPS) is False
 
 
 class TestShapeFilter:

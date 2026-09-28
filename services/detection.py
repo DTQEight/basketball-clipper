@@ -1404,6 +1404,9 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
             log.info(f"  YOLO 异常   : {_stat_yolo_failed}/{_stat_yolo_called} 次推理失败（详见 [YOLO ERROR] 日志）")
         log.info(f"  YOLO 确认   : {d['yolo_confirmed']}/{total_yolo} ({confirm_rate:.0f}%)  |  "
                  f"上方: {d['cross_above']}  下方: {d['cross_below']}  筐内: {d['in_hoop']}  冷却拒: {d['reject_cooldown']}")
+        if d.get('reject_echo'):
+            log.info(f"  网兜回声拒   : {d['reject_echo']} 次（进球后窗口内没有「新球从上方来」，"
+                     f"见 tracker.ECHO_WINDOW_SEC）")
         if d.get('probe_called'):
             _gated = getattr(detector, '_probe_gated_ref', [0])[0]
             log.info(f"  YOLO 兜底   : {YOLO_PROBE_MODE} 档补检 {d['probe_called']} 次  |  "
@@ -1521,6 +1524,7 @@ def run_detect(start_frame, end_frame, ball_conf, min_gap_sec,
                           cross_below=d['cross_below'],
                           in_hoop=d['in_hoop'],
                           reject_cooldown=d['reject_cooldown'],
+                          reject_echo=d['reject_echo'],
                           # ===== 自适应阈值详情 =====
                           auto_threshold_value=_auto_thr_for_history,
                           warmup_p95_median=_warmup_p95_for_history,

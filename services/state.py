@@ -980,6 +980,7 @@ _HISTORY_FIELD_CASTS = {
     "cross_below": (int, None),
     "in_hoop": (int, None),
     "reject_cooldown": (int, None),
+    "reject_echo": (int, None),
     # 自适应阈值详情
     "auto_threshold_value": (int, None),
     "warmup_p95_median": (float, 1),
