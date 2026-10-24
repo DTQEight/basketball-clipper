@@ -958,3 +958,52 @@ class TestRoiGrayOutOfFrame:
         det.baseline_gray = det._roi_gray(_base_frame())
         for i in range(5):
             det.feed(None, i, FPS, frame=_base_frame())
+
+
+class TestBallHintBlobSelection:
+    """球身份先验：筐下有更大的斑块（球员头/肩）时，仍要选到球那一块。
+
+    回归来源 2026.10.23-1st 的 4分16秒 / 9分29秒 两个漏检：差分候选里球一直合格
+    （圆形度 0.83~0.88、面积 500~660、正好压在筐口），但「只取面积最大的连通域」
+    让位置更低的球员头（面积 900~1520）每帧胜出 → 状态机全程跟人头 →
+    球在筐内的帧一次都进不了 blob_in_hoop_frames → 两个进球都走 reject_no_above。
+    同一批帧上 YOLO 稳定跟住球（与球斑块中心仅差 12~14px，与人头差 150px+）。
+    """
+
+    BIG_CY = 165          # 更大的干扰斑块：筐下方（hoop_bot = 120）
+    HINT_CY = 100         # 球在筐内
+
+    def _frame(self, ball_cy=None, with_big=True):
+        """筐下方一个大斑块 + 筐内一个小球（可选）。"""
+        f = _base_frame()
+        if with_big:
+            cv2.circle(f, (CX, self.BIG_CY), 14, (255, 255, 255), -1)
+        if ball_cy is not None:
+            cv2.circle(f, (CX, int(ball_cy)), 6, (255, 255, 255), -1)
+        return f
+
+    def test_big_blob_wins_without_hint(self):
+        """前提（旧行为）：没有球证据时仍取面积最大的筐下斑块。"""
+        det = _detector()
+        blob = det._find_moving_blob(det.compute_roi(self._frame(self.HINT_CY)))
+        assert blob is not None
+        assert blob[1] > HOOP[3], blob      # 落在筐下方 = 干扰斑块
+
+    def test_ball_selected_when_hint_near_ball(self):
+        """有球证据：改选球附近那块（球心距 0px，干扰斑块 65px 外 > 半径 20px）。"""
+        det = _detector()
+        blob = det._find_moving_blob(det.compute_roi(self._frame(self.HINT_CY)),
+                                     ball_hint=_ball_pos(self.HINT_CY))
+        assert blob is not None
+        assert abs(blob[1] - self.HINT_CY) < 3, blob
+
+    def test_goal_registered_despite_bigger_blob_below(self):
+        """端到端：球在筐内 2 帧 + YOLO 确认 → 注册 1 个进球（旧实现 0 个）。"""
+        det = _detector()
+        goals = []
+        for i in range(4):
+            g = det.feed(_ball_pos(self.HINT_CY), i, FPS,
+                         frame=self._frame(self.HINT_CY))
+            if g is not None:
+                goals.append(g)
+        assert len(goals) == 1, det.diag

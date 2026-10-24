@@ -6,7 +6,8 @@
 工作原理：
   1. 标定时取一帧无球的画面作为基准帧
   2. 每帧与基准帧做灰度差分 → 二值化 → 连通域分析
-  3. 在篮筐周边区域找最大连通域 = 运动的篮球
+  3. 在篮筐周边区域找连通域 = 运动的篮球（有 YOLO 球位置时优先取球附近那块，
+     否则取最大连通域，见 BALL_HINT_RADIUS_RATIO）
   4. 跟踪斑块：斑块先经过篮筐上沿 → 后经过篮筐下沿 = 视觉进球
 
 优势（针对固定机位）：
@@ -46,6 +47,25 @@ STATIC_BALL_GAP_SEC = 2.0    # 超过该秒数没再出现 → 该位置记录�
 # 为什么要窗口而不是全局要求：loose 路径是刻意宽松的（配合 YOLO 兜底），
 #   全局加「必须来自上方」会误伤横向/补篮类进筐；只在回声窗口内收紧最安全。
 ECHO_WINDOW_SEC = 5.0        # 进球后多久内要求「新球从上方来」的证据（网兜摆动 ≤4s）
+
+# ===== 差分斑块的「球身份」先验：用 YOLO 球位置约束选哪一块斑块 =====
+# 由来：2026.10.23-1st 的 4分16秒 / 9分29秒 两个真进球漏检（逐帧归因见
+# cache/_miss_1023/repro.py + census.json，参数与线上完全一致：thr=23、yolo_step=2）。
+#   · 差分候选里球一直是合格斑块：圆形度 0.83~0.88、面积 500~660、正好压在筐口；
+#   · 但 _find_moving_blob 只返回「面积最大的连通域」，而篮下站着的球员头/肩
+#     （面积 900~1520、圆形度 0.77、中心在筐下方 66px / 筐上沿以下 159px）每帧都赢 → 状态机全程跟的是
+#     人头 → 球在筐内的那几帧一次都没进 blob_in_hoop_frames → 两个进球都走
+#     reject_no_above（该场整场 69 个候选里恰好漏掉这 2 个，其余候选逐项一致）；
+#   · 同一批帧上 YOLO 稳定跟住球（conf 0.82~0.91），球心与球斑块中心仅差 12~14px，
+#     而与人头差 150px+ —— 两个信息源各自都对，缺的只是把它们关联起来。
+# 做法：面积最大的斑块**不在** YOLO 球位置附近时，改选「球位置附近面积最大的斑块」。
+# 没有任何球证据（纯 diff 模式、或 YOLO 整帧漏检）时行为与旧版逐字节一致：仍取最大。
+# 为什么可以用 YOLO 定身份：线上判定本来就有 YOLO 硬否决（_check_yolo_near_hoop），
+# 「进球成立」的前提就是这段窗口里 YOLO 看见过球；让差分跟踪同一个物体，两个证据源
+# 口径才一致。半径见 _ball_hint_radius：本机位 0.5×筐宽 = 54px，落在 14px（同一物体）
+# 与 150px（人头）之间，两侧余量都足。
+BALL_HINT_RADIUS_RATIO = 0.5   # 命中半径 = 篮筐框宽 × 该比例
+BALL_HINT_MIN_RADIUS = 12.0    # 命中半径下限（像素）：小篮筐框/小目标时别退化成 0
 
 
 class GoalDetector:
@@ -295,11 +315,17 @@ class GoalDetector:
         contours, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return any(cv2.contourArea(c) >= self.min_blob_area for c in contours)
 
-    def _find_moving_blob(self, frame_roi_gray):
-        """在篮筐周边搜索区域 ROI 内找最大运动连通域。
+    def _find_moving_blob(self, frame_roi_gray, ball_hint=None):
+        """在篮筐周边搜索区域 ROI 内找运动斑块（默认取最大；有 YOLO 球证据时取球附近那块）。
 
         frame_roi_gray: 由 _roi_gray 产出的搜索区域灰度模糊图
                         （与 baseline_gray 同格式，直接做差分）
+        ball_hint: 本帧 YOLO 球框列表 [(cx, cy, x1, y1, x2, y2, conf), ...]。
+                   空/None → 行为与旧版完全一致（取面积最大的合格连通域）。
+                   非空 → 面积最大的合格连通域**不在**任何球心附近时，改选
+                   「球心附近面积最大」的合格连通域（见 BALL_HINT_RADIUS_RATIO）。
+                   动机：篮下站着的人头/肩比球大得多，纯「取最大」会让状态机
+                   长期跟踪人头，球在筐内的帧一次都进不了 blob_in_hoop_frames。
 
         过滤条件：
           1. 面积在 [min_blob_area, max_blob_area] 范围内
@@ -343,8 +369,12 @@ class GoalDetector:
         self.last_diff_ratio = cv2.countNonZero(diff_bin) / max(diff_bin.size, 1)
 
         # 找最大的有效连通域（面积在范围内 + 形状过滤）
+        # 同时记一份「球心附近面积最大」的：球证据存在时它才是要跟踪的物体
         best_blob = None
         best_area = 0
+        near_blob = None
+        near_area = 0
+        hint_r = self._ball_hint_radius(ball_hint)
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if not (self.min_blob_area <= area <= self.max_blob_area):
@@ -381,8 +411,45 @@ class GoalDetector:
                 best_blob = (float(bcx), float(bcy),
                              int(bx), int(by), int(bx + bw), int(by + bh),
                              float(area))
+            if hint_r > 0 and area > near_area \
+                    and self._near_ball_hint(bcx, bcy, ball_hint, hint_r):
+                near_area = area
+                near_blob = (float(bcx), float(bcy),
+                             int(bx), int(by), int(bx + bw), int(by + bh),
+                             float(area))
 
-        return best_blob
+        # 球证据优先：球附近有合格斑块时用它，否则退回「最大」（旧行为）
+        return near_blob if near_blob is not None else best_blob
+
+    def _ball_hint_radius(self, ball_hint) -> float:
+        """YOLO 球心与差分斑块质心「同一物体」的判定半径（像素）。
+
+        max(筐宽 × BALL_HINT_RADIUS_RATIO, 1.5×球框宽, BALL_HINT_MIN_RADIUS)：
+        球框项让半径随目标尺度自适应（远机位/小篮筐框时不会退化成固定大圆），
+        1.5 倍框宽 ≈ 球径的 1.5 倍，足以吸收运动模糊造成的质心偏移。
+        本机位实测：同一物体相距 12~14px，人头相距 150px+，0.5×筐宽 = 54px
+        落在两者之间，两侧都有 3 倍以上余量。
+        """
+        if not ball_hint:
+            return 0.0
+        r = float(self.hoop_w) * BALL_HINT_RADIUS_RATIO
+        for b in ball_hint:
+            try:
+                r = max(r, 1.5 * (float(b[4]) - float(b[2])))
+            except (IndexError, TypeError, ValueError):
+                continue          # 球框结构异常时只看筐宽项，不影响判定
+        return max(BALL_HINT_MIN_RADIUS, r)
+
+    @staticmethod
+    def _near_ball_hint(cx, cy, ball_hint, radius) -> bool:
+        """斑块质心是否落在某个 YOLO 球心半径 radius 内。"""
+        r2 = radius * radius
+        for b in ball_hint:
+            dx = float(b[0]) - cx
+            dy = float(b[1]) - cy
+            if dx * dx + dy * dy <= r2:
+                return True
+        return False
 
     def feed(self, ball_pos, frame_idx: int, fps: float, frame=None,
              ball_frame=None, frame_roi=None):
@@ -453,7 +520,10 @@ class GoalDetector:
         # 只写最高分那一个会让筐边真球被画面上其它球/误报挤掉（见方法 docstring）
         # 写入前过「静止球证据门」：海报/标志牌上的圆形图案会被认成球且原地不动，
         # 不挡掉就等于让 YOLO 硬否决长期失效（见 _drop_static_balls）
-        for _bp in self._drop_static_balls(ball_pos, frame_idx):
+        # 本帧可用的「球身份」证据（静止物已剔除）：既写进历史供 YOLO 硬否决，
+        # 也作为选斑块时「哪一块是球」的先验（见 BALL_HINT_RADIUS_RATIO）
+        _hint_balls = self._drop_static_balls(ball_pos, frame_idx)
+        for _bp in _hint_balls:
             self.ball_pos_history.append(
                 (ball_frame if ball_frame is not None else frame_idx,
                  _bp[0], _bp[1]))
@@ -474,8 +544,8 @@ class GoalDetector:
                 self.blob_in_hoop_frames = 0
                 return None
 
-        # 在篮筐周边找运动斑块
-        blob = self._find_moving_blob(frame_roi)
+        # 在篮筐周边找运动斑块（有球证据时优先取球附近那块，否则退回最大）
+        blob = self._find_moving_blob(frame_roi, ball_hint=_hint_balls)
 
         # ====== 自适应阈值预热：只采样不判定 ======
         if self.auto_threshold and not self._warmup_done:
