@@ -544,6 +544,137 @@ def _sync_marks(video_path, clips, write_manual=True):
     return n_keep, n_reject
 
 
+def parse_ts(text):
+    """把用户输入的时间点解析成秒：'256.5' / '4:16.5' / '1:04:16.5'。
+
+    容忍首尾空格、全角冒号。非法输入返回 None——**宁可报错让用户重填，也不要猜**：
+    猜错时间点会把他引到错误的画面，比不做更糟。
+    """
+    if text is None:
+        return None
+    s = str(text).strip().replace("：", ":")
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split(":")]
+    if not 1 <= len(parts) <= 3 or any(p == "" for p in parts):
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(v < 0 for v in vals):
+        return None
+    if len(parts) > 1 and any(v >= 60 for v in vals[1:]):
+        return None          # 分/秒位不可能 ≥60（时位不受限）
+    total = 0.0
+    for v in vals:
+        total = total * 60 + v
+    return round(total, 3)
+
+
+def _refresh_kept_indices():
+    """按当前 clips 的标记重算 kept_goal_indices（与 _sync_marks 同口径）。
+
+    有任一标记时只保留 √ 的索引；完全无标记时保持"全选"（导出不过滤，老行为）。
+    """
+    marks = [c.get("mark") for c in state.last_goal_clips]
+    n_keep = sum(1 for m in marks if m == "keep")
+    n_reject = sum(1 for m in marks if m == "reject")
+    state.kept_goal_indices = ({i for i, m in enumerate(marks) if m == "keep"}
+                               if (n_keep or n_reject)
+                               else set(range(len(state.last_goal_clips))))
+
+
+def add_manual_goal(ts, person=None, video_path=None):
+    """人工插入一个进球时间点（补漏检）。ts 可以是秒数，也可以是 '4:16.5' 文本。
+
+    做四件事：① state 落盘（`manual_goals` + `labels.kept`，跨重检保留）；
+    ② 为它切一个预览片段（失败也保留候选，只在文案里说明）；③ 加进当前会话的
+    候选列表并按时间重排（卡片顺序 = 时间顺序）；④ 保持 last_goals 同步。
+    返回 (ok, msg, ts)。
+    """
+    if video_path is None:
+        video_path = state.video_state.get("path")
+    if not video_path:
+        return False, "请先加载视频", None
+    sec = parse_ts(ts) if isinstance(ts, str) else (
+        round(float(ts), 3) if ts is not None else None)
+    if sec is None:
+        return False, f"时间点格式不对：{ts!r}（支持 256.5 或 4:16.5）", None
+    total = int(state.video_state.get("total") or 0)
+    fps = float(state.video_state.get("fps") or 30.0)
+    dur = (total / fps) if (total and fps) else None
+    if dur is not None and sec > dur:
+        return False, f"时间点 {sec:.1f}s 超出视频时长 {dur:.1f}s", None
+
+    status, actual, msg = state.add_manual_goal(video_path, sec, person=person)
+    if status == "error":
+        return False, msg or "插入失败", None
+
+    clips = state.last_goal_clips
+    # 已有候选（同一进球 / 时间戳重合）：直接标 √ 复用，不制造第二张卡片
+    near = next((c for c in clips
+                 if abs(float(c.get("ts", -1)) - float(actual)) <= state.MANUAL_DEDUPE_SEC),
+                None)
+    if near is not None:
+        near["mark"] = "keep"
+        near["mark_source"] = "manual"
+        near["source"] = near.get("source") or "manual"
+        _refresh_kept_indices()
+        return True, f"已在 {actual:.1f}s 有候选（已标 √，未重复添加）", float(actual)
+
+    clip = {"ts": round(float(actual), 3), "path": None, "idx": len(clips),
+            "mark": "keep", "mark_source": "manual", "source": "manual"}
+    try:
+        made = _generate_preview_clips(video_path, [float(actual)], 0, total,
+                                       fps, total, int(time.time()))
+        if made and made[0].get("path"):
+            clip["path"] = made[0]["path"]
+    except Exception as e:
+        log.warning(f"[MANUAL] 预览切片失败（候选保留，卡片无预览）: {e}")
+    clips.append(clip)
+    clips.sort(key=lambda c: float(c.get("ts", 0)))
+    for i, c in enumerate(clips):
+        c["idx"] = i
+    _refresh_kept_indices()
+    if isinstance(state.last_goals, list) \
+            and not any(abs(float(g) - float(actual)) <= state.MANUAL_DEDUPE_SEC
+                        for g in state.last_goals):
+        state.last_goals.append(float(actual))
+        state.last_goals.sort()
+    log.info(f"[MANUAL] 插入进球 {actual:.3f}s（预览 {'OK' if clip['path'] else '无'}）")
+    return True, (f"已插入进球 {actual:.1f}s"
+                  + ("" if clip["path"] else "（预览切片失败，卡片无预览）")), float(actual)
+
+
+def remove_manual_goal(ts, video_path=None):
+    """删除一条手动插入（连同标签与卡片）。返回 (ok, msg)。"""
+    if video_path is None:
+        video_path = state.video_state.get("path")
+    if not video_path:
+        return False, "请先加载视频"
+    sec = parse_ts(ts) if isinstance(ts, str) else (
+        round(float(ts), 3) if ts is not None else None)
+    if sec is None:
+        return False, f"时间点格式不对：{ts!r}"
+    ok, msg = state.remove_manual_goal(video_path, sec)
+    if not ok:
+        return False, msg
+    # 只摘掉 manual 来源的卡片：检测出的候选不归这个操作管（那是 √/× 的语义）
+    state.last_goal_clips[:] = [
+        c for c in state.last_goal_clips
+        if not (abs(float(c.get("ts", -1)) - float(sec)) <= 1e-3
+                and c.get("source") == "manual")]
+    for i, c in enumerate(state.last_goal_clips):
+        c["idx"] = i
+    _refresh_kept_indices()
+    if isinstance(state.last_goals, list):
+        state.last_goals[:] = [g for g in state.last_goals
+                               if abs(float(g) - float(sec)) > 1e-3]
+    log.info(f"[MANUAL] 删除手动插入 {sec:.3f}s")
+    return True, msg
+
+
 def _ball_boxes_from_result(res):
     """把 YOLO 推理结果转成候选球框列表（按置信度降序），无检出返回 []。
 
@@ -1907,7 +2038,9 @@ def _clips_from_record(r):
         except (TypeError, ValueError):
             continue
     clips = []
-    for t in r.get("goals", []):
+    manual_set = {round(float(t), 3) for t in (r.get("manual_goals") or [])}
+    # 进球集合走 state.record_goals：检测到的 ∪ 手动插入的（整场导出靠这里才看得到手动补的球）
+    for t in state.record_goals(r):
         # 标签键（kept/deleted/persons）统一存 round(ts,3)，goals 是全精度：
         # 与 _on_load_history_impl 相同的舍入匹配，否则 31.2789 对不上 31.279
         ts = round(float(t), 3)
@@ -1919,9 +2052,14 @@ def _clips_from_record(r):
             mark = "keep"
         elif ts in a_rej:
             mark = "reject"
+        elif ts in manual_set:
+            mark = "keep"          # 手动插入的球默认按 √ 导出（标签缺失时的兜底）
         else:
             mark = None
-        clips.append({"ts": ts, "mark": mark, "person": persons.get(ts)})
+        clip = {"ts": ts, "mark": mark, "person": persons.get(ts)}
+        if ts in manual_set:
+            clip["source"] = "manual"
+        clips.append(clip)
     return clips
 
 
@@ -2152,7 +2290,9 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
         else:
             state.calib["baseline_frame"] = None
             state.calib["baseline_idx"] = -1
-    all_goals = [float(t) for t in r.get("goals", [])]
+    # 进球集合 = 检测到的 ∪ 手动插入的（手动插入单独存 record["manual_goals"]，
+    # 重检测不会覆盖它；不在这里合并的话，历史回读就「看不见手动插入的球」）
+    all_goals = [float(t) for t in state.record_goals(r)]
     state.last_goals.clear()
     state.last_goals.extend(all_goals)
 
@@ -2495,7 +2635,7 @@ def _on_batch_load_video_impl(selected, progress_callback):
 
     if matched:
         _report(10, '找到检测记录，加载进球数据...')
-        all_goals = [float(t) for t in matched.get("goals", [])]
+        all_goals = [float(t) for t in state.record_goals(matched)]
         # 注：last_goals / last_goal_clips / kept_goal_indices 已在函数入口统一清空，
         # 这里直接 extend，不需要再 .clear() 一次
         state.last_goals.extend(all_goals)

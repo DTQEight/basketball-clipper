@@ -559,6 +559,24 @@ def main_page():
                     frame_pos_label = ui.label('帧 0').classes('text-gray-400 text-xs font-mono').style(
                         'min-width: 132px; text-align: right; flex-shrink: 0')
 
+                # ===== 手动插入进球（补漏检）=====
+                # 主入口就是时间框：检测漏了随时补一个时间点，候选按时间顺序插进列表，
+                # 集锦/整场导出会自动带上（导出前本来就按 ts 升序 + min_gap 合并）。
+                insert_row = ui.row().classes('w-full items-center gap-2 hidden')
+                with insert_row:
+                    insert_input = ui.input(
+                        placeholder='漏检补录：输入 4:16.5 或 256.5（留空=当前帧）'
+                    ).classes('flex-1').props('dense outlined dark').on(
+                        'keydown.enter', lambda: _on_insert_goal())
+                    insert_btn = ui.button(
+                        '插入为进球', on_click=lambda: _on_insert_goal()
+                    ).classes('text-sm shrink-0').props('ripple').style(
+                        'background: var(--accent); color: var(--bg-canvas)')
+                    insert_undo_btn = ui.button(
+                        '撤销手动', on_click=lambda: _on_remove_manual()
+                    ).classes('text-xs shrink-0').props('ripple dense').style(
+                        'background: var(--bg-elevated); color: var(--text-secondary)')
+
                 result_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
                 highlights_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style('aspect-ratio: 16/9')
 
@@ -610,8 +628,10 @@ def main_page():
         # 帧选择器跟随预览图显隐（仅已加载多帧视频时才有意义）
         if mode == 'preview' and (state.video_state.get('total') or 0) > 1:
             frame_select_container.classes(remove='hidden')
+            insert_row.classes(remove='hidden')
         else:
             frame_select_container.classes(add='hidden')
+            insert_row.classes(add='hidden')
 
     def _auto_show_progress():
         """timer 里的进度自动接管：用户正看着 result/highlights 时不动右栏。
@@ -684,12 +704,87 @@ def main_page():
 
     frame_slider.on_value_change(_on_frame_slider_change)
 
+    # ====== 手动插入进球（补漏检）======
+    # 为什么需要：YOLO/状态机再好也会漏球（实测硬帧上主档会整窗无证据）。人工补一个
+    # 时间点比继续堆检测规则划算；补齐后候选列表按时间排序，集锦与整场导出自动带上。
+    async def _jump_to_ts(ts):
+        """把预览跳到指定秒（真正刷帧由 slider 的 on_value_change 负责）。"""
+        fps = float(state.video_state.get('fps') or 30.0)
+        total = int(state.video_state.get('total') or 0)
+        idx = int(round(float(ts) * fps))
+        if total > 0:
+            idx = max(0, min(idx, total - 1))
+        state.video_state['current_frame'] = idx
+        frame_pos_label.set_text(_fmt_frame_pos(idx, total, fps))
+        _show_right_pane('preview')
+        frame_slider.set_value(idx)
+
+    async def _on_insert_goal():
+        if state.video_state.get("path") is None:
+            _set_status('请先加载视频', 'err')
+            return
+        text = (insert_input.value or '').strip()
+        if not text:
+            # 留空 = 用当前帧：看完画面直接补录，不用手算秒数
+            fps = float(state.video_state.get('fps') or 30.0)
+            text = f"{(int(state.video_state.get('current_frame') or 0) / max(fps, 1e-6)):.3f}"
+        token = _try_acquire('manual')
+        if not token:
+            return
+        from nicegui import run
+        try:
+            ok, msg, ts = await run.io_bound(detection.add_manual_goal, text)
+        except Exception as ex:
+            ok, msg, ts = False, f"插入失败: {ex}", None
+        finally:
+            state.release_task(token)   # 锁归本次操作：同步业务函数内部不释放
+        if ok:
+            insert_input.set_value('')
+            _refresh_result_cards()
+            _set_status(msg, 'ok')
+            if ts is not None:
+                await _jump_to_ts(ts)
+        else:
+            _set_status(msg, 'err')
+
+    async def _on_remove_manual(idx=None):
+        if _cards_video["path"] is not None:
+            _set_status('快照模式下不能撤销，请先切回单视频', 'err')
+            return
+        clips = _cards_clips()
+        ts = None
+        if isinstance(idx, int) and 0 <= idx < len(clips):
+            ts = clips[idx].get("ts")
+        else:
+            text = (insert_input.value or '').strip()
+            if text:
+                ts = detection.parse_ts(text)
+            else:
+                fps = float(state.video_state.get('fps') or 30.0)
+                ts = (int(state.video_state.get('current_frame') or 0) / max(fps, 1e-6))
+        if ts is None:
+            _set_status('请输入要撤销的时间点（4:16.5 / 256.5），或直接点卡片上的 ✕', 'err')
+            return
+        token = _try_acquire('manual')
+        if not token:
+            return
+        from nicegui import run
+        try:
+            ok, msg = await run.io_bound(detection.remove_manual_goal, ts)
+        except Exception as ex:
+            ok, msg = False, f"撤销失败: {ex}"
+        finally:
+            state.release_task(token)
+        _refresh_result_cards()
+        _set_status(msg, 'ok' if ok else 'err')
+
     # ====== 全局任务互斥：锁在 services.state（进程级，跨页面连接/刷新共享）======
     # 旧实现 _busy 是页面函数局部变量：NiceGUI 每个连接/刷新独立执行页面函数，
     # 刷新后旧检测线程还在跑、新页面锁为空可再启动任务 → 并发写全局 state。
     def _task_label(task):
         return {'detect': '开始识别', 'batch': '批量识别',
-                'highlights': '生成集锦', 'load': '加载视频'}.get(task, '后台任务')
+                'highlights': '生成集锦', 'load': '加载视频',
+                'manual': '插入进球'}.get(task, '后台任务')
 
     def _try_acquire(task):
         """尝试占用任务锁；已有任务运行则提示并返回 0。返回值为 token（传给后台函数）。"""
@@ -1626,6 +1721,18 @@ def main_page():
                             f'第 {i + 1}/{len(clips)} 个候选')
                         ui.label(f'{t_min}:{t_sec:04.1f} - {end_min}:{end_sec:04.1f}').classes(
                             'text-sm font-bold font-mono shrink-0').style('color: var(--accent)')
+                        # 手动插入的候选：徽章 + 撤销按钮（人工补的球要一眼能认出来，
+                        # 否则下次看列表会以为是自己漏标了自动候选）
+                        if clip.get("source") == "manual":
+                            ui.label('手动').classes(
+                                'text-[10px] font-bold shrink-0 rounded-full px-1.5'
+                            ).style('color: #f59e0b; '
+                                    'border: 1px solid rgba(245, 158, 11, 0.55); '
+                                    'background: rgba(245, 158, 11, 0.12)').tooltip(
+                                '人工插入（检测漏了这个球）：默认已标 √，可点右侧 ✕ 撤销')
+                            ui.button('✕', on_click=lambda e, i=i: _on_remove_manual(i)).props(
+                                'flat dense').classes('text-[10px] shrink-0').tooltip(
+                                '撤销这条手动插入（同时清掉它的标签）')
                         # AI 复核：分数始终显示，便于与人工标记对照。
                         # 不能再用「mark is None」做门——标完之后正好是最需要复核
                         # 对照的时候，一标就全没了（用户实测反馈）。

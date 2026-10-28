@@ -318,6 +318,33 @@ def _history_file_for(video_path: str) -> str:
     return os.path.join(HISTORY_DIR, f"{safe}__{h}.json")
 
 
+# ============ 手动插入进球（人工补漏检） ============
+# 与任一已有进球（检测出的或手动插入的）相距 ≤ 该秒数时视为「同一个进球」：
+# 插入时直接复用已有那条（避免同一进球出现两张卡片）；重检测时也不再单独保留
+# 手动条目（新检测已经覆盖它，标签会经 _remap_labels_to_goals 迁移过去）。
+MANUAL_DEDUPE_SEC = 1.0
+
+
+def record_goals(record) -> list:
+    """一条历史记录的**全部进球时刻** = 检测到的 ∪ 手动插入的（升序去重）。
+
+    手动插入刻意**不并进 goals**：重检测会用新的 goals 整体覆盖记录，并进去就静默
+    丢了（用户手工指点的事实比一次重跑的结果更值得保留）。所以单独存
+    `manual_goals`，由本函数在读取侧统一合并。消费点都必须走这里：
+    单视频历史加载、整场（四节）导出、UI 卡片列表——漏一个就会「看不见手动插入」。
+    """
+    if not isinstance(record, dict):
+        return []
+    out = set()
+    for key in ("goals", "manual_goals"):
+        for t in (record.get(key) or []):
+            try:
+                out.add(round(float(t), 3))
+            except (TypeError, ValueError):
+                continue
+    return sorted(out)
+
+
 # ============ 断点续识别 ============
 # 影响检测结果的关键参数（用于 checkpoint 指纹，参数变化则 checkpoint 失效）
 _CHECKPOINT_PARAM_KEYS = (
@@ -861,6 +888,145 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
     return True
 
 
+# ============ 手动插入进球：读写 ============
+
+def _mutate_record(video_path, fn):
+    """在写锁内对单条历史记录做「读-改-写」。返回 (rec, fn 的返回值) 或 (None, 错误串)。
+
+    只改这一条（每条记录本就独立成文件），与 update_history_labels 的增量写同口径：
+    不 save_history(records) 全量重写。
+    """
+    with _history_io_lock:
+        p = _history_file_for(video_path)
+        if not os.path.exists(p):
+            return None, "该视频还没有历史记录（请先检测一次再插入）"
+        try:
+            with open(p, encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception as e:
+            return None, f"读取历史记录失败: {e}"
+        try:
+            res = fn(rec)
+        except Exception as e:
+            return None, f"更新历史记录失败: {e}"
+        try:
+            _atomic_write_json(p, rec, indent=2)
+        except Exception as e:
+            return None, f"写入历史记录失败: {e}"
+        return rec, res
+
+
+def _ts_near(ts, seq, tol=MANUAL_DEDUPE_SEC):
+    """seq 里是否有与 ts 相距 ≤ tol 的时间戳；有则返回它（四舍五入到 3 位）。"""
+    for t in (seq or []):
+        try:
+            if abs(float(t) - float(ts)) <= tol:
+                return round(float(t), 3)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def add_manual_goal(video_path, ts, person=None, note=None):
+    """把人工指定的时间点插入为该视频的进球候选。
+
+    返回 (status, actual_ts, msg)：
+      · "added"  → 新建成功，actual_ts = 插入的时间戳
+      · "exists" → 与已有进球相距 ≤ MANUAL_DEDUPE_SEC，**不新建**；actual_ts = 那条
+                   已有进球的时间戳（调用方应把它标成 √ 而不是制造两个卡片）
+      · "error"  → 失败，msg 为原因
+
+    落盘口径：`manual_goals`（跨重检保留）+ `labels.kept`（人工正样本，训练集读它）
+    + `labels.persons`（可选）。**不写 auto_kept**——这是人工判断，不是模型判断。
+    """
+    if not video_path:
+        return "error", None, "没有已加载的视频"
+    try:
+        t = round(float(ts), 3)
+    except (TypeError, ValueError):
+        return "error", None, f"时间点无效: {ts!r}"
+    if t < 0:
+        return "error", None, f"时间点不能为负: {t}"
+
+    def _mut(rec):
+        goals = [float(g) for g in (rec.get("goals") or [])]
+        manual = [float(g) for g in (rec.get("manual_goals") or [])]
+        dup = _ts_near(t, goals + manual)
+        if dup is not None:
+            return "exists", dup, None
+        rec["manual_goals"] = sorted({round(x, 3) for x in manual} | {t})
+        lab = rec.get("labels") or {}
+        kept = {round(float(x), 3) for x in (lab.get("kept") or [])} | {t}
+        lab["kept"] = sorted(kept)
+        # 用户此前若把同一时刻判过 ×（或模型判过 ×），插入即视为改判：清掉反例
+        for other in ("deleted", "auto_rejected"):
+            if lab.get(other):
+                lab[other] = sorted({round(float(x), 3) for x in lab[other]
+                                     if abs(round(float(x), 3) - t) > 1e-3})
+        if person:
+            persons = dict(lab.get("persons") or {})
+            persons[str(t)] = str(person)
+            lab["persons"] = persons
+        if note:
+            notes = dict(lab.get("manual_notes") or {})
+            notes[str(t)] = str(note)
+            lab["manual_notes"] = notes
+        lab["label_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rec["labels"] = lab
+        return "added", t, None
+
+    rec, res = _mutate_record(video_path, _mut)
+    if rec is None:
+        return "error", None, str(res)
+    status, actual, _ = res
+    if status == "added":
+        return "added", actual, f"已插入进球 {actual:.1f}s"
+    return "exists", actual, f"已在 {actual:.1f}s 有一个进球（相距 ≤{MANUAL_DEDUPE_SEC}s），未重复插入"
+
+
+def remove_manual_goal(video_path, ts):
+    """删除一条手动插入，并清掉它的 kept/persons 标签。返回 (ok, msg)。
+
+    只删手动插入的条目：检测出的进球不归这里管（那是 √/× 的语义）。
+    """
+    try:
+        t = round(float(ts), 3)
+    except (TypeError, ValueError):
+        return False, f"时间点无效: {ts!r}"
+
+    def _mut(rec):
+        manual = [round(float(x), 3) for x in (rec.get("manual_goals") or [])]
+        if not any(abs(x - t) <= 1e-3 for x in manual):
+            return False
+        rest = [x for x in manual if abs(x - t) > 1e-3]
+        if rest:
+            rec["manual_goals"] = rest
+        else:
+            rec.pop("manual_goals", None)
+        lab = rec.get("labels") or {}
+        for k in ("kept", "deleted", "auto_kept", "auto_rejected"):
+            if lab.get(k):
+                lab[k] = sorted({round(float(x), 3) for x in lab[k]
+                                 if abs(round(float(x), 3) - t) > 1e-3})
+        persons = dict(lab.get("persons") or {})
+        persons.pop(str(t), None)
+        lab["persons"] = persons
+        notes = dict(lab.get("manual_notes") or {})
+        notes.pop(str(t), None)
+        if notes:
+            lab["manual_notes"] = notes
+        else:
+            lab.pop("manual_notes", None)
+        lab["label_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rec["labels"] = lab
+        return True
+
+    rec, res = _mutate_record(video_path, _mut)
+    if rec is None:
+        return False, str(res)
+    return (True, f"已删除手动插入 {t:.1f}s") if res else (False, "该时间点不是手动插入的，未删除")
+
+
 def get_labels(video_path):
     """读取某视频的已保存标签。
 
@@ -1091,12 +1257,14 @@ def _add_history_impl(video_path, hoop, goals, baseline_idx=-1,
     # 时间戳会偏移，直接沿用旧 ts 会导致加载历史时精确匹配失败，被标记过的
     # 球掉出默认集锦；匹配率过低说明两次检测结果差异过大，旧标签已无意义。
     old_labels = None
+    _old_manual = None
     # M7：旧记录查找走 _find_history_record（精确优先 + 唯一 basename 兜底）。
     # 视频迁移目录后历史里仍记着旧路径，旧实现只按精确路径找 → 找不到旧标签，
     # 结果历史里新旧两条并存（旧的那条永远带着过期标签）。
     _old_idx = _find_history_record(records, video_path)
     if _old_idx is not None:
         old_labels = records[_old_idx].get("labels")
+        _old_manual = records[_old_idx].get("manual_goals")
     # 剔除旧记录：命中的那条 + 任何精确同路径的残留（避免新旧两条并存）
     records = [r for i, r in enumerate(records)
                if i != _old_idx and r.get("video") != video_path]
@@ -1124,6 +1292,15 @@ def _add_history_impl(video_path, hoop, goals, baseline_idx=-1,
                 f"已丢弃旧标记: {video_path}")
     if diff_threshold is not None:
         rec["diff_threshold"] = diff_threshold  # 可能为 int 或 str 'auto'
+    # 手动插入的进球必须跨重检保留：那是用户手工指点的事实，不该被一次重跑抹掉。
+    # 已被本次检测覆盖（相距 ≤ MANUAL_DEDUPE_SEC）的条目丢弃——那条已由检测出的
+    # 进球代表，它的人工 √ 会经 _remap_labels_to_goals 迁移到新时间戳上。
+    if _old_manual:
+        _kept_manual = sorted({round(float(t), 3) for t in _old_manual
+                               if not any(abs(float(t) - float(g)) <= MANUAL_DEDUPE_SEC
+                                          for g in rec["goals"])})
+        if _kept_manual:
+            rec["manual_goals"] = _kept_manual
     for name, value in fields.items():
         if value is None:
             continue
