@@ -337,8 +337,14 @@ def main_page():
                     collapse_btn = ui.button('▲ 收起功能区', on_click=lambda: _toggle_func_collapse()).classes(
                         'text-xs').style('background: var(--bg-elevated); color: var(--text-secondary)')
 
-                # 功能区域（固定高度，紧凑）
-                with ui.column().classes('w-full px-3 py-2 gap-1 border-b').style('flex-shrink: 0; border-color: var(--border-subtle)') as func_container:
+                # 功能区域：内容超高时自身滚动。
+                # 批量面板 + 展开的「参数/集锦/历史」会把这块撑得比视口还高；
+                # 原来的 flex-shrink:0 让它按内容撑高、永不收缩，而左栏是
+                # overflow:hidden，超出的部分直接被裁掉 —— 展开区的下半截既看
+                # 不到也滚不动。放开收缩（flex-shrink:1 + min-height:0）并允许
+                # 纵向滚动后，超出的部分可以在功能区内滚到。
+                with ui.column().classes('w-full px-3 py-2 gap-1 border-b overflow-y-auto').style(
+                        'flex: 0 1 auto; min-height: 0; border-color: var(--border-subtle)') as func_container:
 
                     # 输入框 + 加载按钮（一行）
                     path_input = ui.input(value=state.DEFAULT_VIDEO, placeholder='文件路径').classes('w-full').props('dense')
@@ -370,7 +376,12 @@ def main_page():
                     # 结果状态
                     result_status = ui.label('').classes('text-gray-400 text-xs')
 
-                    # 折叠区域：参数 / 集锦 / 历史 合并到一个框（展开时占满整框）
+                # 折叠区（参数 / 集锦 / 历史）固定在功能区下方，**不能**放进上面
+                # 那个可滚动容器：批量模式内容一高，三个入口本身就被滚出可视区，
+                # 用户会直接找不到「参数那一行」。入口常驻；展开的内容各自限高、
+                # 在内部滚动（见各 expansion 内容列的 max-h + overflow-y-auto）。
+                with ui.column().classes('w-full px-3 py-1 border-b').style(
+                        'flex-shrink: 0; border-color: var(--border-subtle)') as tabs_container:
                     with ui.row().classes('w-full border rounded-lg overflow-hidden').style('gap: 0; flex-wrap: wrap; border-color: var(--border-subtle)'):
                         exp_params = ui.expansion('参数', group='leftpanel').classes('w-1/3 text-gray-300 text-xs').style('min-width: 0').props('duration=0')
                         with exp_params:
@@ -534,10 +545,12 @@ def main_page():
                     _func_state["collapsed"] = collapsed
                     if collapsed:
                         func_container.classes(add='hidden')
+                        tabs_container.classes(add='hidden')
                         collapse_btn.set_text('▾ 展开功能区')
                         collapse_btn.style('background: transparent; color: var(--accent); border: 1px solid var(--accent)')
                     else:
                         func_container.classes(remove='hidden')
+                        tabs_container.classes(remove='hidden')
                         collapse_btn.set_text('▲ 收起功能区')
                         collapse_btn.style('background: var(--bg-elevated); color: var(--text-secondary); border: none')
 
@@ -545,12 +558,18 @@ def main_page():
                     _set_func_collapsed(not _func_state["collapsed"])
 
             # ========== 右侧面板 ==========
-            with ui.column().classes('flex-1 p-4 gap-3').style('background: var(--bg-canvas)'):
+            with ui.column().classes('flex-1 p-4 gap-3').style(
+                    'background: var(--bg-canvas); overflow-y: auto; min-height: 0'):
 
                 # 视频预览区
+                # 限高：窗口高度不足时预览图不能再按 16:9 铺满整宽，否则会把
+                # 下方的帧选择器和「插入进球」输入框顶出可视区（用户得缩到
+                # 90% 缩放才看得到）。限宽后等比缩小并居中，保持 16:9。
                 preview_image = ui.interactive_image(
                     source='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
-                ).classes('w-full rounded-xl bg-black').style('aspect-ratio: 16/9; object-fit: contain')
+                ).classes('w-full rounded-xl bg-black').style(
+                    'aspect-ratio: 16/9; object-fit: contain; '
+                    'max-width: calc(52vh * 16 / 9); margin: 0 auto')
 
                 # 帧选择器（标定前拖动浏览帧；随预览图同显隐）
                 frame_select_container = ui.row().classes('w-full items-center gap-3 hidden')
@@ -606,6 +625,17 @@ def main_page():
     # 否则每 0.4s 无条件切 progress 会把本页正在播放的片段/集锦顶掉。
     _right_pane = {"mode": "preview"}
 
+    def _sync_insert_row():
+        """补录输入行的显隐只看「有没有可预览的视频」，不跟随右侧面板模式。
+
+        原先它由 _show_right_pane 一并控制，插入一次后只要面板切到进度/结果
+        （批量/复核在跑时会自动切），这一行就被藏起来且再也不会自己回来。
+        """
+        if (state.video_state.get('total') or 0) > 1:
+            insert_row.classes(remove='hidden')
+        else:
+            insert_row.classes(add='hidden')
+
     def _show_right_pane(mode):
         """右侧 4 个元素互斥显示：'preview' | 'result' | 'highlights' | 'progress' | None（preview fallback）。"""
         modes = {'preview', 'result', 'highlights', 'progress'}
@@ -628,10 +658,10 @@ def main_page():
         # 帧选择器跟随预览图显隐（仅已加载多帧视频时才有意义）
         if mode == 'preview' and (state.video_state.get('total') or 0) > 1:
             frame_select_container.classes(remove='hidden')
-            insert_row.classes(remove='hidden')
         else:
             frame_select_container.classes(add='hidden')
-            insert_row.classes(add='hidden')
+        # 补录输入行独立同步（见 _sync_insert_row 的说明）
+        _sync_insert_row()
 
     def _auto_show_progress():
         """timer 里的进度自动接管：用户正看着 result/highlights 时不动右栏。
@@ -655,6 +685,7 @@ def main_page():
     def _sync_frame_selector():
         """视频加载后同步滑块范围/位置（各加载路径已将 current_frame 重置为 0）。"""
         total = int(state.video_state.get('total') or 0)
+        _sync_insert_row()
         if total <= 1:
             frame_select_container.classes(add='hidden')
             return
@@ -741,6 +772,7 @@ def main_page():
         if ok:
             insert_input.set_value('')
             _refresh_result_cards()
+            _sync_insert_row()   # 插入后仍要留在原处（不靠右栏模式控制）
             _set_status(msg, 'ok')
             if ts is not None:
                 await _jump_to_ts(ts)

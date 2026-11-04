@@ -147,3 +147,32 @@ class TestSurvivesRedetect:
         state.add_history(V, (0, 0, 10, 10), [100.0, 200.0])
         state.add_history(V, (0, 0, 10, 10), [110.0, 210.0])
         assert state.get_record(V).get("manual_goals") == [300.0]
+
+
+# ==================== 回看时手动来源回填（切走再切回不丢徽章） ====================
+
+class TestManualSourceMarking:
+    """片段缓存只存 ts/path/idx 与 AI 分数，不存 source；切走再切回必须按
+    历史 manual_goals 回填，否则卡片丢「手动」徽章、✕ 撤销也失效。"""
+
+    def test_manual_ts_of(self, hist):
+        state.add_manual_goal(V, 300.5)
+        assert detection._manual_ts_of(V) == {300.5}
+
+    def test_manual_ts_of_no_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(state, "HISTORY_DIR", str(tmp_path / "h3"))
+        os.makedirs(state.HISTORY_DIR, exist_ok=True)
+        assert detection._manual_ts_of("Y:/nope.mp4") == set()
+
+    def test_mark_only_manual_clips(self, hist):
+        state.add_manual_goal(V, 300.5)
+        clips = [{"ts": 100.0}, {"ts": 200.0}, {"ts": 300.5}]
+        detection._mark_manual_sources(clips, V)
+        assert clips[0].get("source") is None
+        assert clips[1].get("source") is None
+        assert clips[2]["source"] == "manual"
+
+    def test_mark_is_noop_without_manual(self, hist):
+        clips = [{"ts": 100.0}]
+        detection._mark_manual_sources(clips, V)
+        assert "source" not in clips[0]

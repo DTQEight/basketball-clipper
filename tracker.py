@@ -48,6 +48,18 @@ STATIC_BALL_GAP_SEC = 2.0    # 超过该秒数没再出现 → 该位置记录�
 #   全局加「必须来自上方」会误伤横向/补篮类进筐；只在回声窗口内收紧最安全。
 ECHO_WINDOW_SEC = 5.0        # 进球后多久内要求「新球从上方来」的证据（网兜摆动 ≤4s）
 
+# ===== YOLO 否决的延迟确认 =====
+# 问题（2026.11.03-4th 584s / 1st 551s 实测）：球穿过筐口的那几帧恰好是检测最弱的时刻
+# （运动模糊 + 逆光 + 篮网遮挡），整帧@1280、抹黑@1280、裁剪@640、筐 ROI 放大
+# @1280/1536/1920 六个档位最高都只有 0.05~0.17（低于 ball_conf 0.2），而球落到筐下
+# 0.1~0.2 秒后立刻变得清晰（0.53~0.80）。原来「触发帧窗口内没球 → 立即否决」把这类
+# 轨迹直接丢掉。
+# 做法：触发时若 YOLO 无证据，先挂起候选（不落历史、不注册），此后 YOLO_DEFER_SEC 内
+# 只要出现球证据就承认该进球（时间戳仍用触发时刻）。超时仍未出现才丢弃。
+# 这不放宽 YOLO 的证据强度（仍然要求 ball_conf 以上的球框、仍走静止球过滤），
+# 只是把「检查时点」从单帧扩到 0.6s。
+YOLO_DEFER_SEC = 0.6
+
 # ===== 差分斑块的「球身份」先验：用 YOLO 球位置约束选哪一块斑块 =====
 # 由来：2026.10.23-1st 的 4分16秒 / 9分29秒 两个真进球漏检（逐帧归因见
 # cache/_miss_1023/repro.py + census.json，参数与线上完全一致：thr=23、yolo_step=2）。
@@ -241,8 +253,13 @@ class GoalDetector:
             "yolo_static_dropped": 0,  # 因「静止物体」被剔除的球证据条数
             "probe_called": 0,     # 备用档补检次数（两段式兜底）
             "probe_confirmed": 0,  # 备用档补检命中并救回判定的次数
+            "defer_pending": 0,    # YOLO 否决后挂起、等待后续球证据的次数
+            "defer_confirmed": 0,  # 延迟确认成功（挂起期间出现球证据）
+            "defer_expired": 0,    # 延迟确认超时（仍未出现球证据，丢弃）
             "baseline_updates": 0, # 滚动基准帧更新次数
         }
+        # 延迟确认中的候选（None=无）：{ts, deadline, source, strong}
+        self._defer_cand = None
 
     def _roi_gray(self, frame):
         """裁剪篮筐搜索区域 → 灰度 → 高斯模糊。
@@ -544,6 +561,23 @@ class GoalDetector:
                 self.blob_in_hoop_frames = 0
                 return None
 
+        # ===== YOLO 否决的延迟确认（见 YOLO_DEFER_SEC）=====
+        # 必须在找斑块之前处理：挂起期间只要历史里出现球证据就承认该进球
+        # （时间戳用触发时刻，不是确认时刻），超时才丢弃。
+        if self._defer_cand is not None:
+            _dc = self._defer_cand
+            if self._has_ball_in_goal_cylinder():
+                self._defer_cand = None
+                self.diag["defer_confirmed"] += 1
+                self.blob_in_hoop_frames = 0
+                self.last_in_hoop_frame = -999
+                if self._register_goal(_dc["ts"], frame_idx, fps, _dc["source"],
+                                       strong=_dc["strong"]):
+                    return _dc["ts"]
+            elif frame_idx > _dc["deadline"]:
+                self._defer_cand = None
+                self.diag["defer_expired"] += 1
+
         # 在篮筐周边找运动斑块（有球证据时优先取球附近那块，否则退回最大）
         blob = self._find_moving_blob(frame_roi, ball_hint=_hint_balls)
 
@@ -670,6 +704,9 @@ class GoalDetector:
                             return ts
                     else:
                         self.diag["yolo_rejected"] += 1
+                        # 不立即否决：球过筐瞬间常检不出、0.1~0.5s 后才清晰
+                        # （见 YOLO_DEFER_SEC），先挂起等后续球证据
+                        self._defer_yolo_reject(frame_idx / fps, frame_idx, fps, "loose")
                         self.blob_in_hoop_frames = 0
                         return None
 
@@ -696,6 +733,8 @@ class GoalDetector:
                         yolo_ok, yolo_status = self._check_yolo_near_hoop()
                         if not yolo_ok:
                             self.diag["yolo_rejected"] += 1
+                            # 延迟确认：挂起后等 0.6s 内的球证据（见 YOLO_DEFER_SEC）
+                            self._defer_yolo_reject(frame_idx / fps, frame_idx, fps, "visual")
                         else:
                             if yolo_status == "confirmed":
                                 self.diag["yolo_confirmed"] += 1
@@ -727,6 +766,8 @@ class GoalDetector:
                     yolo_ok, yolo_status = self._check_yolo_near_hoop()
                     if not yolo_ok:
                         self.diag["yolo_rejected"] += 1
+                        # 延迟确认：挂起后等 0.6s 内的球证据（见 YOLO_DEFER_SEC）
+                        self._defer_yolo_reject(frame_idx / fps, frame_idx, fps, "side")
                     else:
                         if yolo_status == "confirmed":
                             self.diag["yolo_confirmed"] += 1
@@ -805,6 +846,8 @@ class GoalDetector:
         self.last_goal_frame = frame_idx
         self._echo_armed = bool(strong)
         self.blob_history.clear()
+        # 常规路径已注册 → 清掉挂起候选，避免同一轨迹被延迟确认重复注册
+        self._defer_cand = None
         if source == "loose":
             self.diag["loose_goal"] += 1  # 独立计数器（旧实现复用 side_goal，两条路径混在一起无法排查）
         return True
@@ -914,6 +957,36 @@ class GoalDetector:
                 self.diag["probe_confirmed"] += 1
                 return True, "probe"
         return False, "rejected"
+
+    def _has_ball_in_goal_cylinder(self):
+        """历史中是否有「落在篮筐横向跨度内、且不低于筐口」的球证据。
+
+        延迟确认专用，刻意比 _check_yolo_near_hoop 的接受框严格得多：
+        实测（2026.11.03-4th）真进球 583.23s 的球心 (1342,496) 恰好落在筐宽内，
+        而同一条轨迹 2 秒后的误报 552.11s 球心 (1239,461) 在筐左 67px（筐宽 76px），
+        用「筐宽 ±0.6」的横向带就能把这类「筐下反弹球补确认」的误报挡掉。
+        纵向只要求不高于筐口（by >= hoop_top）：球已到筐内/筐下才可能是一次下穿。
+        """
+        cx = (self.hoop_x1 + self.hoop_x2) / 2
+        half = self.hoop_w * 0.6
+        return any(abs(bx - cx) <= half and by >= self.hoop_top
+                   for (_, bx, by) in self.ball_pos_history)
+
+    def _defer_yolo_reject(self, ts, frame_idx, fps, source):
+        """YOLO 本帧无证据时挂起候选，等待后续帧的球证据（见 YOLO_DEFER_SEC）。
+
+        强标记固定为 False：确认发生在本帧之后、靠延迟窗口匹配到的证据，
+        属于弱注册，不能武装网兜回声窗口。
+        """
+        if self._defer_cand is not None and frame_idx <= self._defer_cand["deadline"]:
+            return  # 已有更早的挂起候选，保留它
+        self._defer_cand = {
+            "ts": ts,
+            "deadline": frame_idx + int(YOLO_DEFER_SEC * fps),
+            "source": source,
+            "strong": False,
+        }
+        self.diag["defer_pending"] += 1
 
     def yolo_accept_box(self):
         """YOLO 证据的接受框 (x_lo, y_lo, x_hi, y_hi)，整帧坐标。

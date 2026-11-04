@@ -2318,6 +2318,9 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
         # 写入缓存并持久化
         if state.last_goal_clips:
             state.put_clip_cache(cache_key, state.last_goal_clips)
+    # 缓存/新生成都不带 source：按历史 manual_goals 回填，手动卡片才能显示
+    # 「手动」徽章并允许 ✕ 撤销
+    _mark_manual_sources(state.last_goal_clips, video_path)
     log.info(f"[LOAD] {os.path.basename(video_path)} | "
              f"cache={'HIT' if cache_hit else 'MISS'} | "
              f"clips={len(state.last_goal_clips)}/{len(all_goals)}")
@@ -2452,6 +2455,39 @@ def _on_load_history_impl(idx_choice, progress_callback, ai_backfill=True):
 
 
 # ============ 文件夹批量模式 ============
+
+def _manual_ts_of(video_path):
+    """该视频历史记录里「手动补录」的时间点集合（无记录/无手动返回空集）。"""
+    try:
+        rec = state.get_record(video_path)
+    except Exception:
+        return set()
+    out = set()
+    for t in ((rec or {}).get("manual_goals") or []):
+        try:
+            out.add(round(float(t), 3))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _mark_manual_sources(clips, video_path):
+    """把来自手动补录的片段打上 source="manual"。
+
+    片段缓存（load_clip_cache）只保留 ts/path/idx 与 AI 分数，不保留 source；
+    重新生成的片段同样没有 source。不按 manual_goals 回填的话，切走再切回后
+    这些卡片既没有「手动」徽章，也没法用 ✕ 撤销。
+    """
+    ts_set = _manual_ts_of(video_path)
+    if not ts_set:
+        return
+    for c in clips:
+        try:
+            if round(float(c.get("ts", -1)), 3) in ts_set:
+                c["source"] = "manual"
+        except (TypeError, ValueError):
+            continue
+
 
 def _restore_labels_to_clips(clips, video_path, keep_existing_manual=False):
     """把历史人工标签（kept=√ / deleted=× / persons=人物）回填到 clips。
@@ -2611,17 +2647,47 @@ def _on_batch_load_video_impl(selected, progress_callback):
     if snap and snap.get("clips"):
         state.last_goals.extend(snap["goals"])
         state.last_goal_clips.extend([dict(c) for c in snap["clips"]])
+        # 手动补录的进球不在快照里（快照只存检测当次的结果）→ 切走再切回会
+        # 「消失」。按历史 manual_goals 把缺失的补回来（预览片段就地生成）
+        _manual_missing = sorted(
+            t for t in _manual_ts_of(video_path)
+            if not any(abs(t - float(c.get("ts", -1))) <= state.MANUAL_DEDUPE_SEC
+                       for c in state.last_goal_clips))
+        if _manual_missing:
+            _made = {}
+            try:
+                for _c in _generate_preview_clips(
+                        video_path, _manual_missing, 0, info["total"],
+                        info["fps"], info["total"], int(time.time())):
+                    _made[round(float(_c["ts"]), 3)] = _c
+            except Exception as e:
+                log.warning(f"[BATCH LOAD] 手动进球预览生成失败: {e}")
+            for _t in _manual_missing:
+                _c = _made.get(_t) or {"ts": _t, "path": None}
+                _c["source"] = "manual"
+                state.last_goal_clips.append(_c)
+            state.last_goal_clips.sort(key=lambda c: float(c.get("ts", 0)))
+            for _i, _c in enumerate(state.last_goal_clips):
+                _c["idx"] = _i
+            state.last_goals.extend(_manual_missing)
+            state.last_goals.sort()
         # 与单视频历史加载对齐：回填历史 √/× 与人物分类。
         # 快照是检测刚完成时的原始 clips，不含跨会话的 kept/deleted/persons；
         # 只补人物会导致之前 × 误报的片段被当未标记展示/导出。
         # keep_existing_manual=True：保留快照上本会话流水线已打的人工标记
         _restored_kept, _has_marks = _restore_labels_to_clips(
             state.last_goal_clips, video_path, keep_existing_manual=True)
+        _mark_manual_sources(state.last_goal_clips, video_path)
         state.kept_goal_indices = (_restored_kept if _has_marks
                                    else set(range(len(state.last_goal_clips))))
+        # 快照同步：流水线快照模式（_cards_clips）与单视频共用同一份结果，
+        # 否则补录的球在快照视图里仍然看不见
+        if _manual_missing:
+            snap["goals"] = list(state.last_goals)
+            snap["clips"] = [dict(c) for c in state.last_goal_clips]
         status = (f"已加载: {os.path.basename(video_path)}\n"
                   f"{'已标定' if video_path in state.batch_calibs else '未标定'}\n"
-                  f"进球: {len(snap['goals'])} 个（含人工删减）\n"
+                  f"进球: {len(state.last_goals)} 个（含人工删减/补录）\n"
                   f"复用 {len(state.last_goal_clips)} 个预览片段")
         return preview, info_str, status
 
@@ -2664,6 +2730,8 @@ def _on_batch_load_video_impl(selected, progress_callback):
             state.last_goal_clips, video_path)
         state.kept_goal_indices = (_restored_kept if _has_marks
                                    else set(range(len(state.last_goal_clips))))
+        # 手动补录的片段也走同一套回填（缓存/新生成都不带 source）
+        _mark_manual_sources(state.last_goal_clips, video_path)
 
         # ===== AI 复核：批量回看同样要补分数 / 按当前阈值重推 auto =====
         # 批量识别本身走 run_detect，已在检测时就打过复核；但这条路是「重开
