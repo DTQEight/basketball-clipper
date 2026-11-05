@@ -284,8 +284,14 @@ def main_page():
       .app-pane { min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-canvas); }
       .app-pane.center { background: #0d1117; border-left: 1px solid var(--border-subtle); border-right: 1px solid var(--border-subtle); }
       .app-pane-head { flex: 0 0 auto; padding: 12px 14px 10px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); }
-      .clip-row { transition: background 0.12s ease; }
+      .clip-row { position: relative; transition: background 0.12s ease; }
       .clip-row:hover { background: var(--bg-elevated) !important; }
+      /* 整行点击层：覆盖缩略图/时间码/空白区，统一触发预览；交互按钮用 z-index 2 抬到点击层之上 */
+      .clip-row .row-hit { position: absolute; inset: 0; z-index: 1; cursor: pointer; border-radius: 8px; }
+      .clip-row .row-actions { position: relative; z-index: 2; }
+      .clip-play { position: absolute; inset: 0; display: grid; place-items: center; font-size: 13px;
+        color: #fff; background: rgba(0, 0, 0, 0.38); opacity: 0; transition: opacity 0.12s; pointer-events: none; }
+      .clip-row:hover .clip-play { opacity: 1; }
       .app-footer { flex: 0 0 46px; height: 46px; display: flex; align-items: center; gap: 10px; padding: 0 16px; background: var(--bg-surface); border-top: 1px solid var(--border-subtle); }
       .params-drawer { position: fixed; right: 0; top: 56px; bottom: 46px; width: 344px; background: var(--bg-surface); border-left: 1px solid var(--border-strong); transform: translateX(102%); transition: transform 0.22s ease; display: flex; flex-direction: column; z-index: 20; box-shadow: -20px 0 40px rgba(0, 0, 0, 0.4); }
       .params-drawer.open { transform: translateX(0); }
@@ -2148,8 +2154,11 @@ def main_page():
                 # 行式布局（原型约 40px）：46×26 缩略图 + 时间码 + 徽章 + 人物 + ✓/✕
                 _card = ui.row().classes(
                     'clip-row w-full items-center gap-2 cursor-pointer').style(
-                    _card_style(mark, i == _sel))
+                    _card_style(mark, i == _sel)).tooltip('点击预览该球')
                 with _card:
+                    # 整行点击层：点缩略图、时间码、徽章区或空白都触发预览（见 .clip-row .row-hit）
+                    ui.element('div').classes('row-hit').on(
+                        'click', lambda e, idx=i: _on_preview_clip(idx))
                     _thumb = ui.element('div').style(
                         'width: 46px; height: 26px; border-radius: 5px; flex: 0 0 46px; '
                         'overflow: hidden; position: relative; cursor: pointer; '
@@ -2157,9 +2166,10 @@ def main_page():
                         'border: 1px solid var(--border-subtle);')
                     _thumb.on('click', lambda e, idx=i: _on_preview_clip(idx))
                     with _thumb:
+                        ui.label('▶').classes('clip-play')
                         ui.label(f'{i + 1}').classes('text-[8px] font-mono').style(
                             'position: absolute; right: 3px; bottom: 1px; '
-                            'color: #fff; opacity: 0.75;')
+                            'color: #fff; opacity: 0.75; z-index: 2;')
                     with ui.column().classes('min-w-0 flex-1 gap-0'):
                         _tlabel = ui.label(_fmt_ts(ts)).classes(
                             'text-[12.5px] font-bold font-mono').style(
@@ -2178,8 +2188,9 @@ def main_page():
                                 f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
                                 f'background: {_pc[1] if _pc else "transparent"}; '
                                 'max-width: 82px; overflow: hidden; '
-                                'text-overflow: ellipsis; white-space: nowrap;')
-                with ui.row().classes('items-center gap-1 shrink-0'):
+                                'text-overflow: ellipsis; white-space: nowrap; '
+                                'position: relative; z-index: 2;')
+                with ui.row().classes('items-center gap-1 shrink-0 row-actions'):
                     _keep_btn = ui.button(
                         '✓', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')
                     ).props('flat dense no-caps').classes('text-[11px]').style(
