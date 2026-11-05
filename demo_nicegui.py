@@ -23,6 +23,8 @@ import os
 import re
 import sys
 import time
+import base64
+import hashlib
 import asyncio
 from pathlib import Path
 
@@ -88,6 +90,78 @@ def _person_color_map(clips):
     names = sorted({c.get("person") for c in (clips or []) if c.get("person")})
     return {n: _PERSON_PALETTE[i % len(_PERSON_PALETTE)]
             for i, n in enumerate(names)}
+
+
+# ============ 片段缩略图（磁盘缓存）============
+# 缩略图取片段中间帧（进球瞬间就在片段中点），生成一次落盘复用：
+# 解码一个 3s 片段约 0.5~0.8s（40 个片段同步解会把列表卡住数秒），
+# 故列表先渲染占位、再由页面 timer 逐个后台填充；命中缓存则立即显示。
+_THUMB_DIR = os.path.join(state.CACHE_ROOT, "thumbs")
+_THUMB_W, _THUMB_H = 96, 54   # 行内 46×26 的 2x，兼顾高分屏清晰度与体积
+# 1×1 透明 GIF：占位期间不显示浏览器的「图片损坏」图标
+_BLANK_IMG = ('data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAE'
+              'AAAIBRAA7')
+
+
+def _thumb_cache_path(clip_path):
+    """按「绝对路径 + mtime + 大小」派生缓存文件名（片段重切后自动失效）。"""
+    try:
+        st = os.stat(clip_path)
+        key = f'{os.path.abspath(clip_path)}|{st.st_mtime_ns}|{st.st_size}'
+    except OSError:
+        return None
+    h = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(_THUMB_DIR, h + '.jpg')
+
+
+def _thumb_uri(clip_path):
+    """读缓存并转 data URI；未命中返回 None（不触发解码）。"""
+    fp = _thumb_cache_path(clip_path)
+    if not fp or not os.path.exists(fp):
+        return None
+    try:
+        with open(fp, 'rb') as f:
+            return 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode()
+    except OSError:
+        return None
+
+
+def _thumb_for(clip_path):
+    """取缩略图 data URI，未缓存则解码片段中点帧并落盘（阻塞，调用方放 io_bound）。"""
+    uri = _thumb_uri(clip_path)
+    if uri:
+        return uri
+    import cv2
+    cap = cv2.VideoCapture(clip_path)
+    try:
+        if not cap.isOpened():
+            return None
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, n // 2))
+        ok, frame = cap.read()
+        if not ok:  # 中部不可解时退回首帧
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        frame = cv2.resize(frame, (_THUMB_W, _THUMB_H))
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+        if not ok:
+            return None
+    finally:
+        cap.release()
+    uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
+    fp = _thumb_cache_path(clip_path)
+    if fp:
+        try:
+            os.makedirs(_THUMB_DIR, exist_ok=True)
+            tmp = fp + '.tmp'
+            with open(tmp, 'wb') as f:
+                f.write(buf.tobytes())
+            os.replace(tmp, fp)  # 原子落盘：多标签页并发写同一片段也不会读到半截文件
+        except OSError:
+            pass
+    return uri
 
 
 # ============ YOLO/CUDA 启动自检 ============
@@ -1663,6 +1737,9 @@ def main_page():
     # 浏览器只在 mousedown/mouseup 落在同一元素上才触发 click —— 这几百毫秒里的
     # 点击会真丢。改为：标记只更新那一张卡片的 3 个元素 + 顶部统计行（约 6 个元素）。
     _card_widgets = {}          # idx -> {'card': 行元素, 'keep': btn, 'rej': btn}
+    # 缩略图后台填充队列：重建列表时收集「无缓存缩略图」的行，
+    # 由页面级 timer 每 tick 解码一张（每次重建都会重置队列，避免堆积旧元素）
+    _thumb_pending = []
 
     def _cards_clips():
         """当前卡片列表的数据源（与 _refresh_result_cards 同一规则：快照优先）。"""
@@ -2095,6 +2172,7 @@ def main_page():
         """
         result_container.clear()
         _card_widgets.clear()  # 方案A：局部更新注册表随整列表一起重建
+        _thumb_pending.clear()  # 旧元素随列表一起销毁，不再补图
         vp = _cards_video["path"]
         clips = _cards_clips()
         if not clips:
@@ -2165,11 +2243,17 @@ def main_page():
                         'background: linear-gradient(160deg, #243043, #141b26); '
                         'border: 1px solid var(--border-subtle);')
                     _thumb.on('click', lambda e, idx=i: _on_preview_clip(idx))
+                    _cpath = clip.get("path")
+                    _curi = _thumb_uri(_cpath) if _cpath else None
                     with _thumb:
+                        _thumb_img = ui.image(_curi or _BLANK_IMG).props('fit=cover').style(
+                            'width: 100%; height: 100%; display: block;')
                         ui.label('▶').classes('clip-play')
                         ui.label(f'{i + 1}').classes('text-[8px] font-mono').style(
                             'position: absolute; right: 3px; bottom: 1px; '
                             'color: #fff; opacity: 0.75; z-index: 2;')
+                    if _cpath and not _curi:
+                        _thumb_pending.append((_thumb_img, _cpath))
                     with ui.column().classes('min-w-0 flex-1 gap-0'):
                         _tlabel = ui.label(_fmt_ts(ts)).classes(
                             'text-[12.5px] font-bold font-mono').style(
@@ -2760,6 +2844,28 @@ def main_page():
         except Exception:
             pass
 
+    async def _fill_thumb_tick():
+        """每 tick 补 2 张片段缩略图：解码放 io_bound，命中磁盘缓存则近乎无耗时。"""
+        if not _thumb_pending:
+            return
+        batch = _thumb_pending[:2]
+        del _thumb_pending[:2]
+        from nicegui import run
+
+        async def _one(el, path):
+            try:
+                uri = await run.io_bound(_thumb_for, path)
+            except Exception:
+                uri = None
+            if uri:
+                try:
+                    el.set_source(uri)
+                except Exception:
+                    pass  # 行已被下一次重建移除
+
+        await asyncio.gather(*(_one(el, path) for el, path in batch))
+
+    ui.timer(0.3, _fill_thumb_tick)
     ui.timer(0.4, _sync_live_ui)
 
     # 页面初始化：不自动加载历史列表（空白初始状态），点「刷新」才加载
