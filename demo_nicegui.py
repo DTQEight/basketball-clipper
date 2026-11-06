@@ -509,6 +509,14 @@ def main_page():
                         ui.label('进球').classes('text-sm font-bold').style('color: var(--text-primary)')
                         list_count_label = ui.label('共 0 · 已标 0').classes('text-[11.5px]').style(
                             'color: var(--text-tertiary)')
+                    # 批量/多节切换：识别进行中也能切到已完成视频的快照审核
+                    # （快照模式只读该视频结果，不占用全局结果集，故不受任务锁限制；
+                    # 旧 UI 的视频列表在主面板常驻，重构后挪进了参数抽屉，
+                    # 这里补一个常驻入口）
+                    batch_switch = ui.select(options={}, value=None).props(
+                        'dense outlined dark').classes('w-full text-xs')
+                    batch_switch.on_value_change(lambda e: _on_batch_select_change(e))
+                    batch_switch.visible = False
                     with ui.row().classes('w-full items-center gap-1 flex-wrap'):
                         chip_all = ui.button('全部', on_click=lambda: _set_filter('all')).props(
                             'flat dense no-caps').style(_chip_style(True))
@@ -1151,8 +1159,11 @@ def main_page():
 
         # 用 dict（值->标签）作为 options：dict 时 select 的值才是纯路径字符串；
         # 若用 [(值,标签)] 列表，NiceGUI 会把整个元组当值，导致加载失败
-        batch_select.set_options({f: _label(f) for f in state.batch_files},
-                                 value=cur_val)
+        _opts = {f: _label(f) for f in state.batch_files}
+        batch_select.set_options(_opts, value=cur_val)
+        # 左栏常驻切换框同步（识别中审核另一节走这里，见建页处注释）
+        batch_switch.set_options(_opts, value=cur_val)
+        batch_switch.visible = True
         # 单节勾选：路径被移出目录后清掉残留，与 batch_files 保持一致
         state.batch_selected &= set(state.batch_files)
         batch_checks.clear()
@@ -1164,6 +1175,19 @@ def main_page():
         batch_check_hint.set_text(_batch_check_hint_text())
 
     _batch_loading = False  # 防重入（set_value 可能触发 change 事件）
+    _batch_sel_sync = {"on": False}  # 两处下拉互写时的回环保护
+
+    def _sync_batch_sel(path):
+        """同步左栏常驻下拉与参数抽屉下拉的选中值（只在值不同时写，防回环）。"""
+        if not path or _batch_sel_sync["on"]:
+            return
+        _batch_sel_sync["on"] = True
+        try:
+            for _sel in (batch_select, batch_switch):
+                if _sel.value != path:
+                    _sel.set_value(path)
+        finally:
+            _batch_sel_sync["on"] = False
 
     # 当前结果卡片显示的视频：None=全局模式（单视频/批量最后结果）
     # 非空=批量快照模式（流水线：后台检测继续跑，前台确认该视频的快照结果）
@@ -1189,7 +1213,7 @@ def main_page():
         # 点已完成视频 → 只切换卡片到该视频快照（纯展示，不动全局 state/标定，不打断后台检测）
         if state.current_task() == 'batch':
             if path and path in state.batch_results:
-                batch_select.set_value(path)
+                _sync_batch_sel(path)
                 _cards_video["path"] = path
                 _refresh_result_cards()
                 _set_status(f'查看: {os.path.basename(path)} | '
@@ -1206,8 +1230,7 @@ def main_page():
             return
         if path == state.batch_current_video:
             # 已是当前视频：仅同步下拉框显示，避免重复加载
-            if batch_select.value != path:
-                batch_select.set_value(path)
+            _sync_batch_sel(path)
             return
         _batch_loading = True
         _cards_video["path"] = None  # 常规加载走全局 state，卡片回到全局模式
@@ -1216,7 +1239,7 @@ def main_page():
             _batch_loading = False
             return
         try:
-            batch_select.set_value(path)
+            _sync_batch_sel(path)
             # 若该视频已有检测结果，生成预览片段可能耗时（缓存未命中时 ~40s/50球），
             # 用 io_bound 避免阻塞 UI；同时切到进度面板给出可见反馈（旧实现
             # 进度写在隐藏容器里，界面静止像卡死）
@@ -1444,6 +1467,15 @@ def main_page():
 
     # 下拉框选择视频后立即加载（无需再点「加载」按钮），直接用事件携带的新值
     async def _on_batch_select_change(e):
+        # 左栏常驻下拉 / 参数抽屉下拉互相同步（只写「另一个」，避免自己触发自己）
+        if e.value and not _batch_sel_sync["on"]:
+            _batch_sel_sync["on"] = True
+            try:
+                _other = batch_switch if e.sender is batch_select else batch_select
+                if _other.value != e.value:
+                    _other.set_value(e.value)
+            finally:
+                _batch_sel_sync["on"] = False
         await _on_batch_load_video(e.value)
     batch_select.on_value_change(_on_batch_select_change)
 
