@@ -238,7 +238,8 @@ def _compute_features(detections, net_pre, net_post, hoop, video_w, video_h, fps
     return f
 
 
-def extract(model, ball_classes, device, events, log_every=20, on_row=None):
+def extract(model, ball_classes, device, events, log_every=20, on_row=None,
+            cancel_check=None):
     """events: dataset 记录列表。返回 (features_list, errors)。
 
     on_row(feats): 可选回调，每个事件产出后**立即**调用一次。全量跑要 5~6 小时，
@@ -272,6 +273,10 @@ def extract(model, ball_classes, device, events, log_every=20, on_row=None):
         total = reader.total
         try:
             for ev in evs:
+                # 取消钩子：逐帧 YOLO 是复核里最长的一段，服务端点「取消」要能
+                # 在秒级生效（按事件粒度检查；单个 ±1.5s 窗口只跑几十帧）
+                if cancel_check and cancel_check():
+                    return out, errors
                 ts = float(ev["ts"])
                 hoop = ev.get("hoop")
                 if not hoop:

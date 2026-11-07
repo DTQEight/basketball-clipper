@@ -431,19 +431,49 @@ def reject_threshold() -> float:
 
 # ===== AI 复核总开关（UI「AI 识别」）=====
 # 关闭后不再跑四臂打分：检测更快、不产生任何 auto / auto_reject 标记，
-# 所有候选都留给人工判定。仅进程内生效，重启恢复默认开启（与其余 UI 开关一致）。
+# 所有候选都留给人工判定。
+# 落盘到 cache/ui_settings.json：旧实现只存在进程内存，重启服务即恢复「开启」，
+# 用户关掉后重启会莫名其妙又跑一遍复核（十分钟级）——这是实测踩过的坑。
 _ENABLED = True
+_ENABLED_LOADED = False
+_UI_SETTINGS = os.path.join(CACHE_ROOT, "ui_settings.json")
+
+
+def _load_enabled() -> None:
+    """首次访问时从磁盘恢复开关（惰性加载，避免 CACHE_ROOT 尚未就绪时读文件）。"""
+    global _ENABLED, _ENABLED_LOADED
+    if _ENABLED_LOADED:
+        return
+    _ENABLED_LOADED = True
+    try:
+        with open(_UI_SETTINGS, "r", encoding="utf-8") as f:
+            _ENABLED = bool(json.load(f).get("ai_verify", True))
+    except Exception:
+        pass
 
 
 def set_enabled(on: bool) -> None:
-    """设置是否启用 AI 复核（四臂集成）。"""
-    global _ENABLED
+    """设置是否启用 AI 复核（四臂集成），并持久化到 ui_settings.json。"""
+    global _ENABLED, _ENABLED_LOADED
     _ENABLED = bool(on)
+    _ENABLED_LOADED = True
+    try:
+        data = {}
+        if os.path.exists(_UI_SETTINGS):
+            with open(_UI_SETTINGS, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        data["ai_verify"] = _ENABLED
+        os.makedirs(os.path.dirname(_UI_SETTINGS), exist_ok=True)
+        with open(_UI_SETTINGS, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _log.warning("goal_verifier: 保存 AI 复核开关失败（仅本次生效）: %s", e)
     _log.info("goal_verifier: AI 复核已%s", "开启" if _ENABLED else "关闭")
 
 
 def is_enabled() -> bool:
-    """当前是否启用 AI 复核。"""
+    """当前是否启用 AI 复核（首次调用时从磁盘恢复上次的选择）。"""
+    _load_enabled()
     return _ENABLED
 
 
@@ -654,7 +684,7 @@ def _flow_maps(frames):
     return np.repeat(mags[..., None], 3, axis=-1)
 
 
-def _score_visual(video_path, clips, hoop, on_progress=None):
+def _score_visual(video_path, clips, hoop, on_progress=None, cancel_check=None):
     """B/Flow/VM 三臂打分（共享同一批 16 帧筐心块解码）。
 
     就地写 clip['score_b'] / clip['score_flow'] / clip['score_vm']（float 0~1）。
@@ -710,6 +740,10 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
         reader = VideoReader(video_path, single_thread=True)
         fps, total = reader.fps, reader.total
         for k, c in enumerate(todo):
+            if _cancelled(cancel_check):
+                _log.info("goal_verifier: [B/Flow/VM] 抽帧阶段检测到取消（%d/%d），提前结束",
+                          k, len(todo))
+                return
             ts = float(c["ts"])
             frames = np.zeros((n_frames, 224, 224, 3), dtype=np.uint8)
             # offsets 单调递增 → 顺序解码到最后一帧（同 extract_frames_b.main）
@@ -751,6 +785,10 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
     try:
         n_chunks = (len(blocks) + 3) // 4
         for i in range(0, len(blocks), 4):
+            if _cancelled(cancel_check):
+                _log.info("goal_verifier: [B/Flow/VM] 推理阶段检测到取消（%d/%d），提前结束",
+                          i, len(blocks))
+                return
             chunk = blocks[i:i + 4]
             bn = i // 4 + 1
             if on_progress:
@@ -833,7 +871,7 @@ def _score_visual(video_path, clips, hoop, on_progress=None):
                   (len(blocks) + 3) // 4, len(blocks))
 
 
-def _score_lgbm(video_path, clips, hoop, on_progress=None):
+def _score_lgbm(video_path, clips, hoop, on_progress=None, cancel_check=None):
     """A 臂打分：±1.5s 密集 YOLO 复检提手工特征 → LGBM。就地写 clip['score_lgbm']。
 
     分批调用 extract()（每批 A_BATCH 个候选）：单批耗时长（逐帧 YOLO），
@@ -867,6 +905,10 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None):
     tb = time.time()
     _log.info("goal_verifier: [A 臂] 开始提特征：%d 个候选 / %d 批", len(todo), nb)
     for s in range(0, len(todo), A_BATCH):
+        if _cancelled(cancel_check):
+            _log.info("goal_verifier: [A 臂] 检测到取消，提前结束（已完成 %d 个候选）",
+                      n_done)
+            return
         chunk = todo[s:s + A_BATCH]
         _log.info("goal_verifier: [A 臂] 批 %d/%d（%d 个候选）YOLO 逐帧提特征…",
                   s // A_BATCH + 1, nb, len(chunk))
@@ -881,7 +923,8 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None):
             })
             clip_by_eid[eid] = c
         try:
-            feats, errors = extract(m, ball_classes, device, events)
+            feats, errors = extract(m, ball_classes, device, events,
+                                    cancel_check=cancel_check)
         except Exception as e:
             # N13：单批提特征失败只跳过**这一批**。旧实现 break 会放弃其后全部
             # 候选的 A 臂打分——部分片段缺 A 臂而其余有，跨候选分数不可比
@@ -924,11 +967,25 @@ def combine(clip) -> float | None:
     return sum(w * v for w, v in avail) / wsum
 
 
-def score_clips(video_path, clips, hoop, progress=None):
+def _cancelled(cancel_check) -> bool:
+    """取消钩子：cancel_check 为 None 时永不取消（批量/命令行调用不受影响）。"""
+    if not cancel_check:
+        return False
+    try:
+        return bool(cancel_check())
+    except Exception:
+        return False
+
+
+def score_clips(video_path, clips, hoop, progress=None, cancel_check=None):
     """给 clips 跑四臂打分，就地写各臂分与集成分。返回打分成功的片段数。
 
     progress: 可选回调 progress(frac: float, stage: str)，供 UI 显示长耗时的复核进度。
     A 臂独占前 70%（逐帧 YOLO 是绝对瓶颈），视觉三臂占后 30%。
+    cancel_check: 可选取消钩子。复核是最长的一段（A 臂逐帧 YOLO 数分钟），
+    旧实现只在复核结束后才看 state.cancel_event，用户点「取消」要等整段跑完
+    才生效；这里按「每批候选 / 每片段抽帧 / 每批推理」检查，取消后立即返回
+    已打过的部分分数，主流程照常走「取消于收尾阶段保留检测结果」的分支。
     """
     if not clips or not hoop:
         return 0
@@ -944,10 +1001,15 @@ def score_clips(video_path, clips, hoop, progress=None):
     # 心跳：日志停在哪一条，就说明卡在哪一臂（服务卡死时唯一现场）
     _log.info("goal_verifier: [复核开始] %s —— %d 个候选", video_path, len(clips))
     t0 = time.time()
-    _score_lgbm(video_path, clips, hoop, on_progress=_p_a)
+    _score_lgbm(video_path, clips, hoop, on_progress=_p_a,
+                cancel_check=cancel_check)
+    if _cancelled(cancel_check):
+        _log.info("goal_verifier: [复核取消] A 臂阶段被取消（已跳过视觉三臂）")
+        return 0
     _log.info("goal_verifier: [复核] A 臂结束（%.1fs），进入视觉三臂",
               time.time() - t0)
-    _score_visual(video_path, clips, hoop, on_progress=_p_v)
+    _score_visual(video_path, clips, hoop, on_progress=_p_v,
+                  cancel_check=cancel_check)
     _log.info("goal_verifier: [复核] 视觉三臂结束（%.1fs），开始融合",
               time.time() - t0)
     # 打分完成后才取指纹：ENS_WEIGHTS 是 _load_temporal 里读进来的
@@ -965,19 +1027,20 @@ def score_clips(video_path, clips, hoop, progress=None):
     return n
 
 
-def mark_auto(clips, video_path, hoop, progress=None):
+def mark_auto(clips, video_path, hoop, progress=None, cancel_check=None):
     """给 clips 打上 auto 标记（就地修改）。返回自动通过的数量。
 
     clip 需含 "ts"；会新增 verify_score / auto（及各臂分供排查）。
     progress: 可选进度回调（见 score_clips）。
     **只标记，不删除候选**；任何异常都不抛出——打分是增强功能，失败必须静默降级。
     """
-    if not clips or not _ENABLED:
+    if not clips or not is_enabled():
         # 关闭「AI 识别」时兜底：调用方已判过开关，这里再判一次，
         # 避免将来新增调用点漏判而白跑一遍四臂推理
         return 0
     try:
-        n_scored = score_clips(video_path, clips, hoop, progress=progress)
+        n_scored = score_clips(video_path, clips, hoop, progress=progress,
+                               cancel_check=cancel_check)
         if not n_scored:
             return 0
         return refresh_auto(clips)
