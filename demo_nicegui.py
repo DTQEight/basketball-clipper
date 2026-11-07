@@ -23,8 +23,6 @@ import os
 import re
 import sys
 import time
-import base64
-import hashlib
 import asyncio
 from pathlib import Path
 
@@ -41,7 +39,8 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from nicegui import ui, app
 
-from services import state, detection, video_utils, goal_verifier
+from services import state, detection, video_utils, goal_verifier, thumbnails
+from ui import theme
 
 # 主按钮启动时刻（模块级，跨页面连接/刷新共享）：
 # 用于 1s 双击去抖——启动后 1s 内再次点击"开始识别/批量识别"是双击误触，
@@ -93,75 +92,11 @@ def _person_color_map(clips):
 
 
 # ============ 片段缩略图（磁盘缓存）============
-# 缩略图取片段中间帧（进球瞬间就在片段中点），生成一次落盘复用：
-# 解码一个 3s 片段约 0.5~0.8s（40 个片段同步解会把列表卡住数秒），
-# 故列表先渲染占位、再由页面 timer 逐个后台填充；命中缓存则立即显示。
-_THUMB_DIR = os.path.join(state.CACHE_ROOT, "thumbs")
-_THUMB_W, _THUMB_H = 96, 54   # 行内 46×26 的 2x，兼顾高分屏清晰度与体积
-# 1×1 透明 GIF：占位期间不显示浏览器的「图片损坏」图标
-_BLANK_IMG = ('data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAE'
-              'AAAIBRAA7')
-
-
-def _thumb_cache_path(clip_path):
-    """按「绝对路径 + mtime + 大小」派生缓存文件名（片段重切后自动失效）。"""
-    try:
-        st = os.stat(clip_path)
-        key = f'{os.path.abspath(clip_path)}|{st.st_mtime_ns}|{st.st_size}'
-    except OSError:
-        return None
-    h = hashlib.md5(key.encode('utf-8')).hexdigest()
-    return os.path.join(_THUMB_DIR, h + '.jpg')
-
-
-def _thumb_uri(clip_path):
-    """读缓存并转 data URI；未命中返回 None（不触发解码）。"""
-    fp = _thumb_cache_path(clip_path)
-    if not fp or not os.path.exists(fp):
-        return None
-    try:
-        with open(fp, 'rb') as f:
-            return 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode()
-    except OSError:
-        return None
-
-
-def _thumb_for(clip_path):
-    """取缩略图 data URI，未缓存则解码片段中点帧并落盘（阻塞，调用方放 io_bound）。"""
-    uri = _thumb_uri(clip_path)
-    if uri:
-        return uri
-    import cv2
-    cap = cv2.VideoCapture(clip_path)
-    try:
-        if not cap.isOpened():
-            return None
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, n // 2))
-        ok, frame = cap.read()
-        if not ok:  # 中部不可解时退回首帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = cap.read()
-        if not ok or frame is None:
-            return None
-        frame = cv2.resize(frame, (_THUMB_W, _THUMB_H))
-        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
-        if not ok:
-            return None
-    finally:
-        cap.release()
-    uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
-    fp = _thumb_cache_path(clip_path)
-    if fp:
-        try:
-            os.makedirs(_THUMB_DIR, exist_ok=True)
-            tmp = fp + '.tmp'
-            with open(tmp, 'wb') as f:
-                f.write(buf.tobytes())
-            os.replace(tmp, fp)  # 原子落盘：多标签页并发写同一片段也不会读到半截文件
-        except OSError:
-            pass
-    return uri
+# 实现在 services/thumbnails.py：检测切片阶段顺手生成（P1-4），UI 只读缓存。
+# 这里保留别名，避免页面代码大量改名。
+_BLANK_IMG = thumbnails.BLANK_IMG
+_thumb_uri = thumbnails.uri
+_thumb_for = thumbnails.ensure
 
 
 # ============ YOLO/CUDA 启动自检 ============
@@ -215,188 +150,14 @@ _yolo_selfcheck()
 
 # 品牌资产静态目录（顶栏图标 / favicon）
 app.add_static_files('/assets', str(ROOT / 'assets'))
+# 进程退出兜底（P0-2）：服务正常关闭时让检测线程先把断点写盘
+app.on_shutdown(lambda: state.flush_all("app-shutdown"))
 
 @ui.page('/')
 def main_page():
     ui.dark_mode().enable()
-    ui.add_head_html('''
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-    /* ============ Dark Tech Theme (v2 design-taste-frontend) ============ */
-    :root {
-      /* 背景层级（off-black, 非 pure black） */
-      --bg-canvas:   #0A0A0A;   /* 最底层 */
-      --bg-surface:  #141414;   /* 卡片层 */
-      --bg-elevated: #1F1F1F;   /* 悬浮层 */
-      --border-subtle: #2A2A2A; /* 低对比分隔 */
-      --border-strong: #3A3A3A; /* 强分隔 */
-      /* 文字层级 */
-      --text-primary:   #FAFAFA; /* off-white */
-      --text-secondary:  #A3A3A3; /* zinc-400 */
-      --text-tertiary:   #525252; /* zinc-600 */
-      /* 单一 accent: Electric Cyan (v2 推荐 Electric Blue 类) */
-      --accent:          #22D3EE;
-      --accent-hover:    #67E8F9;
-      --accent-muted:    rgba(34, 211, 238, 0.12);
-      /* 语义色（仅状态用，不破坏单 accent 锁定） */
-      --ok:    #22C55E;
-      --err:   #EF4444;
-      --busy:  #22D3EE;
-      /* 字体栈 */
-      --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-      --font-mono: 'Geist Mono', 'SF Mono', Menlo, monospace;
-    }
-    body {
-      background: var(--bg-canvas) !important;
-      margin: 0;
-      overflow: hidden;
-      font-family: var(--font-sans);
-      -webkit-font-smoothing: antialiased;
-      font-feature-settings: "tnum" 1, "ss01" 1;
-    }
-    .nicegui-content { max-width: 100% !important; padding: 0 !important; font-family: var(--font-sans); }
-
-    /* 数字 tabular-nums 对齐 */
-    .font-mono, [class*="font-mono"] { font-family: var(--font-mono) !important; font-variant-numeric: tabular-nums; }
-
-    /* ============ 滚动条（accent 主题化） ============ */
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(34, 211, 238, 0.25); border-radius: 3px; transition: background 0.2s; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(34, 211, 238, 0.5); }
-
-    /* ============ Quasar 组件覆盖 ============ */
-    .q-expansion-item__header { white-space: nowrap; }
-    /* 输入框聚焦 accent 边框 + 微发光 */
-    .q-field--outlined.q-field--focused .q-field__control {
-      border-color: var(--accent) !important;
-      box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.15);
-    }
-    .q-field--outlined.q-field--focused .q-field__label { color: var(--accent) !important; }
-
-    /* ============ 按钮交互态 ============ */
-    .q-btn { transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1); }
-    .q-btn:active { transform: scale(0.98); }
-    /* 透明 accent 描边按钮 hover */
-    .btn-accent-outline:hover {
-      background: var(--accent-muted);
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    /* ============ 进球卡片：左侧色条 + hover 上浮 ============ */
-    .result-card {
-      position: relative;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      border-left: 3px solid transparent !important;
-    }
-    .result-card:hover {
-      background: var(--bg-elevated) !important;
-      border-left-color: var(--accent) !important;
-      transform: translateY(-1px);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-    }
-    .result-card:active { transform: translateY(0); }
-
-    /* ============ 视频区边框 + 屏幕感 ============ */
-    .q-video, video {
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.5), 0 0 20px rgba(34, 211, 238, 0.04);
-    }
-
-    /* ============ 进度条 accent 渐变 ============ */
-    .q-linear-progress__track { background: rgba(34, 211, 238, 0.12) !important; }
-    .q-linear-progress__model {
-      background: linear-gradient(90deg, #0E7490 0%, #22D3EE 50%, #67E8F9 100%) !important;
-      box-shadow: 0 0 8px rgba(34, 211, 238, 0.4);
-    }
-
-    /* ============ 历史记录选中态 ============ */
-    .history-row {
-      transition: all 0.15s ease;
-    }
-    .history-row:hover { background: var(--bg-elevated); }
-    .history-row.selected {
-      border-color: var(--accent) !important;
-      background: var(--accent-muted);
-    }
-
-    /* ============ 背景噪点纹理（去 digital flatness） ============ */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='0.9'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
-      pointer-events: none;
-      z-index: 0;
-    }
-    /* 确保内容层在噪点层之上 */
-    .nicegui-content, .q-page, .q-layout { position: relative; z-index: 1; }
-
-    /* 减少动效偏好 */
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        transition-duration: 0.01ms !important;
-      }
-    }
-    </style>
-    ''')
-
-    # ====== 布局样式（原型：顶栏 56 / 三栏 / 底栏 46 / 参数抽屉）======
-    ui.add_head_html('''
-    <style>
-      /* 固定到视口：NiceGUI 页面容器自带内边距，单纯 height:100dvh 会出现底部留白 */
-      .app-shell { position: fixed; inset: 0; display: flex; flex-direction: column; width: 100%; height: 100dvh; overflow: hidden; background: var(--bg-canvas); z-index: 0; }
-      .app-shell .q-page, .app-shell > .nicegui-content { padding: 0 !important; }
-      .app-topbar { flex: 0 0 56px; height: 56px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: var(--bg-surface); border-bottom: 1px solid var(--border-subtle); }
-      /* ui.row 默认带 items-start，会让 grid 子项不拉伸、内容溢出到 footer；强制 stretch */
-      .app-workspace { flex: 1; min-height: 0; display: grid !important; align-items: stretch !important; grid-template-columns: 322px minmax(420px, 1fr) 292px; grid-template-rows: minmax(0, 1fr); }
-      .app-pane { min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-canvas); }
-      .app-pane.center { background: #0d1117; border-left: 1px solid var(--border-subtle); border-right: 1px solid var(--border-subtle); }
-      .app-pane-head { flex: 0 0 auto; padding: 12px 14px 10px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); }
-      .clip-row { position: relative; transition: background 0.12s ease; }
-      .clip-row:hover { background: var(--bg-elevated) !important; }
-      /* 整行点击层：覆盖缩略图/时间码/空白区，统一触发预览；交互按钮用 z-index 2 抬到点击层之上 */
-      .clip-row .row-hit { position: absolute; inset: 0; z-index: 1; cursor: pointer; border-radius: 8px; }
-      .clip-row .row-actions { position: relative; z-index: 2; }
-      .clip-play { position: absolute; inset: 0; display: grid; place-items: center; font-size: 13px;
-        color: #fff; background: rgba(0, 0, 0, 0.38); opacity: 0; transition: opacity 0.12s; pointer-events: none; }
-      .clip-row:hover .clip-play { opacity: 1; }
-      .app-footer { flex: 0 0 46px; height: 46px; display: flex; align-items: center; gap: 10px; padding: 0 16px; background: var(--bg-surface); border-top: 1px solid var(--border-subtle); }
-      .params-drawer { position: fixed; right: 0; top: 56px; bottom: 46px; width: 344px; background: var(--bg-surface); border-left: 1px solid var(--border-strong); transform: translateX(102%); transition: transform 0.22s ease; display: flex; flex-direction: column; z-index: 20; box-shadow: -20px 0 40px rgba(0, 0, 0, 0.4); }
-      .params-drawer.open { transform: translateX(0); }
-      .cfg-group { font-size: 11px; color: var(--text-tertiary); letter-spacing: 0.06em; text-transform: uppercase; margin-top: 4px; }
-      .cfg-group::after { content: ""; display: block; height: 1px; margin-top: 5px; background: var(--border-subtle); }
-      .cfg-hint { font-size: 10.5px; color: var(--text-tertiary); }
-      .insp-card { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 11px 12px; }
-      .meta-pill { font-size: 11.5px; color: var(--text-secondary); padding: 2px 8px; border-radius: 999px; background: var(--bg-elevated); border: 1px solid var(--border-subtle); }
-      .pending-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 5px 11px; border-radius: 999px; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); color: #f59e0b; }
-      .tab-bar { flex: 0 0 42px; height: 42px; display: flex; align-items: center; gap: 2px; padding: 0 12px; background: var(--bg-surface); border-bottom: 1px solid var(--border-subtle); }
-      .bar-track { height: 5px; border-radius: 3px; background: var(--bg-elevated); overflow: hidden; width: 100%; }
-      .bar-fill { display: block; height: 100%; border-radius: 3px; }
-      .kv-row { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; color: var(--text-secondary); border-bottom: 1px dashed rgba(255,255,255,0.06); }
-      .kv-row:last-child { border-bottom: none; }
-      .kv-row b { color: var(--text-primary); font-weight: 500; font-variant-numeric: tabular-nums; }
-      @media (max-width: 1180px) {
-        .app-workspace { grid-template-columns: 290px minmax(360px, 1fr) 264px; }
-      }
-      /* 窄窗口：收起检查器，避免三栏挤到不可访问（<1100px 时检查器隐藏，操作仍可在列表完成） */
-      @media (max-width: 1100px) {
-        .app-workspace { grid-template-columns: 300px minmax(0, 1fr); }
-        .app-pane.inspector { display: none; }
-        .app-topbar .meta-pill { display: none; }
-      }
-      @media (max-width: 860px) {
-        .app-topbar { gap: 8px; padding: 0 10px; }
-        .app-topbar .file-sub { display: none; }
-        .app-footer { gap: 6px; padding: 0 10px; }
-      }
-    </style>
-    ''')
+    # 主题 / 布局 / 响应式样式统一在 ui/theme.py（P0-1 拆分 + P1-7 本地字体）
+    ui.add_head_html(theme.HEAD_HTML)
 
     def _tab_style(active):
         if active:
@@ -422,6 +183,21 @@ def main_page():
     _stats_row_holder = {'row': None}
     _tabs = {}
     _drawer_state = {"open": False}
+    # 窄屏检查器浮层（P2-8）：≤1100px 时检查器从栅格改为滑入抽屉，
+    # 顶栏「详情」按钮控制开合，避免窄窗口下完全没有检查器入口。
+    _inspector_state = {"open": False, "el": None}
+    # AI 复核（独立后台任务）的按钮显隐状态
+    _verify_ui = {"running": False}
+
+    def _toggle_inspector(force=None):
+        el = _inspector_state["el"]
+        if el is None:
+            return
+        _inspector_state["open"] = (not _inspector_state["open"]) if force is None else bool(force)
+        if _inspector_state["open"]:
+            el.classes(add='open')
+        else:
+            el.classes(remove='open')
 
     with ui.column().classes('app-shell w-full p-0 gap-0'):
         # ====== YOLO 自检横幅（失败时醒目提示 + 确认重启） ======
@@ -491,6 +267,10 @@ def main_page():
             meta_res = ui.label('—').classes('meta-pill')
             meta_fps = ui.label('—').classes('meta-pill')
             ui.space()
+            ui.button('详情', on_click=lambda: _toggle_inspector()).props('flat dense no-caps').classes(
+                'text-[11.5px] shrink-0 inspector-toggle').style(
+                'color: var(--text-secondary); border: 1px solid var(--border-strong);').tooltip(
+                '窄屏：打开检查器浮层')
             pending_pill = ui.label('待审 0').classes('pending-pill')
             ui.button('历史', on_click=lambda: _open_history()).props('flat dense no-caps').classes(
                 'text-xs').style('color: var(--text-secondary); border: 1px solid var(--border-strong);')
@@ -499,6 +279,17 @@ def main_page():
                 'border: 1px solid var(--border-strong);')
             detect_btn = ui.button('开始识别', on_click=lambda: _on_detect()).props('dense no-caps').classes(
                 'text-xs font-bold').style('background: var(--accent); color: var(--bg-canvas); padding: 6px 14px;')
+            # AI 复核独立任务：仅在复核运行/排队时出现，取消只影响复核（P1-5）
+            verify_stop_btn = ui.button('取消复核', on_click=lambda: _on_cancel_verify()).props(
+                'flat dense no-caps').classes('text-xs hidden').style(
+                'color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.4);')
+
+        # ====== 错误横幅（P1-6：错误统一走横幅，状态栏只留简短进度）======
+        with ui.row().classes('app-banner w-full') as app_banner:
+            ui.icon('error', color='red-4').classes('text-sm flex-shrink-0')
+            banner_text = ui.label('').classes('banner-text')
+            ui.button('关闭', on_click=lambda: app_banner.classes(remove='show')).props(
+                'flat dense no-caps').classes('banner-close text-[11px]')
 
         # ====== 三栏主体 ======
         with ui.row().classes('app-workspace w-full'):
@@ -601,7 +392,8 @@ def main_page():
                             'text-[10.5px] font-mono shrink-0').style('color: var(--text-tertiary)')
 
             # ---------- 右：检查器 ----------
-            with ui.column().classes('app-pane inspector'):
+            with ui.column().classes('app-pane inspector') as _inspector_col:
+                _inspector_state["el"] = _inspector_col
                 with ui.row().classes('app-pane-head w-full items-baseline gap-2'):
                     ui.label('检查器').classes('text-sm font-bold').style('color: var(--text-primary)')
                     insp_tc_label = ui.label('—').classes('text-[11.5px] font-mono').style(
@@ -815,7 +607,11 @@ def main_page():
 
     # ====== 事件处理函数 ======
     def _set_status(text, kind='info'):
-        """设置结果状态文本并切换颜色（ok=绿 / err=红 / busy=青 / info=灰）。"""
+        """设置底栏状态文本并切换颜色（ok=绿 / err=红 / busy=青 / info=灰）。
+
+        P1-6 反馈分层：进度/结果留在状态栏，错误额外弹顶栏横幅（不会被后续
+        进度消息冲掉），操作成功的小确认走 toast（见 _toast）。
+        """
         result_status.set_text(text)
         _color_map = {
             'ok': 'var(--ok)',
@@ -823,6 +619,23 @@ def main_page():
             'busy': 'var(--busy)',
         }
         result_status.style(f'color: {_color_map.get(kind, "var(--text-secondary)")}')
+        if kind == 'err':
+            banner_text.set_text(text)
+            app_banner.classes(add='show')
+        elif kind in ('ok', 'info'):
+            app_banner.classes(remove='show')
+
+    def _toast(msg, kind='ok'):
+        """操作确认类反馈（打标/导出/复制等）：短 toast，不占状态栏。"""
+        _type = {'ok': 'positive', 'err': 'negative', 'busy': 'primary'}.get(kind, 'dark')
+        ui.notify(msg, type=_type, position='bottom-right', timeout=1600)
+
+    def _on_cancel_verify():
+        """取消独立 AI 复核：只置复核专用的取消标志，不影响检测/批量任务。"""
+        state.verify_cancel_event.set()
+        verify_stop_btn.set_text('正在取消...')
+        verify_stop_btn.disable()
+        _set_status('已请求取消 AI 复核（检测结果不受影响）', 'busy')
 
     # ========== 公共辅助：切换右侧视频区可见性（避免每处重复 4 行 classes 切换，也避免遗漏） ==========
     # 当前右栏显示的面板（页级）：timer 里的"后台任务进度自动接管"要先看它，
@@ -1062,7 +875,8 @@ def main_page():
             state.batch_files = files
             state.batch_calibs = {}
             state.batch_current_video = None
-            state.batch_results.clear()  # 清掉上一轮快照，防止新文件夹同名视频显示旧结果
+            # 清掉上一轮批量快照（不误伤单视频已加载的场次）
+            state.clear_batch_sessions()
             # 单节勾选：保留本会话里仍存在的勾选（重载同一目录不会被重置成全选）；
             # 首次加载 / 换了目录（交集为空）→ 默认全选
             state.batch_selected &= set(files)
@@ -1090,7 +904,7 @@ def main_page():
         state.batch_calibs = {}
         state.batch_current_video = None
         state.batch_selected = set()
-        state.batch_results.clear()
+        state.clear_batch_sessions()
         _cards_video["path"] = None  # 离开快照查看模式
         # 重要：state.last_goal_clips/last_goals/kept_goal_indices 的清空
         #       已下沉到 detection.load_video 业务层（切视频即清空），UI 层不再重复
@@ -2078,6 +1892,42 @@ def main_page():
             except Exception:
                 pass
 
+    def _render_timing_card():
+        """本场耗时构成（P1-6）：解帧/差分/YOLO 主循环、切片、AI 复核、落盘。"""
+        _p = _cards_video.get("path") or state.video_state.get("path")
+        sess = state.session_for(_p, create=False) if _p else None
+        if not sess:
+            return
+        t = sess.get("timing") or {}
+        rows = [("准备 / 断点恢复", t.get("prepare_sec")),
+                ("主循环（解码+差分+YOLO）", t.get("detect_sec")),
+                ("切片 + 缩略图", t.get("slice_sec")),
+                ("AI 复核", t.get("verify_sec")),
+                ("落盘", t.get("persist_sec"))]
+        with ui.column().classes('insp-card w-full gap-1'):
+            ui.label('本场耗时构成').classes('text-[11px] font-bold tracking-wider').style(
+                'color: var(--text-secondary)')
+            shown = False
+            for _name, _val in rows:
+                if not _val:
+                    continue
+                shown = True
+                with ui.row().classes('kv-row w-full'):
+                    ui.label(_name)
+                    ui.label(f'{_val:.0f}s').classes('font-mono').style('color: var(--text-primary)')
+            if not shown:
+                ui.label('本次尚未记录（旧历史或刚开始）').classes('cfg-hint')
+            _vs = sess.get("verify_state") or "idle"
+            _vmsg = sess.get("verify_msg") or ""
+            if _vs != "idle" or _vmsg:
+                _vname = {"queued": "复核排队中", "running": "复核进行中",
+                          "done": "复核完成", "cancelled": "复核已取消",
+                          "failed": "复核失败"}.get(_vs, "复核")
+                with ui.row().classes('kv-row w-full'):
+                    ui.label('AI 复核')
+                    ui.label(f'{_vname}{(" · " + _vmsg) if _vmsg else ""}').style(
+                        'color: var(--text-primary); font-size: 11px;')
+
     def _sync_inspector():
         """右栏检查器：当前片段判定 + 四臂分条形图（无分数则隐藏）+ 时间线。"""
         try:
@@ -2093,12 +1943,11 @@ def main_page():
             except Exception:
                 pass
             with inspector_body:
-                ui.label('未选中片段').classes(
-                    'text-[11.5px] text-center w-full py-6').style(
-                    'color: var(--text-tertiary)')
-                ui.label('点击左侧进球行查看判定与分数').classes(
-                    'text-[11px] text-center w-full').style(
-                    'color: var(--text-tertiary)')
+                with ui.column().classes('empty-state w-full'):
+                    ui.icon('touch_app').classes('text-2xl').style('color: var(--text-tertiary)')
+                    ui.label('未选中片段').classes('empty-title')
+                    ui.label('点击左侧进球行查看判定与分数').classes('empty-hint')
+                _render_timing_card()
             return
         clip = clips[idx]
         _tc = _fmt_ts(clip.get("ts"))
@@ -2175,6 +2024,7 @@ def main_page():
                         ui.label(_k).classes('text-[11.5px]')
                         ui.label(str(_v)).classes('text-[11.5px] font-mono').style(
                             'color: var(--text-primary)')
+            _render_timing_card()
 
     async def _footer_cancel():
         """底栏取消：按当前任务分派到现有的取消分支。"""
@@ -2209,16 +2059,20 @@ def main_page():
         clips = _cards_clips()
         if not clips:
             with result_container:
-                if vp is not None:
-                    ui.label(f'当前查看: {os.path.basename(vp)}').classes(
-                        'text-xs text-center w-full py-4').style('color: var(--accent)')
-                    ui.label('该视频暂无片段').classes(
-                        'text-[11px] text-center w-full').style('color: var(--text-secondary)')
-                else:
-                    ui.label('暂无进球结果').classes(
-                        'text-xs text-center w-full py-4').style('color: var(--text-secondary)')
-                    ui.label('请先加载视频 → 框住篮筐+篮网 → 开始识别').classes(
-                        'text-[11px] text-center w-full').style('color: var(--text-tertiary)')
+                with ui.column().classes('empty-state w-full'):
+                    if vp is not None:
+                        ui.icon('movie_filter').classes('text-2xl').style(
+                            'color: var(--text-tertiary)')
+                        ui.label(f'当前查看: {os.path.basename(vp)}').classes(
+                            'empty-title').style('color: var(--accent)')
+                        ui.label('该场次暂无片段：可能未识别、识别被取消，或全部片段已删除').classes(
+                            'empty-hint')
+                    else:
+                        ui.icon('sports_basketball').classes('text-2xl').style(
+                            'color: var(--text-tertiary)')
+                        ui.label('还没有进球结果').classes('empty-title')
+                        ui.label('加载视频 → 在画面上框住篮筐+篮网 → 开始识别').classes(
+                            'empty-hint')
             export_row.classes(add='hidden')  # 无结果时隐藏导出按钮
             _list_sel["idx"] = None
             _fill_stat_row(_stats_payload())
@@ -2424,6 +2278,9 @@ def main_page():
                 _list_sel["idx"] = None
                 _sync_inspector()
         _set_status(status, 'info')
+        # 打标是操作确认类反馈：再给一个短 toast，底栏文字不抢眼
+        _ok = not (status.startswith('❌') or '失败' in status)
+        _toast(status, 'ok' if _ok else 'err')
 
     async def _on_highlights():
         vp = _cards_video["path"]
@@ -2815,6 +2672,8 @@ def main_page():
                 progress_bar.set_value(d["pct"] / 100)
                 progress_text.set_text('检测中...' if d["pct"] < 80 else '生成预览片段...')
                 progress_detail.set_text(d["msg"])
+                # 进度同步到底栏（P1-6：进度→状态栏；右侧面板保留详细阶段）
+                result_status.set_text(f'{d["pct"]:.0f}% · {d["msg"]}')
             else:
                 # 任务已真正结束（进度槽清空）：取消标记随之失效，按钮复位
                 _CANCEL_REQ["detect"] = False
@@ -2841,6 +2700,7 @@ def main_page():
                 progress_bar.set_value(b["pct"] / 100)
                 progress_text.set_text(b["msg"])
                 progress_detail.set_text(b["msg"])
+                result_status.set_text(f'{b["pct"]:.0f}% · {b["msg"]}')
             else:
                 _CANCEL_REQ["batch"] = False
                 if batch_run_btn.text != '批量识别':
@@ -2860,6 +2720,28 @@ def main_page():
                     progress_detail.set_text(h["msg"])
             else:
                 hl_progress_strip.classes(add='hidden')
+            # ===== AI 复核（独立任务，P1-5）=====
+            v = state.live_progress["verify"]
+            if v is not None:
+                if not _verify_ui["running"]:
+                    _verify_ui["running"] = True
+                    verify_stop_btn.classes(remove='hidden')
+                    verify_stop_btn.set_text('取消复核')
+                    verify_stop_btn.enable()
+                if v.get("pct", 0) > 0:
+                    # 真正开始推理才占用主进度面板（排队时只在状态栏提示，
+                    # 避免把检测/批量的进度条顶掉）
+                    _auto_show_progress()
+                    progress_bar.set_value(v["pct"] / 100)
+                    progress_text.set_text('AI 复核中...')
+                    progress_detail.set_text(v["msg"])
+                elif state.live_progress["detect"] is None and state.live_progress["batch"] is None:
+                    result_status.set_text(v["msg"])
+            elif _verify_ui["running"]:
+                _verify_ui["running"] = False
+                verify_stop_btn.classes(add='hidden')
+                verify_stop_btn.set_text('取消复核')
+                verify_stop_btn.enable()
             # L5：AI 开关的实际状态是进程级全局量，ui.switch 只在建页时读一次 →
             # 其他标签页切换后本页开关显示会与实际不符。timer 顺手同步（仅在
             # 真的不一致时才写，否则每 0.4s 下发一次无意义的更新；写入期间用
