@@ -199,10 +199,13 @@ batch_current_video = None
 # 与 batch_files（扫描到的全部视频）分开存，是为了只跑部分节次时不丢列表/标定。
 batch_selected = set()
 
-# 批量结果快照：视频路径 -> {"goals": [...], "clips": [...], "kept": set(), "finished_at": str}
-# 检测线程只写入新 key；前台人工确认（删卡片/导出集锦）只读写快照。
-# 与全局 last_goals/last_goal_clips 完全隔离，支持流水线：后台跑检测 + 前台确认已完成视频
-batch_results = {}
+# 场次结果（session）：视频路径 -> {goals, clips, kept, status, timing, ...}
+# 每个视频一份独立结果，单视频与批量共用（P0-1）。
+# 检测线程只写入自己视频的场次；前台人工确认（删卡片/导出集锦）按 video_path
+# 读写对应场次。切换视频只切换"当前显示对象"，不再覆盖上一场结果。
+sessions = {}
+# 兼容旧名：批量快照与单视频场次共用同一存储（batch_results 曾是唯一的多场容器）
+batch_results = sessions
 
 # ============ 全局任务互斥（进程级，跨页面连接/刷新共享）============
 # 旧实现的 _busy 锁在 NiceGUI 页面函数局部：每个浏览器连接/刷新独立执行页面函数，
@@ -261,8 +264,8 @@ hl_busy = {"on": False}
 # 全部 UI，而任务线程（持模块级锁）仍继续跑、进度回调写的是旧页面已销毁的元素。
 # 各 io_bound 进度回调把 (pct, msg) 写入本表，页面 ui.timer 轮询后恢复/刷新新页面
 # 的按钮、进度条与阶段消息，任务结束（置 None）后自动复位。
-# 键：'detect' / 'batch' / 'hl'（hl 覆盖单视频/整场集锦与批量流水线迷你条）。
-live_progress = {"detect": None, "batch": None, "hl": None}
+# 键：'detect' / 'batch' / 'verify' / 'hl'（hl 覆盖单视频/整场集锦与批量流水线迷你条）
+live_progress = {"detect": None, "batch": None, "verify": None, "hl": None}
 
 
 def set_live(task: str, pct: float, msg: str, mini: bool = False) -> None:
@@ -285,6 +288,122 @@ def clear_live(task: str) -> None:
             live_progress[task] = None
     except Exception:
         pass
+
+
+# AI 复核独立取消标志：复核从检测流程解耦后是独立后台任务，
+# 检测侧取消不应连带杀掉复核，反之亦然（P1-5）。
+verify_cancel_event = threading.Event()
+
+# ============ 场次（session）：按视频独立的结果容器（P0-1） ============
+# 全局 last_goals / last_goal_clips / kept_goal_indices 保留为"当前显示对象"的别名，
+# 指向某个场次的列表 —— 切换视频时只重绑定别名，不 clear 别人的结果。
+_EMPTY_SESSION_KEY = "__none__"
+
+
+def new_session(source="single"):
+    return {"goals": [], "clips": [], "kept": set(),
+            "status": "", "timing": {}, "finished_at": "", "source": source,
+            "verify_state": "idle", "verify_msg": ""}
+
+
+def session_for(video_path, create=True):
+    """取该视频的场次；create=False 时不存在返回 None。"""
+    key = video_path or _EMPTY_SESSION_KEY
+    s = sessions.get(key)
+    if s is None and create:
+        s = new_session()
+        sessions[key] = s
+    return s
+
+
+def activate_session(video_path):
+    """把全局显示别名指向该视频的场次（无则新建空场次）。"""
+    global last_goals, last_goal_clips, kept_goal_indices
+    s = session_for(video_path)
+    last_goals = s["goals"]
+    last_goal_clips = s["clips"]
+    kept_goal_indices = s["kept"]
+    return s
+
+
+def current_session(create=False):
+    """当前已加载视频的场次（不自动建空场次，避免给未加载状态留垃圾 key）。"""
+    return session_for(video_state.get("path"), create=create)
+
+
+def set_kept(indices):
+    """就地更新 kept 集合（保持场次持有的同一份引用，切场次时不丢）。"""
+    global kept_goal_indices
+    kept_goal_indices.clear()
+    kept_goal_indices.update(indices)
+
+
+def clear_batch_sessions():
+    """只清批量来源的场次，保留单视频已加载场次（单视频加载文件夹外的视频时调用）。"""
+    for key in [k for k, v in sessions.items() if v.get("source") == "batch"]:
+        sessions.pop(key, None)
+
+
+# ============ 进程退出兜底：断点落盘（P0-2） ============
+# 检测线程注册一个"立即收尾"钩子；SIGTERM/SIGINT/atexit 时统一调用，
+# 让正常取消路径把最后一次断点写盘（否则 kill 进程会丢失最近一段进度）。
+_shutdown_flushers = []
+_shutdown_lock = threading.Lock()
+_shutdown_once = {"on": False}
+
+
+def register_shutdown_flusher(fn) -> None:
+    with _shutdown_lock:
+        if fn not in _shutdown_flushers:
+            _shutdown_flushers.append(fn)
+
+
+def unregister_shutdown_flusher(fn) -> None:
+    with _shutdown_lock:
+        try:
+            _shutdown_flushers.remove(fn)
+        except ValueError:
+            pass
+
+
+def flush_all(reason="") -> None:
+    """调用全部落盘钩子（幂等；单个失败不影响其它）。"""
+    if _shutdown_once["on"]:
+        return
+    _shutdown_once["on"] = True
+    with _shutdown_lock:
+        fns = list(_shutdown_flushers)
+    for fn in fns:
+        try:
+            fn(reason)
+        except Exception as e:
+            logging.getLogger("state").warning(f"[SHUTDOWN] 落盘钩子失败: {e}")
+
+
+def _install_shutdown_hooks() -> None:
+    import atexit
+    import signal
+    atexit.register(lambda: flush_all("atexit"))
+
+    def _sig(signum, _frame):
+        flush_all(f"signal-{signum}")
+        # 交还默认处理，让进程按原语义终止（否则服务看似"点了没反应"）
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            os._exit(0)
+
+    for _s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if _s is None:
+            continue
+        try:
+            signal.signal(_s, _sig)
+        except Exception:
+            pass
+
+
+_install_shutdown_hooks()
 
 # NVENC 编码会话信号量：GeForce 消费卡驱动限制同时 2 路编码会话。
 # 预览片段线程池（services/detection）与集锦（cutter/ffmpeg_cutter）跨模块
@@ -888,6 +1007,67 @@ def _update_history_labels_impl(video_path, kept_ts_list, deleted_ts_list, perso
     return True
 
 
+def update_history_verify(video_path, snapshot) -> bool:
+    """AI 复核完成后补写当次分带快照（P1-5：复核已晚于检测落盘）。
+
+    复核解耦后检测历史先落盘，快照只能在复核结束时追加；单独写一条字段，
+    不重建整份记录（避免踩掉人工标记等并发写入）。
+    """
+    try:
+        records = load_history()
+    except Exception as e:
+        logging.getLogger("state").warning(
+            f"[WARN] update_history_verify 读取历史失败: {e}")
+        return False
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return False
+    target = records[hit_idx]
+    target["verify_snapshot"] = _cast_verify_snapshot(snapshot)
+    try:
+        with _history_io_lock:
+            _atomic_write_json(_history_file_for(target["video"]), target, indent=2)
+        return True
+    except Exception as e:
+        logging.getLogger("state").warning(
+            f"[WARN] update_history_verify 写入失败: {e}")
+        return False
+
+
+def update_history_fields(video_path, **fields) -> bool:
+    """按字段补写一条已存在的历史记录（只接受 _HISTORY_FIELD_CASTS 里的字段）。
+
+    用于检测落盘后才知道的数值（如"落盘阶段耗时"、后台复核耗时）。
+    """
+    unknown = set(fields) - set(_HISTORY_FIELD_CASTS)
+    if unknown:
+        raise TypeError(f"update_history_fields 收到未知字段: {sorted(unknown)}")
+    try:
+        records = load_history()
+    except Exception as e:
+        logging.getLogger("state").warning(
+            f"[WARN] update_history_fields 读取历史失败: {e}")
+        return False
+    hit_idx = _find_history_record(records, video_path)
+    if hit_idx is None:
+        return False
+    target = records[hit_idx]
+    for key, val in fields.items():
+        cast, ndigits = _HISTORY_FIELD_CASTS[key]
+        try:
+            target[key] = round(cast(val), ndigits)
+        except (TypeError, ValueError):
+            continue
+    try:
+        with _history_io_lock:
+            _atomic_write_json(_history_file_for(target["video"]), target, indent=2)
+        return True
+    except Exception as e:
+        logging.getLogger("state").warning(
+            f"[WARN] update_history_fields 写入失败: {e}")
+        return False
+
+
 # ============ 手动插入进球：读写 ============
 
 def _mutate_record(video_path, fn):
@@ -1119,6 +1299,12 @@ _HISTORY_FIELD_CASTS = {
     "search_margin": (int, None),
     # 时间/批量
     "elapsed_sec": (float, 1),
+    # 本场耗时构成（P1-6）：准备 / 主检测 / 切片 / AI 复核 / 落盘
+    "timing_prepare_sec": (float, 1),
+    "timing_detect_sec": (float, 1),
+    "timing_slice_sec": (float, 1),
+    "timing_verify_sec": (float, 1),
+    "timing_persist_sec": (float, 1),
     "batch_idx": (int, None),
     "batch_total": (int, None),
     "detect_start_time": (str, None),
