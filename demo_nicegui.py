@@ -1628,7 +1628,8 @@ def main_page():
         else:
             _bd, _op = '1px solid transparent', '1'
         _shadow = 'box-shadow: inset 3px 0 0 var(--accent);' if selected else ''
-        return (f'margin: 0; padding: 6px 8px; border-radius: 8px; background: {_bg}; '
+        # 行高按内容定：缩略图 26px + 上下 3px ≈ 32px，列表一屏能多看 4~5 个球
+        return (f'margin: 0; padding: 3px 7px; border-radius: 7px; background: {_bg}; '
                 f'opacity: {_op}; border: {_bd}; {_shadow}')
 
     def _stats_payload():
@@ -2117,7 +2118,7 @@ def main_page():
             with result_container:
                 # 行式布局（原型约 40px）：46×26 缩略图 + 时间码 + 徽章 + 人物 + ✓/✕
                 _card = ui.row().classes(
-                    'clip-row w-full items-center gap-2 cursor-pointer').style(
+                    'clip-row w-full items-center gap-1.5 cursor-pointer').style(
                     _card_style(mark, i == _sel)).tooltip('点击预览该球')
                 with _card:
                     # 整行点击层：点缩略图、时间码、徽章区或空白都触发预览（见 .clip-row .row-hit）
@@ -2157,20 +2158,23 @@ def main_page():
                                 f'color: {_pc[0] if _pc else "var(--text-tertiary)"}; '
                                 f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
                                 f'background: {_pc[1] if _pc else "transparent"}; '
+                                'min-height: 0; height: 18px; padding: 0 6px; '
                                 'max-width: 82px; overflow: hidden; '
                                 'text-overflow: ellipsis; white-space: nowrap; '
                                 'position: relative; z-index: 2;')
-                with ui.row().classes('items-center gap-1 shrink-0 row-actions'):
-                    _keep_btn = ui.button(
-                        '✓', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')
-                    ).props('flat dense no-caps').classes('text-[11px]').style(
-                        _mark_btn_style(mark == 'keep', 'keep') +
-                        '; min-height: 0; width: 24px; height: 24px; padding: 0;')
-                    _rej_btn = ui.button(
-                        '✕', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')
-                    ).props('flat dense no-caps').classes('text-[11px]').style(
-                        _mark_btn_style(mark == 'reject', 'reject') +
-                        '; min-height: 0; width: 24px; height: 24px; padding: 0;')
+                    # ✓/✕ 与缩略图同一行（旧实现是 card 的兄弟节点 → 每个进球
+                    # 多占一整行按钮高度，列表看起来大片空白）
+                    with ui.row().classes('items-center gap-0.5 shrink-0 row-actions ml-auto'):
+                        _keep_btn = ui.button(
+                            '✓', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')
+                        ).props('flat dense no-caps').classes('text-[11px]').style(
+                            _mark_btn_style(mark == 'keep', 'keep') +
+                            '; min-height: 0; width: 22px; height: 22px; padding: 0;')
+                        _rej_btn = ui.button(
+                            '✕', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_reject')
+                        ).props('flat dense no-caps').classes('text-[11px]').style(
+                            _mark_btn_style(mark == 'reject', 'reject') +
+                            '; min-height: 0; width: 22px; height: 22px; padding: 0;')
             # 方案A：登记本行可被局部更新的 3 个元素（未登记则退回整列表重建）
             _card_widgets[i] = {'card': _card, 'keep': _keep_btn, 'rej': _rej_btn}
 
