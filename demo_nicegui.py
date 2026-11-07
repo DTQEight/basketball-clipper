@@ -2116,7 +2116,7 @@ def main_page():
             person = clip.get("person")
             _pc = st['person_colors'].get(person) if person else None
             with result_container:
-                # 行式布局（原型约 40px）：46×26 缩略图 + 时间码 + 徽章 + 人物 + ✓/✕
+                # 行式布局（约 34px）：46×26 缩略图 + 时间码 + 徽章 + 人物 + ✓/✕
                 _card = ui.row().classes(
                     'clip-row w-full items-center gap-1.5 cursor-pointer').style(
                     _card_style(mark, i == _sel)).tooltip('点击预览该球')
@@ -2141,27 +2141,28 @@ def main_page():
                             'color: #fff; opacity: 0.75; z-index: 2;')
                     if _cpath and not _curi:
                         _thumb_pending.append((_thumb_img, _cpath))
-                    with ui.column().classes('min-w-0 flex-1 gap-0'):
+                    # 内容单行排布：旧实现时间码独占一行、徽章/人物另起一行，
+                    # 时间码右侧会留下大半行宽的横向空白
+                    with ui.row().classes('min-w-0 flex-1 items-center gap-1.5 flex-nowrap'):
                         _tlabel = ui.label(_fmt_ts(ts)).classes(
-                            'text-[12.5px] font-bold font-mono').style(
+                            'text-[12.5px] font-bold font-mono shrink-0').style(
                             'color: var(--text-primary); cursor: pointer; line-height: 1.2;')
                         _tlabel.on('click', lambda e, idx=i: _on_preview_clip(idx))
-                        with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                            if _badge is not None:
-                                ui.label(_badge[0]).classes(
-                                    'text-[10px] px-1.5 rounded-full font-bold shrink-0'
-                                ).style(_badge[1]).tooltip(_badge[2])
-                            ui.button((f'👤 {person}' if person else '👤 分类'),
-                                      on_click=lambda e, idx=i: _on_person_clip(idx)
-                                      ).props('flat dense no-caps').classes(
-                                'text-[10px] rounded-full px-1.5 py-0 min-h-0').style(
-                                f'color: {_pc[0] if _pc else "var(--text-tertiary)"}; '
-                                f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
-                                f'background: {_pc[1] if _pc else "transparent"}; '
-                                'min-height: 0; height: 18px; padding: 0 6px; '
-                                'max-width: 82px; overflow: hidden; '
-                                'text-overflow: ellipsis; white-space: nowrap; '
-                                'position: relative; z-index: 2;')
+                        if _badge is not None:
+                            ui.label(_badge[0]).classes(
+                                'text-[10px] px-1 rounded-full font-bold shrink-0'
+                            ).style(_badge[1]).tooltip(_badge[2])
+                        ui.button((f'👤 {person}' if person else '👤 分类'),
+                                  on_click=lambda e, idx=i: _on_person_clip(idx)
+                                  ).props('flat dense no-caps').classes(
+                            'text-[10px] rounded-full px-1 py-0 min-h-0 min-w-0').style(
+                            f'color: {_pc[0] if _pc else "var(--text-tertiary)"}; '
+                            f'border: 1px solid {_pc[0] if _pc else "var(--border-subtle)"}; '
+                            f'background: {_pc[1] if _pc else "transparent"}; '
+                            'min-height: 0; height: 18px; padding: 0 6px; '
+                            'flex: 0 1 auto; max-width: 88px; overflow: hidden; '
+                            'text-overflow: ellipsis; white-space: nowrap; '
+                            'position: relative; z-index: 2;')
                     # ✓/✕ 与缩略图同一行（旧实现是 card 的兄弟节点 → 每个进球
                     # 多占一整行按钮高度，列表看起来大片空白）
                     with ui.row().classes('items-center gap-0.5 shrink-0 row-actions ml-auto'):
