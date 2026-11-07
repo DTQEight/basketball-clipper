@@ -195,6 +195,37 @@ class TestNetEchoSuppression:
         assert len(det.goals) == 2
         assert det.diag["reject_echo"] == 0
 
+    def test_echo_window_cleared_by_ball_descending_in_hoop(self):
+        """回归（2026.11.06-1st 133.9s）：窗口内 YOLO 真看到球在筐口内下移时放行。
+
+        该场 129.7s 的强误报武装了 5s 窗口，紧接着的真球是**侧向进筐**（斑块全程
+        没到过筐上方，last_above_frame=-999），24 帧触发全被判余摆吞掉。
+        网兜摆动不会有球在筐口内下移，出现该硬证据必须放行。
+        """
+        det = _detector(min_gap_sec=2.0)
+        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
+        det.last_above_frame = -999          # 侧向进筐：没有「球在筐上方」的观测
+        # 筐口 80~120，宽松下界到 144：两个**不同检测帧**、累计下移 12px
+        det.ball_pos_history.extend([(70, float(CX), 100.0),
+                                     (72, float(CX), 112.0)])
+        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is True
+        assert det.diag["echo_cleared_by_ball"] == 1
+        assert det.diag["reject_echo"] == 0
+
+    def test_echo_window_not_cleared_without_real_descent(self):
+        """反证不成立时不得放行：同一检测帧复用、或球在筐口下方都算「没看到下穿」。"""
+        det = _detector(min_gap_sec=2.0)
+        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
+        det.last_above_frame = -999
+        # 同一检测帧（跳帧复用）→ 不能算穿过
+        det.ball_pos_history.extend([(72, float(CX), 100.0),
+                                     (72, float(CX), 112.0)])
+        # 球已在筐口下界之外（hoop_bot=120 + 0.6*40=144）
+        det.ball_pos_history.append((74, float(CX), 160.0))
+        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is False
+        assert det.diag["reject_echo"] == 1
+        assert det.diag["echo_cleared_by_ball"] == 0
+
     def test_beyond_window_behaves_like_old(self):
         """超出回声窗口（net 摆动早已停止）→ 行为与旧版一致，不设额外限制。
 

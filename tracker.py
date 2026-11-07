@@ -239,6 +239,7 @@ class GoalDetector:
             "in_hoop": 0,          # 斑块在篮筐框内次数
             "reject_cooldown": 0,  # 冷却期跳过
             "reject_echo": 0,      # 网兜余摆回声被抑制（进球后窗口内没有「新球从上方来」）
+            "echo_cleared_by_ball": 0,  # 回声窗口内出现「球在筐口内下移」硬证据而放行
             "echo_disarmed_weak": 0,  # 回声窗口未武装（上一个进球是弱注册，见 _register_goal）
             "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
             "reject_in_x": 0,      # x 不在篮筐范围
@@ -790,7 +791,9 @@ class GoalDetector:
             **该假设已被 20251007 勒流 1st 证伪**：该场 388.8s 的补篮是球在筐沿被
             点进去的，斑块整段都没到过筐上方，真补篮于是被判成余摆拒掉（该场
             reject_echo=8）。补齐的第二道判据见 _echo_armed —— 弱注册的进球不武装
-            窗口，避免「误报进球把紧随其后的真球一起吞掉」（打铁+补篮正是这种组合）。
+            窗口，避免「误报进球把紧随其后的真球一起吞掉」（打铁+补篮正是这种组合）；
+            第三道判据见 _ball_descending_through_hoop —— 窗口内 YOLO 看到球在筐口
+            内下移时直接放行（2026.11.06-1st 133.9s 侧向进筐的真球即此形态）。
 
         只在本函数被调用的时机（冷却已过）才有意义；从未进球 → 恒 False。
         """
@@ -804,6 +807,11 @@ class GoalDetector:
             # 依据（20251007 勒流 1st）：386.25s 的打铁被弱注册成进球，它开的
             # 5 秒窗口把 388.8s 的真补篮当成余摆吞了（该场 reject_echo=8、真球漏检）。
             self.diag["echo_disarmed_weak"] += 1
+            return False
+        # 硬证据优先于「上穿→下穿」推断：窗口内 YOLO 真看到球在筐口内向下穿，
+        # 就不可能是网兜余摆（网/网兜摆动不会产生筐口内的球下移）。
+        if self._ball_descending_through_hoop():
+            self.diag["echo_cleared_by_ball"] += 1
             return False
         return self.last_above_frame <= self.last_goal_frame
 
@@ -956,6 +964,26 @@ class GoalDetector:
         half = self.hoop_w * 0.6
         return any(abs(bx - cx) <= half and by >= self.hoop_top
                    for (_, bx, by) in self.ball_pos_history)
+
+    def _ball_descending_through_hoop(self):
+        """YOLO 是否看到「球在筐口内向下穿过」——回声窗口的硬反证。
+
+        判据：球心横向落在筐宽 ±0.6 内、纵向在筐口到筐下 0.6×筐高之间，
+        且至少出现在 2 个不同的**检测帧**、累计下移 > 5px（跳帧复用同一检测帧不算）。
+
+        动机（2026.11.06-1st 133.9s）：129.7s 的强误报武装了 5s 回声窗口，
+        真球随后侧向穿筐（斑块全程未出现在筐上方，last_above_frame=-999），
+        连续 24 帧触发全被判成余摆吞掉。网/网兜摆动不会产生筐口内下移的球。
+        """
+        half = self.hoop_w * 0.6
+        y_lo = self.hoop_top
+        y_hi = self.hoop_bot + self.hoop_h * 0.6
+        pts = [(f, by) for (f, bx, by) in self.ball_pos_history
+               if abs(bx - self.hoop_cx) <= half and y_lo <= by <= y_hi]
+        if len({f for f, _ in pts}) < 2:
+            return False
+        pts.sort()
+        return (pts[-1][1] - pts[0][1]) > 5
 
     def _evidence_gate(self, ts, frame_idx, fps, source):
         """统一进球证据仲裁（P0-2）：三条触发路径只在这里决定「放行 / 挂起」。
