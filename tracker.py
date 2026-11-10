@@ -36,18 +36,6 @@ STATIC_BALL_TOL_PX = 12      # 球心位移 ≤ 该值视为「同一位置」�
 STATIC_BALL_SEC = 1.0        # 同一位置持续存在 ≥ 该秒数 → 判为静止物
 STATIC_BALL_GAP_SEC = 2.0    # 超过该秒数没再出现 → 该位置记录作废、重新计时
 
-# ===== 网兜余摆回声抑制 =====
-# 问题：球入筐后网兜会继续摆动 2~4 秒，而网兜自身的运动斑块就落在筐内，满足
-#   loose 路径的「in_x + 连续 min_in_hoop_frames 帧」，冷却期（min_gap_sec，
-#   界面「进球间隔」默认 2.0s）一过期就会被**再注册一次**，同一个进球变成两个候选。
-# 实测（2026.09.21-2nd）：43 个候选里 13 对的间隔正好是 2.07~2.96s，紧贴冷却边界。
-# 判别依据（物理）：网兜不会「从筐上方下来」。所以进球后的这段窗口内，要求
-#   先重新观察到「斑块在筐上方」（即一条新的下穿轨迹）才允许再次注册；
-#   超出窗口则行为与旧版完全一致。
-# 为什么要窗口而不是全局要求：loose 路径是刻意宽松的（配合 YOLO 兜底），
-#   全局加「必须来自上方」会误伤横向/补篮类进筐；只在回声窗口内收紧最安全。
-ECHO_WINDOW_SEC = 5.0        # 进球后多久内要求「新球从上方来」的证据（网兜摆动 ≤4s）
-
 # ===== YOLO 否决的延迟确认 =====
 # 问题（2026.11.03-4th 584s / 1st 551s 实测）：球穿过筐口的那几帧恰好是检测最弱的时刻
 # （运动模糊 + 逆光 + 篮网遮挡），整帧@1280、抹黑@1280、裁剪@640、筐 ROI 放大
@@ -213,10 +201,6 @@ class GoalDetector:
 
         self.goals = []                # 进球时间戳
         self.last_goal_frame = -1
-        # 回声窗口是否已武装：只有**强确认**的进球才武装（见 _register_goal / _is_net_echo）。
-        # 弱注册（走 1.5s 超时窗匹配、或仅兜底档 probe 证据）往往是误报，不该获得
-        # 5 秒「余摆保护期」——那会把紧随其后的真补篮一起吞掉。
-        self._echo_armed = True
         self.last_diff_ratio = 0.0     # 调试用：最近一次差分比例
 
         # YOLO 球位置历史缓存（用于双确认的时间窗口检查）
@@ -238,9 +222,6 @@ class GoalDetector:
             "cross_below": 0,      # 斑块到达篮筐下方次数
             "in_hoop": 0,          # 斑块在篮筐框内次数
             "reject_cooldown": 0,  # 冷却期跳过
-            "reject_echo": 0,      # 网兜余摆回声被抑制（进球后窗口内没有「新球从上方来」）
-            "echo_cleared_by_ball": 0,  # 回声窗口内出现「球在筐口内下移」硬证据而放行
-            "echo_disarmed_weak": 0,  # 回声窗口未武装（上一个进球是弱注册，见 _register_goal）
             "reject_no_above": 0,  # 没到上方就到下方（侧向进筐被拒）
             "reject_in_x": 0,      # x 不在篮筐范围
             "reject_size": 0,      # 斑块太宽
@@ -260,7 +241,7 @@ class GoalDetector:
             "defer_expired": 0,    # 延迟确认超时（仍未出现球证据，丢弃）
             "baseline_updates": 0, # 滚动基准帧更新次数
         }
-        # 延迟确认中的候选（None=无）：{ts, deadline, source, strong}
+        # 延迟确认中的候选（None=无）：{ts, deadline, source}
         self._defer_cand = None
 
     def _roi_gray(self, frame):
@@ -572,8 +553,7 @@ class GoalDetector:
                 self._defer_cand = None
                 self.blob_in_hoop_frames = 0
                 self.last_in_hoop_frame = -999
-                if self._register_goal(_dc["ts"], frame_idx, fps, _dc["source"],
-                                       strong=_dc["strong"]):
+                if self._register_goal(_dc["ts"], frame_idx, fps, _dc["source"]):
                     return _dc["ts"]
             elif frame_idx > _dc["deadline"]:
                 self._defer_cand = None
@@ -689,12 +669,11 @@ class GoalDetector:
                 # 默认 2 帧（≈0.07秒@30fps），过滤单帧噪声，不影响真实进球（球在框内 2-4 帧）
                 if self.loose_mode and self.blob_in_hoop_frames >= self.min_in_hoop_frames:
                     # 统一证据仲裁（P0-2）：YOLO 硬证据 → 放行，否则挂起
-                    action, yolo_status = self._evidence_gate(
+                    action, _ = self._evidence_gate(
                         frame_idx / fps, frame_idx, fps, "loose")
                     if action == "accept":
                         ts = frame_idx / fps
-                        if self._register_goal(ts, frame_idx, fps, "loose",
-                                               strong=(yolo_status == "confirmed")):
+                        if self._register_goal(ts, frame_idx, fps, "loose"):
                             self.blob_in_hoop_frames = 0
                             # loose 进球后复位"曾在上方"标记：否则本次下穿轨迹结束后，
                             # flag 无限期残留，几秒后任意无关"下方下移"斑块会走路径1
@@ -726,7 +705,7 @@ class GoalDetector:
                         self.diag["reject_trend"] += 1
                     else:
                         # 统一证据仲裁（P0-2）：YOLO 硬证据 → 放行，否则挂起
-                        action, yolo_status = self._evidence_gate(
+                        action, _ = self._evidence_gate(
                             frame_idx / fps, frame_idx, fps, "visual")
                         if action == "accept":
                             # 弱注册判据要先算：下面会复位 blob_above_hoop，
@@ -738,11 +717,8 @@ class GoalDetector:
                             self.blob_above_hoop = False
                             self.last_above_frame = -999
                             self.blob_in_hoop_frames = 0
-                            # 弱注册判据：靠 1.5s 超时窗匹配到轨迹（不是新鲜的下穿），
-                            # 或球证据只来自兜底档 probe / 网兜运动（主档没看见球）
-                            if self._register_goal(
-                                    ts, frame_idx, fps, "visual",
-                                    strong=(not _timeout) and yolo_status == "confirmed"):
+                            # 弱注册判据：靠 1.5s 超时窗匹配到轨迹（不是新鲜的下穿）
+                            if self._register_goal(ts, frame_idx, fps, "visual"):
                                 return ts
                 self.blob_above_hoop = False
 
@@ -754,7 +730,7 @@ class GoalDetector:
                     self.diag["reject_size"] += 1
                 else:
                     # 统一证据仲裁（P0-2）：YOLO 硬证据 → 放行，否则挂起
-                    action, yolo_status = self._evidence_gate(
+                    action, _ = self._evidence_gate(
                         frame_idx / fps, frame_idx, fps, "side")
                     if action == "accept":
                         # 弱注册判据要先算：下面会复位 blob_in_hoop_frames，
@@ -767,9 +743,7 @@ class GoalDetector:
                         ts = frame_idx / fps
                         self.blob_in_hoop_frames = 0
                         self.last_in_hoop_frame = -999
-                        if self._register_goal(
-                                ts, frame_idx, fps, "side",
-                                strong=(not _timeout) and yolo_status == "confirmed"):
+                        if self._register_goal(ts, frame_idx, fps, "side"):
                             return ts
             else:
                 self.diag["reject_no_above"] += 1
@@ -778,66 +752,19 @@ class GoalDetector:
 
         return None
 
-    def _is_net_echo(self, frame_idx, fps) -> bool:
-        """本次触发是否为「网兜余摆回声」：冷却已过，但仍在回声窗口内，
-        且这期间**没有任何**「斑块在筐上方」的新观测（=没有新球从上面下来）。
+    def _register_goal(self, ts, frame_idx, fps, source=""):
+        """注册一个进球时间戳（只受冷却期控制）。
 
-        背景见文件头 ECHO_WINDOW_SEC 的注释。判据 last_above_frame 的生命周期：
-
-          · 每次注册进球都会把它复位成 -999（见 loose / visual 路径），所以刚进完
-            球这个条件必然成立；而网兜的斑块只会出现在筐内，不会产生新的「在筐
-            上方」观测 → 余摆必然被判为回声；
-          · 真球（投篮或补篮）总有一段球在筐上方的轨迹，会重新置位该值 → 不受影响。
-            **该假设已被 20251007 勒流 1st 证伪**：该场 388.8s 的补篮是球在筐沿被
-            点进去的，斑块整段都没到过筐上方，真补篮于是被判成余摆拒掉（该场
-            reject_echo=8）。补齐的第二道判据见 _echo_armed —— 弱注册的进球不武装
-            窗口，避免「误报进球把紧随其后的真球一起吞掉」（打铁+补篮正是这种组合）；
-            第三道判据见 _ball_descending_through_hoop —— 窗口内 YOLO 看到球在筐口
-            内下移时直接放行（2026.11.06-1st 133.9s 侧向进筐的真球即此形态）。
-
-        只在本函数被调用的时机（冷却已过）才有意义；从未进球 → 恒 False。
-        """
-        if self.last_goal_frame < 0:
-            return False
-        gap_sec = (frame_idx - self.last_goal_frame) / fps
-        if gap_sec >= ECHO_WINDOW_SEC:
-            return False
-        if not self._echo_armed:
-            # 上一个进球是弱注册（超时匹配 / 仅兜底档证据）→ 不设余摆保护期。
-            # 依据（20251007 勒流 1st）：386.25s 的打铁被弱注册成进球，它开的
-            # 5 秒窗口把 388.8s 的真补篮当成余摆吞了（该场 reject_echo=8、真球漏检）。
-            self.diag["echo_disarmed_weak"] += 1
-            return False
-        # 硬证据优先于「上穿→下穿」推断：窗口内 YOLO 真看到球在筐口内向下穿，
-        # 就不可能是网兜余摆（网/网兜摆动不会产生筐口内的球下移）。
-        if self._ball_descending_through_hoop():
-            self.diag["echo_cleared_by_ball"] += 1
-            return False
-        return self.last_above_frame <= self.last_goal_frame
-
-    def _register_goal(self, ts, frame_idx, fps, source="", strong=True):
-        """注册一个进球时间戳（受冷却期 + 网兜回声抑制控制）。
-
-        strong: 本次注册是否为**强确认** —— 新鲜的「上穿→下穿」轨迹 + 主档 YOLO
-            直接确认。弱注册（只有兜底档 probe 证据，或靠 1.5s 超时窗匹配到轨迹）
-            往往是误报（实测 20251007 勒流 1st 386.25s 打铁被误注册），故不武装
-            回声窗口：让紧随其后的真补篮有机会注册，代价是这一类进球后余摆不受
-            保护。强注册照旧武装，余摆保护行为不变。
-
-        返回: True 表示已注册，False 表示被拒（冷却期 / 网兜余摆）
+        返回: True 表示已注册，False 表示被冷却期拒绝
         """
         if self.last_goal_frame >= 0:
             gap_sec = (frame_idx - self.last_goal_frame) / fps
             if gap_sec < self.min_gap_sec:
                 self.diag["reject_cooldown"] += 1
                 return False
-            if self._is_net_echo(frame_idx, fps):
-                self.diag["reject_echo"] += 1
-                return False
 
         self.goals.append(ts)
         self.last_goal_frame = frame_idx
-        self._echo_armed = bool(strong)
         self.blob_history.clear()
         # 常规路径已注册 → 清掉挂起候选，避免同一轨迹被延迟确认重复注册
         self._defer_cand = None
@@ -965,26 +892,6 @@ class GoalDetector:
         return any(abs(bx - cx) <= half and by >= self.hoop_top
                    for (_, bx, by) in self.ball_pos_history)
 
-    def _ball_descending_through_hoop(self):
-        """YOLO 是否看到「球在筐口内向下穿过」——回声窗口的硬反证。
-
-        判据：球心横向落在筐宽 ±0.6 内、纵向在筐口到筐下 0.6×筐高之间，
-        且至少出现在 2 个不同的**检测帧**、累计下移 > 5px（跳帧复用同一检测帧不算）。
-
-        动机（2026.11.06-1st 133.9s）：129.7s 的强误报武装了 5s 回声窗口，
-        真球随后侧向穿筐（斑块全程未出现在筐上方，last_above_frame=-999），
-        连续 24 帧触发全被判成余摆吞掉。网/网兜摆动不会产生筐口内下移的球。
-        """
-        half = self.hoop_w * 0.6
-        y_lo = self.hoop_top
-        y_hi = self.hoop_bot + self.hoop_h * 0.6
-        pts = [(f, by) for (f, bx, by) in self.ball_pos_history
-               if abs(bx - self.hoop_cx) <= half and y_lo <= by <= y_hi]
-        if len({f for f, _ in pts}) < 2:
-            return False
-        pts.sort()
-        return (pts[-1][1] - pts[0][1]) > 5
-
     def _evidence_gate(self, ts, frame_idx, fps, source):
         """统一进球证据仲裁（P0-2）：三条触发路径只在这里决定「放行 / 挂起」。
 
@@ -1017,8 +924,6 @@ class GoalDetector:
     def _defer_yolo_reject(self, ts, frame_idx, fps, source):
         """YOLO 本帧无证据时挂起候选，等待后续帧的球证据（见 YOLO_DEFER_SEC）。
 
-        强标记固定为 False：确认发生在本帧之后、靠延迟窗口匹配到的证据，
-        属于弱注册，不能武装网兜回声窗口。
         """
         if self._defer_cand is not None and frame_idx <= self._defer_cand["deadline"]:
             return  # 已有更早的挂起候选，保留它
@@ -1027,7 +932,6 @@ class GoalDetector:
             "frame": frame_idx,
             "deadline": frame_idx + int(YOLO_DEFER_SEC * fps),
             "source": source,
-            "strong": False,
         }
         self.diag["defer_pending"] += 1
 
@@ -1059,9 +963,6 @@ class GoalDetector:
             # ---- 进球状态机 ----
             "goals": list(self.goals),
             "last_goal_frame": self.last_goal_frame,
-            # 回声窗口是否武装：断点存于窗口内（≤5s）时必须一起恢复，
-            # 否则弱注册进球在恢复点之后会被错误地重新武装
-            "_echo_armed": self._echo_armed,
             "blob_above_hoop": self.blob_above_hoop,
             "blob_in_hoop": self.blob_in_hoop,
             "blob_in_hoop_frames": self.blob_in_hoop_frames,
@@ -1115,7 +1016,6 @@ class GoalDetector:
         # ---- 进球状态机 ----
         self.goals = list(state.get("goals", []))
         self.last_goal_frame = int(state.get("last_goal_frame", -1))
-        self._echo_armed = bool(state.get("_echo_armed", True))
         self.blob_above_hoop = bool(state.get("blob_above_hoop", False))
         self.blob_in_hoop = bool(state.get("blob_in_hoop", False))
         self.blob_in_hoop_frames = int(state.get("blob_in_hoop_frames", 0))

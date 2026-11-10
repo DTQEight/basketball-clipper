@@ -1248,3 +1248,60 @@ class TestCancelEvent:
         state_mod.cancel_event.set()
         assert state_mod.cancel_event.is_set()
         state_mod.cancel_event.clear()
+
+class TestTriStateAndCacheFingerprint:
+    def test_triage_three_states(self):
+        from services import goal_verifier as gv
+        assert gv.triage({}) is None
+        assert gv.triage({"score": 0.9, "auto": True}) == "keep"
+        assert gv.triage({"score": 0.1, "auto_reject": True}) == "reject"
+        assert gv.triage({"score": 0.5}) == "uncertain"
+
+    def test_remap_unique_neighbor_within_2s(self, state_mod):
+        """一级 0.5s 匹配不上时，±2s 唯一互为最近邻仍继承人工标记。"""
+        old = {"kept": [10.0, 20.0], "deleted": [30.0]}
+        _l, matched, total = state_mod._remap_labels_to_goals(old, [10.8, 20.9, 31.2])
+        assert total == 3 and matched == 3
+
+    def test_remap_rejects_ambiguous_neighbors(self, state_mod):
+        """并列最近（新球在中间）或多旧标签抢同一新球 → 不猜，宁可不继承。"""
+        _l, matched, _t = state_mod._remap_labels_to_goals(
+            {"kept": [10.0]}, [11.0, 9.0])
+        assert matched == 0
+        _l, matched, _t = state_mod._remap_labels_to_goals(
+            {"kept": [10.0], "deleted": [12.0]}, [11.0])
+        assert matched == 0
+
+    def test_clip_cache_key_includes_video_fingerprint(self, state_mod, tmp_path):
+        v = tmp_path / "a.mp4"
+        v.write_bytes(b"one")
+        k1 = state_mod.clip_cache_key(str(v), [1.0])
+        assert state_mod._FP_SEP in k1[0]
+        v.write_bytes(b"two-longer")
+        k2 = state_mod.clip_cache_key(str(v), [1.0])
+        assert k1 != k2
+
+    def test_invalidate_reuses_arm_scores(self, monkeypatch):
+        """只改阈值/集成权重（arm_ver 未变）→ 复用逐臂分重算，不重跑视频。"""
+        from services import goal_verifier as gv
+        clip = {"score": 0.5, "verify_ver": "old", "auto": True,
+                "mark": "keep", "mark_source": "auto",
+                "score_lgbm": 0.9, "score_b": 0.8, "arm_ver": "arm1"}
+        monkeypatch.setattr(gv, "model_fingerprint", lambda: "new")
+        monkeypatch.setattr(gv, "arm_fingerprint", lambda: "arm1")
+        monkeypatch.setattr(gv, "_available_arms", lambda: ["a", "b"])
+        monkeypatch.setattr(gv, "combine", lambda c: 0.77)
+        assert gv.invalidate_stale([clip]) == 1
+        assert clip["score"] == 0.77 and clip["verify_ver"] == "new"
+        assert "auto" not in clip and "mark" not in clip
+        assert clip["score_lgbm"] == 0.9 and clip["arm_ver"] == "arm1"
+
+    def test_invalidate_clears_when_arms_stale(self, monkeypatch):
+        from services import goal_verifier as gv
+        clip = {"score": 0.5, "verify_ver": "old", "score_lgbm": 0.9,
+                "score_b": 0.8, "arm_ver": "old-arm"}
+        monkeypatch.setattr(gv, "model_fingerprint", lambda: "new")
+        monkeypatch.setattr(gv, "arm_fingerprint", lambda: "arm1")
+        monkeypatch.setattr(gv, "_available_arms", lambda: ["a", "b"])
+        assert gv.invalidate_stale([clip]) == 1
+        assert "score" not in clip and "score_lgbm" not in clip

@@ -1332,7 +1332,6 @@ _HISTORY_FIELD_CASTS = {
     "cross_below": (int, None),
     "in_hoop": (int, None),
     "reject_cooldown": (int, None),
-    "reject_echo": (int, None),
     # 自适应阈值详情
     "auto_threshold_value": (int, None),
     "warmup_p95_median": (float, 1),
@@ -1346,8 +1345,24 @@ _HISTORY_FIELD_CASTS = {
 # 标签时间戳重匹配容差（秒）：改参数重跑后进球时间戳整体小幅偏移，
 # ±容差内的旧标签 ts 视为同一球
 _LABEL_REMAP_TOL_SEC = 0.5
+# 二级容差：0.5s 内匹配不到的旧标签，再在 ±2s 内找**唯一互为最近邻**的新球。
+# 重检测（换阈值/改参数）后 ts 漂移常达 1~1.5s，直接精确匹配会整批丢标记；
+# 但放宽窗口必须要求唯一性，否则「一球消失、邻球顶上」会把 √ 贴错球。
+_LABEL_REMAP_UNIQUE_TOL_SEC = 2.0
 # 旧标签与新进球的匹配率低于该值时，判定两次检测结果差异过大，丢弃旧标签
 _LABEL_MIN_MATCH_RATE = 0.5
+
+
+def _nearest_unique(value, pool):
+    """pool 中离 value 最近的元素；并列最近（无法唯一确定）返回 (None, None)。"""
+    best = None
+    for x in pool:
+        d = abs(x - value)
+        if best is None or d < best[0] - 1e-9:
+            best = (d, x)
+        elif abs(d - best[0]) <= 1e-9:
+            return None, None
+    return best if best is not None else (None, None)
 
 
 def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
@@ -1405,6 +1420,33 @@ def _remap_labels_to_goals(labels: dict, new_goals) -> tuple:
             continue
         used.add(g)
         mapping[ot] = g
+
+    # 二级：±2s 内「唯一互为最近邻」继承人工标记。
+    # 只对一级没匹配上的旧 ts 生效，且必须双向唯一——两个旧标签抢同一个新球、
+    # 或一个旧标签在两个新球中间并列，都宁可放弃（人工重看两个卡片，
+    # 也好过把 √ 贴到相邻的另一球上）。
+    remaining = [ot for ot in sorted(set(kept) | set(deleted) | set(persons))
+                 if ot not in mapping]
+    if remaining:
+        free_goals = [g for g in goals if g not in used]
+        if free_goals:
+            # 正向：每个旧 ts 的新球候选（并列最近 → 跳过）
+            cand = {}
+            for ot in remaining:
+                d, g = _nearest_unique(ot, free_goals)
+                if g is None or d is None or d > _LABEL_REMAP_UNIQUE_TOL_SEC:
+                    continue
+                cand.setdefault(g, []).append((d, ot))
+            for g in sorted(cand):
+                lst = cand[g]
+                if len(lst) != 1:
+                    continue            # 同一新球有多个旧候选 → 不猜
+                _, ot = lst[0]
+                # 反向：该旧 ts 也必须是这个新球的唯一最近邻
+                d2, ot2 = _nearest_unique(g, [o for o in remaining if o not in mapping])
+                if ot2 is None or abs(ot2 - ot) > 1e-9:
+                    continue
+                mapping[ot] = g
     new_labels = dict(labels)
     new_labels["kept"] = sorted(round(mapping[ot], 3) for ot in kept if ot in mapping)
     new_labels["deleted"] = sorted(round(mapping[ot], 3) for ot in deleted if ot in mapping)
@@ -1503,19 +1545,50 @@ def _add_history_impl(video_path, hoop, goals, baseline_idx=-1,
 
 
 # ============ 片段缓存 ============
+# 视频指纹分隔符：video 路径里不会出现该控制字符
+_FP_SEP = "\x1f"
+
+
+def video_fingerprint(video_path: str) -> str:
+    """视频文件指纹（大小 + mtime）。文件不可读时返回空串。
+
+    同一路径上的视频被替换/重录后，进球 ts 可能碰巧一致，但画面已完全不同；
+    不带指纹时片段缓存会把旧视频的切片当成新视频的结果直接复用。
+    """
+    try:
+        st = os.stat(video_path)
+        return f"{st.st_size:x}-{st.st_mtime_ns:x}"
+    except OSError:
+        return ""
+
+
 def clip_cache_key(video_path: str, goals) -> tuple:
-    """构造片段缓存 key：进球时间戳排序 + 保留 3 位小数。
+    """构造片段缓存 key：视频指纹 + 进球时间戳排序 + 保留 3 位小数。
 
     写入方（检测完成，goals 已 sorted）与读取方（历史回读，原序）必须
     用同一规则生成 key，否则顺序不同会导致缓存永不命中。
+    视频文件不存在（或单测里的假路径）时不带指纹，保持旧 key 形状。
     """
-    return (video_path, tuple(sorted(round(float(t), 3) for t in goals)))
+    fp = video_fingerprint(video_path)
+    v = f"{video_path}{_FP_SEP}{fp}" if fp else video_path
+    return (v, tuple(sorted(round(float(t), 3) for t in goals)))
+
+
+def _split_cache_video(v: str) -> tuple:
+    """把 key 里的 video 拆成 (原始路径, 指纹)。"""
+    raw, _, fp = str(v).partition(_FP_SEP)
+    return raw, fp
 
 
 # AI 复核分数随片段缓存一起落盘：否则服务重启后历史回读只剩 ts/path/idx，
 # 卡片上的「AI 自动通过」徽标整批消失（分数要重跑几分钟复核才有）
 _AI_CACHE_KEYS = ("score", "auto", "auto_reject", "verify_score", "verify_ver",
-                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm")
+                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm",
+                  # 逐臂分口径（只改阈值/权重时可复用逐臂分，不重跑视频）
+                  "arm_ver",
+                  # 补充证据（不参与打分，仅供检查器展示）
+                  "traj_fit_rmse", "traj_off_q", "traj_in_q",
+                  "net_seq", "net_seq_z")
 
 
 def put_clip_cache(key, clips):
@@ -1543,7 +1616,11 @@ def load_clip_cache():
             with open(CLIP_CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for item in data:
-                key = (item["video"], tuple(float(g) for g in item["goals"]))
+                raw_video = item["video"]
+                # 旧条目没有 fp 字段：用当前文件指纹补齐，保证与 clip_cache_key 同形
+                fp = item.get("fp") or video_fingerprint(raw_video)
+                key = (f"{raw_video}{_FP_SEP}{fp}" if fp else raw_video,
+                       tuple(float(g) for g in item["goals"]))
                 clips = []
                 for c in item.get("clips", []):
                     row = {"ts": float(c["ts"]), "path": c["path"],
@@ -1568,7 +1645,8 @@ def load_clip_cache():
 def save_clip_cache():
     """把内存片段缓存索引写入磁盘（原子写）。"""
     try:
-        data = [{"video": v, "goals": list(g),
+        data = [{"video": _split_cache_video(v)[0], "fp": _split_cache_video(v)[1],
+                 "goals": list(g),
                  "clips": [dict({"ts": c["ts"], "path": c["path"], "idx": c["idx"]},
                                 **{k: c[k] for k in _AI_CACHE_KEYS if k in c})
                            for c in clips]}

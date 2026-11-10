@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytest
 
-from tracker import ECHO_WINDOW_SEC, GoalDetector, WARMUP_TARGET_SEC
+from tracker import GoalDetector, WARMUP_TARGET_SEC
 
 FPS = 30
 HOOP = (130, 80, 170, 120)   # x1, y1, x2, y2（40x40 篮筐）
@@ -133,129 +133,22 @@ class TestGoalPaths:
         assert len(det.goals) == 1
         assert det.diag["reject_cooldown"] >= 1
         # 3 秒后（帧号跳到 100）→ 第二个进球。
-        # 注意必须给「先到筐上方」的两帧：真球总有一段球在筐上方的轨迹，而只喂
-        # 筐内斑块正是网兜余摆的形状，会被回声抑制拦下（见 TestNetEchoSuppression）。
         _feed_seq(det, [40, 40, 100, 100, 100], start_idx=100)
         assert len(det.goals) == 2
         assert det.goals[1] == pytest.approx(103 / FPS)  # idx=100/101 上方，102/103 筐内第2帧
 
+    def test_no_net_echo_suppression(self):
+        """网兜余摆闸门已移除：冷却期过后，纯筐内斑块也照常注册第二个进球。
 
-class TestNetEchoSuppression:
-    """网兜余摆回声抑制：进球后网兜仍会摆动 2~4 秒，其斑块落在筐内、满足 loose
-    路径的进框条件，冷却期一过就会被再注册一次，同一个进球变成两个候选。
-
-    实测（2026.09.21-2nd.mp4，43 候选）：13 对的间隔正好是 2.07~2.96s，紧贴
-    min_gap_sec=2.0 的边界；抽帧确认第二次触发时球已落下、只有网兜在晃。
-    """
-
-    def test_net_swing_after_goal_is_suppressed(self):
-        """进球后只喂「筐内斑块」（=网兜余摆）→ 不再注册第二个进球。"""
+        回归用户口径（2026.09.21-2nd）：135.296 / 152.616 / 157.912 三个
+        人工确认进球都因网兜回声闸门被误杀，移除后应恢复注册。
+        """
         det = _detector(min_gap_sec=2.0)
         _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
         assert len(det.goals) == 1
-        # 冷却已过（idx 从 70 起，gap≈2.2s > 2.0），但仍是纯筐内斑块
+        # 冷却已过（idx 70，gap≈2.2s > 2.0），纯筐内斑块
         _feed_seq(det, [100, 100, 100, 100], start_idx=70)
-        assert len(det.goals) == 1, "网兜余摆被注册成了第二个进球"
-        assert det.diag["reject_echo"] >= 1
-        assert det.diag["reject_cooldown"] == 0        # 不是冷却拦下的，是回声判据
-
-    def test_weak_registration_does_not_arm_echo_window(self):
-        """弱注册的进球不武装回声窗口：紧随其后的同型触发应照常注册。
-
-        回归场景（20251007 勒流 11 号篮球公园 1st，388.8s 实测）：386.25s 的打铁
-        靠 1.5s 超时窗 + 兜底档 probe 证据被**弱注册**，它开的 5 秒窗口把 2.4 秒后
-        真正的补篮当成余摆吞掉（该场 reject_echo=8）。弱注册不武装后应恢复注册。
-        """
-        det = _detector(min_gap_sec=2.0)
-        # 首球显式弱注册（模拟「超时窗匹配 / 仅兜底档证据」）
-        assert det._register_goal(0.1, 3, FPS, "side", strong=False) is True
-        # 冷却已过（gap≈2.3s > 2.0），又一枚筐内斑块触发
-        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is True
-        assert det.diag["reject_echo"] == 0
-        assert det.diag["echo_disarmed_weak"] >= 1
-
-    def test_strong_registration_still_arms_echo_window(self):
-        """强注册照旧武装窗口 —— 本修复不得把网兜回声保护一起撤销。
-
-        这是防止「为救补篮而放纵余摆」的护栏：同样相隔 2.3s 的第二次触发，
-        上一次是强注册时必须仍被判为余摆。
-        """
-        det = _detector(min_gap_sec=2.0)
-        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
-        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is False
-        assert det.diag["reject_echo"] == 1
-        assert det.diag["echo_disarmed_weak"] == 0
-
-    def test_real_second_goal_within_window_is_kept(self):
-        """窗口内的**真球**（先到筐上方再进框）必须照常注册，不能被误杀。"""
-        det = _detector(min_gap_sec=2.0)
-        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
-        assert len(det.goals) == 1
-        _feed_seq(det, [40, 40, 100, 100], start_idx=70)  # 又有新球从上方下来
         assert len(det.goals) == 2
-        assert det.diag["reject_echo"] == 0
-
-    def test_echo_window_cleared_by_ball_descending_in_hoop(self):
-        """回归（2026.11.06-1st 133.9s）：窗口内 YOLO 真看到球在筐口内下移时放行。
-
-        该场 129.7s 的强误报武装了 5s 窗口，紧接着的真球是**侧向进筐**（斑块全程
-        没到过筐上方，last_above_frame=-999），24 帧触发全被判余摆吞掉。
-        网兜摆动不会有球在筐口内下移，出现该硬证据必须放行。
-        """
-        det = _detector(min_gap_sec=2.0)
-        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
-        det.last_above_frame = -999          # 侧向进筐：没有「球在筐上方」的观测
-        # 筐口 80~120，宽松下界到 144：两个**不同检测帧**、累计下移 12px
-        det.ball_pos_history.extend([(70, float(CX), 100.0),
-                                     (72, float(CX), 112.0)])
-        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is True
-        assert det.diag["echo_cleared_by_ball"] == 1
-        assert det.diag["reject_echo"] == 0
-
-    def test_echo_window_not_cleared_without_real_descent(self):
-        """反证不成立时不得放行：同一检测帧复用、或球在筐口下方都算「没看到下穿」。"""
-        det = _detector(min_gap_sec=2.0)
-        assert det._register_goal(0.1, 3, FPS, "side", strong=True) is True
-        det.last_above_frame = -999
-        # 同一检测帧（跳帧复用）→ 不能算穿过
-        det.ball_pos_history.extend([(72, float(CX), 100.0),
-                                     (72, float(CX), 112.0)])
-        # 球已在筐口下界之外（hoop_bot=120 + 0.6*40=144）
-        det.ball_pos_history.append((74, float(CX), 160.0))
-        assert det._register_goal(2.4, 72, FPS, "side", strong=True) is False
-        assert det.diag["reject_echo"] == 1
-        assert det.diag["echo_cleared_by_ball"] == 0
-
-    def test_beyond_window_behaves_like_old(self):
-        """超出回声窗口（net 摆动早已停止）→ 行为与旧版一致，不设额外限制。
-
-        这条是向后兼容的护栏：窗口外只喂筐内斑块也应该能注册，避免把
-        「窗口」变成对整场生效的新门槛。
-        """
-        det = _detector(min_gap_sec=2.0)
-        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
-        assert len(det.goals) == 1
-        far = 3 + 30 * (ECHO_WINDOW_SEC + 1.0)          # 窗口外
-        _feed_seq(det, [100, 100, 100], start_idx=far)
-        assert len(det.goals) == 2
-        assert det.diag["reject_echo"] == 0
-
-    def test_first_goal_unaffected(self):
-        """本场第一个进球不受影响（此前没有任何进球）。"""
-        det = _detector(min_gap_sec=2.0)
-        _feed_seq(det, [100, 100, 100])                 # 直接筐内 3 帧
-        assert len(det.goals) == 1
-        assert det.diag["reject_echo"] == 0
-
-    def test_echo_flag_never_fires_before_window_expiry_semantics(self):
-        """窗口内若中途出现过「斑块在筐上方」，回声判据即失效（说明来了新球）。"""
-        det = _detector(min_gap_sec=2.0)
-        _feed_seq(det, [40, 40, 100, 100])              # 进球 @ idx 3
-        assert det.last_above_frame <= det.last_goal_frame
-        # 进球后先出现一帧筐上方（新球轨迹起点）→ 判据失效
-        _feed_seq(det, [40], start_idx=70)
-        assert det.last_above_frame > det.last_goal_frame
-        assert det._is_net_echo(71, FPS) is False
 
 
 class TestShapeFilter:

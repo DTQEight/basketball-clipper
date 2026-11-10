@@ -498,6 +498,39 @@ def _available_arms() -> list:
     return arms
 
 
+def _hash_models(h) -> None:
+    """把「产生各臂分数」的模型/权重文件与可用臂组合写进哈希。
+
+    这段只跟**推理产物**有关：换骨干、重训头、换球检测权重、缺臂（重归一化）
+    都会改变各臂分的含义。阈值与集成权重不在这里——见 arm_fingerprint。
+    """
+    for p in (B_SIMCLR_FILE, FLOW_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL,
+              FLOW_MODEL, VM_MODEL, LGBM_MODEL):
+        try:
+            h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
+        except OSError:
+            h.update(f"{p.name}:-".encode())
+    try:
+        for p in sorted(BALL_WEIGHTS_DIR.glob("*.pt")):
+            h.update(f"w:{p.name}:{p.stat().st_mtime_ns}".encode())
+    except OSError:
+        h.update(b"w:-")
+    # R9：把「当前可参与的臂组合」计入指纹（缺臂 → 分数是重归一化的另一口径）
+    h.update(",".join(_available_arms()).encode())
+
+
+def arm_fingerprint() -> str:
+    """「各臂原始分」的指纹：模型文件 + 球检测权重 + 可用臂组合。
+
+    与 model_fingerprint 的区别：**不含阈值/集成权重**。这两类东西改变时，
+    逐臂分（score_lgbm/score_b/score_flow/score_vm）仍然有效，只是重新加权
+    就能得到新合成分 → 无需重跑视频（见 invalidate_stale）。
+    """
+    h = hashlib.md5()
+    _hash_models(h)
+    return h.hexdigest()[:12]
+
+
 def model_fingerprint() -> str:
     """当前判定口径的指纹：各臂模型文件 + 球检测权重 + 集成权重/阈值。
 
@@ -516,43 +549,76 @@ def model_fingerprint() -> str:
     # 必须先刷新 ENS_WEIGHTS/AUTO_THR：否则首次调用会把「代码默认权重」哈希进去，
     # 而下一次调用哈希的是文件里的权重 → 指纹自己就变了（分数被反复误判为过期）
     thr = _read_ensemble()
-    for p in (B_SIMCLR_FILE, FLOW_SIMCLR_FILE, TEMPORAL_BIGRU, TEMPORAL_POOL,
-              FLOW_MODEL, VM_MODEL, LGBM_MODEL):
-        try:
-            h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
-        except OSError:
-            h.update(f"{p.name}:-".encode())
-    try:
-        for p in sorted(BALL_WEIGHTS_DIR.glob("*.pt")):
-            h.update(f"w:{p.name}:{p.stat().st_mtime_ns}".encode())
-    except OSError:
-        h.update(b"w:-")
+    _hash_models(h)
     h.update(json.dumps(sorted(ENS_WEIGHTS.items())).encode())
     h.update(str(thr).encode())
-    # R9：把「当前可参与的臂组合」计入指纹（缺臂 → 分数是重归一化的另一口径）
-    h.update(",".join(_available_arms()).encode())
     return h.hexdigest()[:12]
 
 
+_ARM_SCORE_KEY = {"a": "score_lgbm", "b": "score_b",
+                  "flow": "score_flow", "vm": "score_vm"}
+
+
+def _arms_complete(clip) -> bool:
+    """当前可用臂是否都有原始分（缺任何一臂 → 合成分是重归一化的另一口径）。"""
+    arms = _available_arms()
+    return bool(arms) and all(clip.get(_ARM_SCORE_KEY[a]) is not None
+                              for a in arms)
+
+
+def triage(clip):
+    """三态判决：'keep'（高带）/ 'reject'（低带）/ 'uncertain'（中间带）。
+
+    无分数（AI 未跑 / 被作废）返回 None —— 与「模型看过但拿不准」区分开，
+    后者才是需要暴露给人工优先处理的「待定」。
+    """
+    if clip.get("verify_score") is None and "score" not in clip:
+        return None
+    if clip.get("auto"):
+        return "keep"
+    if clip.get("auto_reject"):
+        return "reject"
+    return "uncertain"
+
+
 def invalidate_stale(clips) -> int:
-    """丢弃口径已过期的分数（就地）。返回被作废的片段数。
+    """丢弃口径已过期的分数（就地）。返回被处理（重算或作废）的片段数。
 
-    verify_ver 与当前指纹不一致（或旧数据根本没有该字段）→ 清掉 score 及各臂分，
-    调用方的"缺分数"分支就会重跑复核。
+    verify_ver 与当前指纹不一致（或旧数据根本没有该字段）→ 处理：
+      · 逐臂分仍属当前模型口径（arm_ver 一致且可用臂齐全）→ **只重算合成分**
+        （改阈值 / 改集成权重不重跑视频）；
+      · 否则清掉 score 及各臂分，调用方的"缺分数"分支就会重跑复核。
 
-    M2：同时清掉**模型来源**的 mark/mark_source —— mark 是旧口径分数分带的产物，
+    M2：清掉**模型来源**的 mark/mark_source —— mark 是旧口径分数分带的产物，
     留着会在本片段重打分失败时被 _sync_marks 当成有效判断写进历史（口径污染）。
-    人工标记（mark_source == "manual"）永远不动。
+    人工标记（mark_source == "manual"）永远不动。重算分支同样只清模型标记，
+    随后由 refresh_auto 按新阈值重推。
     """
     fp = model_fingerprint()
+    afp = arm_fingerprint()
     n = 0
     for c in clips:
         if c.get("verify_ver") == fp:
             continue
-        if "score" not in c and c.get("mark_source") != "auto":
+        # 逐臂分可复用：模型没换，只是阈值/权重变了
+        if c.get("arm_ver") == afp and _arms_complete(c):
+            s = combine(c)
+            if s is not None:
+                c["score"] = round(s, 3)
+                c["verify_ver"] = fp
+                for k in ("auto", "auto_reject", "verify_score", "calib_shift"):
+                    c.pop(k, None)
+                if c.get("mark_source") == "auto":
+                    c.pop("mark", None)
+                    c.pop("mark_source", None)
+                n += 1
+                continue
+        if "score" not in c and c.get("mark_source") != "auto" \
+                and not any(c.get(k) is not None for k in _ARM_SCORE_KEY.values()):
             continue                    # 既无分数也无模型标记 → 无事可做
         for k in ("score", "verify_ver", "auto", "auto_reject", "verify_score",
-                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm"):
+                  "calib_shift", "score_lgbm", "score_b", "score_flow", "score_vm",
+                  "arm_ver"):
             c.pop(k, None)
         if c.get("mark_source") == "auto":
             c.pop("mark", None)
@@ -684,6 +750,45 @@ def _flow_maps(frames):
     return np.repeat(mags[..., None], 3, axis=-1)
 
 
+def _net_zone_sequence(frames):
+    """网区三带帧差峰值的先后顺序（弱证据，不参与打分）。
+
+    输入是 16 帧筐心块（crop_hoop：224×224，筐心居中，筐高占 70px）：
+      y 147~224 是筐口以下（网兜）区域，均分三带，逐对帧求平均绝对差，
+    取每带峰值出现的帧序号。真进球通常「上带先动 → 中带 → 下带」（球穿过网）。
+    返回值 (seq, zones)：
+      seq   'tmb' 下移 / 'bmt' 上移 / 'mixed' 不规则 / None 证据不足
+      zones 三带峰值幅度（诊断用）
+    """
+    import cv2
+    import numpy as np
+    try:
+        grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+        if len(grays) < 4:
+            return None, None
+        y0, y1 = 147, 224
+        bounds = [(y0, y0 + 26), (y0 + 26, y0 + 52), (y0 + 52, y1)]
+        series = [[], [], []]
+        for a, b in zip(grays, grays[1:]):
+            d = cv2.absdiff(a, b)
+            for i, (ya, yb) in enumerate(bounds):
+                series[i].append(float(d[ya:yb].mean()))
+        peaks = [max(s) if s else 0.0 for s in series]
+        # 峰值太弱（几乎无运动）→ 不给结论，避免噪声造出顺序
+        if max(peaks) < 2.0:
+            return None, [round(p, 2) for p in peaks]
+        idx = [int(np.argmax(s)) for s in series]
+        if idx[0] <= idx[1] <= idx[2] and idx[0] < idx[2]:
+            seq = "tmb"
+        elif idx[2] <= idx[1] <= idx[0] and idx[2] < idx[0]:
+            seq = "bmt"
+        else:
+            seq = "mixed"
+        return seq, [round(p, 2) for p in peaks]
+    except Exception:
+        return None, None
+
+
 def _score_visual(video_path, clips, hoop, on_progress=None, cancel_check=None):
     """B/Flow/VM 三臂打分（共享同一批 16 帧筐心块解码）。
 
@@ -780,6 +885,17 @@ def _score_visual(video_path, clips, hoop, on_progress=None, cancel_check=None):
         on_progress(0.5, f'三臂抽帧 {len(blocks)}/{len(todo)}')
     _log.info("goal_verifier: [B/Flow/VM] 抽帧完成 %d/%d，进入 GPU 推理",
               len(blocks), len(todo))
+
+    # 网区三带方向序列（弱证据，顺带算，不额外解码）：只写字段供检查器展示
+    for _c, _fr in blocks:
+        try:
+            _seq, _zones = _net_zone_sequence(_fr)
+            if _seq:
+                _c["net_seq"] = _seq
+            if _zones:
+                _c["net_seq_z"] = _zones
+        except Exception:
+            pass
 
     # 批量 GPU 推理（4 片段 = 64 帧/批，同训练特征提取的显存预算）
     try:
@@ -945,6 +1061,19 @@ def _score_lgbm(video_path, clips, hoop, on_progress=None, cancel_check=None):
                     min(max(float(model.predict([vals])[0]), 0.0), 1.0), 3)
             except Exception:
                 continue
+            # 轨迹补充证据（不参与打分，仅供检查器展示）：
+            #   ext_fit_rmse 抛物线拟合相对残差（越小越像正常抛投）
+            #   ext_off_q    外推落点离筐心的水平偏移（按筐宽归一）
+            #   ext_in_q     外推落点是否落在筐口宽度内（0/1）
+            for _src, _dst in (("ext_fit_rmse", "traj_fit_rmse"),
+                               ("ext_off_q", "traj_off_q"),
+                               ("ext_in_q", "traj_in_q")):
+                _v = row.get(_src)
+                if _v is not None:
+                    try:
+                        c[_dst] = round(float(_v), 4)
+                    except (TypeError, ValueError):
+                        pass
         n_done += len(chunk)
         if on_progress:
             on_progress(min(n_done, len(todo)) / len(todo),
@@ -1014,8 +1143,12 @@ def score_clips(video_path, clips, hoop, progress=None, cancel_check=None):
               time.time() - t0)
     # 打分完成后才取指纹：ENS_WEIGHTS 是 _load_temporal 里读进来的
     fp = model_fingerprint()
+    afp = arm_fingerprint()
     n = 0
     for c in clips:
+        # 逐臂分指纹：只改阈值/集成权重时，下次可直接复用这些分数重算合成分
+        if any(c.get(k) is not None for k in _ARM_SCORE_KEY.values()):
+            c["arm_ver"] = afp
         s = combine(c)
         if s is None:
             continue

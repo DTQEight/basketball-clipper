@@ -313,6 +313,8 @@ def main_page():
                             'flat dense no-caps').style(_chip_style(True))
                         chip_pending = ui.button('待判定 0', on_click=lambda: _set_filter('pending')).props(
                             'flat dense no-caps').style(_chip_style(False))
+                        chip_uncertain = ui.button('AI 待定 0', on_click=lambda: _set_filter('uncertain')).props(
+                            'flat dense no-caps').style(_chip_style(False))
                         chip_ai = ui.button('AI 通过', on_click=lambda: _set_filter('ai-ok')).props(
                             'flat dense no-caps').style(_chip_style(False))
                         chip_rej = ui.button('已标 ×', on_click=lambda: _set_filter('rejected')).props(
@@ -345,7 +347,9 @@ def main_page():
                     ).classes('w-full rounded-xl bg-black').style(
                         'aspect-ratio: 16/9; object-fit: contain; '
                         'max-width: calc(52vh * 16 / 9); margin: 0 auto')
-                    result_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style(
+                    # preload=auto：换源后尽快开始缓冲，减少点击片段到首帧的空窗
+                    result_video_el = ui.video(src='').props('preload=auto').classes(
+                        'w-full rounded-xl hidden').style(
                         'aspect-ratio: 16/9; max-width: calc(52vh * 16 / 9); margin: 0 auto')
                     highlights_video_el = ui.video(src='').classes('w-full rounded-xl hidden').style(
                         'aspect-ratio: 16/9; max-width: calc(52vh * 16 / 9); margin: 0 auto')
@@ -641,6 +645,9 @@ def main_page():
     # 当前右栏显示的面板（页级）：timer 里的"后台任务进度自动接管"要先看它，
     # 否则每 0.4s 无条件切 progress 会把本页正在播放的片段/集锦顶掉。
     _right_pane = {"mode": "preview"}
+    # 结果播放器当前已加载的片段路径：同路径再次点击时不再 set_source
+    # （每次换源都要注销旧媒体路由、销毁并重建浏览器解码管线，连续审核尤卡）
+    _result_src = {"path": None}
 
     def _sync_insert_row():
         """补录输入行的显隐只看「有没有可预览的视频」，不跟随右侧面板模式。
@@ -663,6 +670,14 @@ def main_page():
             # 若无脑重发，前端会持续收到没有变化的样式更新（反复"强制切换"）
             return
         _right_pane["mode"] = mode
+        # 切走的视频先暂停：hidden 只是不显示，<video> 仍在解码/持有解码器，
+        # 与切换后的目标视频抢 GPU 解码配额（审核时表现为播放卡顿）
+        for _el, _name in [(result_video_el, 'result'), (highlights_video_el, 'highlights')]:
+            if _name != mode:
+                try:
+                    _el.run_method('pause')
+                except Exception:
+                    pass
         # 全部先隐藏（一次性 remove/add，比每处写 4 行稳）
         for el, name in [(preview_image, 'preview'),
                          (result_video_el, 'result'),
@@ -1487,6 +1502,13 @@ def main_page():
 
     def _on_person_clip(idx):
         """打开人物分类对话框：已有人物快捷选择 + 自定义新人物 + 清除分类。"""
+        # 开窗前先暂停播放：QDialog 的 40% 黑遮罩压在 <video> 上，浏览器会失去
+        # 视频直通（overlay）层、回退到逐帧合成拷贝，此时边解码边合成最卡
+        for _el in (result_video_el, highlights_video_el):
+            try:
+                _el.run_method('pause')
+            except Exception:
+                pass
         vp = _cards_video["path"]
         if vp is not None:
             snap = state.batch_results.get(vp)
@@ -1658,6 +1680,9 @@ def main_page():
                                and c.get("mark_source") == "auto"),
             'n_auto_rej': sum(1 for c in _clips if _ai_on and c.get("mark") == "reject"
                               and c.get("mark_source") == "auto"),
+            # AI 待定 = 模型有分但落在中间带、且人工尚未判定
+            'n_uncertain': sum(1 for c in _clips if _ai_on and not _eff_mark(c)
+                               and goal_verifier.triage(c) == 'uncertain'),
             'person_counts': person_counts, 'n_person': n_person,
             'person_colors': _person_color_map(_clips), 'export_hint': _hint,
             'n_total': len(_clips),
@@ -1692,6 +1717,7 @@ def main_page():
         try:
             list_count_label.set_text(f'共 {st["n_total"]} · 已标 {st["n_keep"] + st["n_reject"]}')
             chip_pending.set_text(f'待判定 {st["n_pending"]}')
+            chip_uncertain.set_text(f'AI 待定 {st.get("n_uncertain", 0)}')
             pending_pill.set_text(f'待审 {st["n_pending"]}')
             _style_chips()
         except Exception:
@@ -1797,11 +1823,16 @@ def main_page():
         return _i if isinstance(_i, int) else -1
 
     def _clip_visible(clip):
-        """左栏筛选（全部/待判定/AI通过/已标×）+ 时间码搜索；只影响显示。"""
+        """左栏筛选（全部/待判定/AI 待定/AI通过/已标×）+ 时间码搜索；只影响显示。"""
         _mode = _list_filter["mode"]
         _mark = _eff_mark(clip)
         if _mode == 'pending' and _mark:
             return False
+        if _mode == 'uncertain':
+            # 只留「模型看过但拿不准、人工也还没判」的片段：三类分诊里唯一需要人看的带
+            if _mark or not (goal_verifier.is_enabled()
+                             and goal_verifier.triage(clip) == 'uncertain'):
+                return False
         if _mode == 'rejected' and _mark != 'reject':
             return False
         if _mode == 'ai-ok' and not (goal_verifier.is_enabled() and clip.get("auto")):
@@ -1817,6 +1848,7 @@ def main_page():
     def _style_chips():
         _mode = _list_filter["mode"]
         for _btn, _m in ((chip_all, 'all'), (chip_pending, 'pending'),
+                         (chip_uncertain, 'uncertain'),
                          (chip_ai, 'ai-ok'), (chip_rej, 'rejected')):
             try:
                 _btn.style(_chip_style(_mode == _m))
@@ -1872,8 +1904,13 @@ def main_page():
                 'background: rgba(245, 158, 11, 0.12)',
                 f'四臂集成分 {_score:.3f} 落在 {_lo:.2f}–{_hi:.2f} 之间 → 中间带，需人工确认{_note}')
 
-    def _select_row(idx):
-        """更新行选中态（只改上一行与当前行样式）并刷新检查器。"""
+    def _select_row(idx, defer_inspector=False):
+        """更新行选中态（只改上一行与当前行样式）并刷新检查器。
+
+        defer_inspector=True 时把检查器重建推后（调用方负责在换源/play 之后
+        补一次 _sync_inspector）——审核点片段时，整块检查器重建与视频换源
+        挤在同一轮事件里会推迟首帧。
+        """
         _old = _list_sel["idx"]
         _list_sel["idx"] = idx
         _clips = _cards_clips()
@@ -1884,7 +1921,8 @@ def main_page():
                     _w['card'].style(_card_style(_eff_mark(_clips[_i]), _i == idx))
                 except Exception:
                     pass
-        _sync_inspector()
+        if not defer_inspector:
+            _sync_inspector()
 
     def _sync_tab_styles(mode):
         for _name, _btn in _tabs.items():
@@ -2013,6 +2051,33 @@ def main_page():
                             with ui.element('div').classes('bar-track'):
                                 ui.element('div').classes('bar-fill').style(
                                     f'width: {_pct * 100:.0f}%; background: {_color};')
+            _traj = [('轨迹拟合残差', clip.get('traj_fit_rmse'), '{:.3f}'),
+                     ('落点偏离筐心', clip.get('traj_off_q'), '{:.2f} 筐宽'),
+                     ('落点在筐口内', clip.get('traj_in_q'), None)]
+            _net_seq = clip.get('net_seq')
+            if any(v is not None for _, v, _ in _traj) or _net_seq:
+                with ui.column().classes('insp-card w-full gap-0'):
+                    ui.label('补充证据（不计入 AI 分）').classes(
+                        'text-[11px] font-bold tracking-wider').style(
+                        'color: var(--text-secondary)')
+                    for _k, _v, _fmt in _traj:
+                        if _v is None:
+                            continue
+                        if _fmt:
+                            _txt = _fmt.format(float(_v))
+                        else:
+                            _txt = '是' if float(_v) >= 0.5 else '否'
+                        with ui.row().classes('kv-row w-full'):
+                            ui.label(_k).classes('text-[11.5px]')
+                            ui.label(_txt).classes('text-[11.5px] font-mono').style(
+                                'color: var(--text-primary)')
+                    if _net_seq:
+                        with ui.row().classes('kv-row w-full'):
+                            ui.label('网区三带动向').classes('text-[11.5px]')
+                            ui.label({'tmb': '上→中→下', 'bmt': '下→中→上',
+                                      'mixed': '不规则'}.get(_net_seq, str(_net_seq))
+                                     ).classes('text-[11.5px] font-mono').style(
+                                'color: var(--text-primary)')
             with ui.column().classes('insp-card w-full gap-0'):
                 ui.label('时间线').classes('text-[11px] font-bold tracking-wider').style(
                     'color: var(--text-secondary)')
@@ -2166,6 +2231,11 @@ def main_page():
                     # ✓/✕ 与缩略图同一行（旧实现是 card 的兄弟节点 → 每个进球
                     # 多占一整行按钮高度，列表看起来大片空白）
                     with ui.row().classes('items-center gap-0.5 shrink-0 row-actions ml-auto'):
+                        # 单段导出（三栏工作台重构时漏接了该按钮，后端 export_single_clip_hq 一直在）
+                        ui.button('⬇', on_click=lambda e, idx=i: _on_export_clip(idx)).props(
+                            'flat dense no-caps').classes('text-[11px]').style(
+                            'color: var(--text-tertiary); min-height: 0; width: 20px; '
+                            'height: 22px; padding: 0;').tooltip('导出该球片段（集锦规格）')
                         _keep_btn = ui.button(
                             '✓', on_click=lambda e, idx=i: _on_mark_clip(idx, 'mark_keep')
                         ).props('flat dense no-caps').classes('text-[11px]').style(
@@ -2188,21 +2258,33 @@ def main_page():
         # 与 clip_action 内 len 检查→取值之间竞态（快照模式只读快照，安全）
         if _cards_video["path"] is None and _refuse_if_busy():
             return
-        _select_row(idx)
+        # 检查器重建推迟到 play 之后（审核时同一轮里重建整块判定卡会推迟首帧）
+        _select_row(idx, defer_inspector=True)
         vp = _cards_video["path"]  # 取值在 await 之前：本次操作对象不该被后续状态变化改掉
         from nicegui import run
         # M12：clip_action 里"AI 已判的片段预览即记人工复核"会落盘重写历史，
         # 同步执行在进球多时卡住事件循环
         path, status = await run.io_bound(detection.clip_action, "preview", idx, video_path=vp)
         if path and os.path.exists(path):
-            result_video_el.set_source(path)
+            if _result_src["path"] != path:
+                # 换源会注销旧媒体路由并重建浏览器解码管线：先暂停释放旧解码器，
+                # 否则新旧两条解码管线短时并存，首帧/前几秒最容易掉帧
+                try:
+                    result_video_el.run_method('pause')
+                except Exception:
+                    pass
+                result_video_el.set_source(path)
+                _result_src["path"] = path
             _show_right_pane('result')
-            # 自动播放
+            # 自动播放（同路径时直接 play：已播完会按规范从头开始，无需重新换源）
             result_video_el.run_method('play')
+            # 播放已下发，再用一次性 timer 重建检查器（让出本轮事件循环）
+            ui.timer(0, _sync_inspector, once=True)
         else:
             # N11：clip_action 只按 clip 元数据算出理论路径，片段可能已被缓存驱逐/
             # 7 天清理删掉——此时若照旧显示"▶ 正在预览"，用户会以为播放器坏了
             status = '片段已失效，请重新检测/加载'
+            _sync_inspector()
         _set_status(status, 'info')
 
     def _on_export_clip(idx):
